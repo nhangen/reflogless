@@ -27,7 +27,11 @@ pub fn snap(
             "event name 'latest' would collide with the restore-latest alias".into(),
         ));
     }
-    let Selection { files, skipped } = select::collect(repo)?;
+    // Defensively exclude the store itself — prevents recursive snapshotting
+    // when the user puts $GITSAFE_DATA_DIR inside the repo (tests, sandboxes).
+    let exclude = vec![store.root.clone()];
+    let Selection { files, skipped } =
+        select::collect_with_cap(repo, select::PER_FILE_CAP_BYTES, &exclude)?;
     let id = make_id(event);
     let mut manifest = Manifest::new(
         id.clone(),
@@ -320,6 +324,22 @@ mod tests {
         let s = snap(&repo, &store, "manual", None).unwrap();
         let m = store.load_manifest(&s.manifest_id).unwrap();
         assert_eq!(m.entries[0].size, 12);
+    }
+
+    #[test]
+    fn snap_excludes_store_dir_inside_repo() {
+        let workdir = TempDir::new().unwrap();
+        let repo = make_repo(workdir.path());
+        // Store base lives INSIDE the repo (pathological config; defend
+        // against recursive snapshotting).
+        let store_base = repo.root.join(".gitsafe-data");
+        let store = Store::for_repo_with_base(&repo, store_base.clone()).unwrap();
+        fs::write(repo.root.join("keep.txt"), b"keep").unwrap();
+        // First snap creates store files; second snap should NOT see them.
+        let s1 = snap(&repo, &store, "manual", None).unwrap();
+        assert_eq!(s1.files_written, 1);
+        let s2 = snap(&repo, &store, "manual", None).unwrap();
+        assert_eq!(s2.files_written, 1, "store files leaked into second snap");
     }
 
     #[test]

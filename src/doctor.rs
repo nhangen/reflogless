@@ -1,0 +1,330 @@
+use crate::error::Result;
+use crate::hooks::{hooks_dir, HOOKS, MARKER};
+use crate::repo::Repo;
+use crate::store::Store;
+use std::fmt::Write as _;
+use std::fs;
+
+#[derive(Debug)]
+pub struct DoctorReport {
+    pub hooks: Vec<HookStatus>,
+    pub store_size_bytes: Result<u64>,
+    pub snapshots: Result<usize>,
+    pub corrupt_snapshots: usize,
+    pub shim_status: ShimStatus,
+    pub canary_roundtrip: bool,
+    pub recent_hook_errors: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct HookStatus {
+    pub name: String,
+    pub state: HookState,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum HookState {
+    Missing,
+    Unreadable(String),
+    Managed { chained: bool },
+    Tampered,
+    Foreign,
+}
+
+#[derive(Debug)]
+pub enum ShimStatus {
+    Off,
+}
+
+pub fn run(repo: &Repo, store: &Store) -> Result<DoctorReport> {
+    let dir = hooks_dir(repo)?;
+    let mut hook_status = Vec::new();
+    for h in HOOKS {
+        let p = dir.join(h);
+        let backup = p.with_extension("gitsafe-orig");
+        let state = if !p.exists() {
+            HookState::Missing
+        } else {
+            match fs::read_to_string(&p) {
+                Err(e) => HookState::Unreadable(e.to_string()),
+                Ok(body) => {
+                    if body.contains(MARKER) {
+                        HookState::Managed {
+                            chained: backup.exists(),
+                        }
+                    } else if body.contains("gitsafe snap --event") {
+                        // A user hand-edited the gitsafe wrapper and stripped
+                        // the marker, but the gitsafe call is still present —
+                        // distinct from a legitimate third-party hook.
+                        HookState::Tampered
+                    } else {
+                        HookState::Foreign
+                    }
+                }
+            }
+        };
+        hook_status.push(HookStatus {
+            name: (*h).into(),
+            state,
+        });
+    }
+
+    let store_size_bytes = dir_size(&store.root);
+    let (snapshots, corrupt_snapshots) = match store.list_manifests_lenient() {
+        Ok((ok, warn)) => (Ok(ok.len()), warn.len()),
+        Err(e) => (Err(e), 0),
+    };
+
+    // Canary: roundtrip a fixed blob; clean up after to avoid lingering
+    // doctor-only artifacts in the user-visible store.
+    let canary_bytes: &[u8] = b"gitsafe-doctor-canary-32-bytes!!";
+    let canary_roundtrip = match store.write_blob(canary_bytes) {
+        Ok(d) => {
+            let ok = store
+                .read_blob(&d)
+                .map(|b| b == canary_bytes)
+                .unwrap_or(false);
+            // Best-effort cleanup; canary blob is unreferenced by any manifest
+            // so the next `gc` would drop it regardless.
+            let _ = store.delete_blob(&d);
+            ok
+        }
+        Err(_) => false,
+    };
+
+    let recent_hook_errors = read_hook_error_log(store);
+
+    Ok(DoctorReport {
+        hooks: hook_status,
+        store_size_bytes,
+        snapshots,
+        corrupt_snapshots,
+        shim_status: ShimStatus::Off,
+        canary_roundtrip,
+        recent_hook_errors,
+    })
+}
+
+fn read_hook_error_log(store: &Store) -> Vec<String> {
+    let log = std::env::var("GITSAFE_HOOK_LOG").unwrap_or_else(|_| {
+        store
+            .root
+            .join("hook-errors.log")
+            .to_string_lossy()
+            .into_owned()
+    });
+    let p = std::path::Path::new(&log);
+    if !p.exists() {
+        return Vec::new();
+    }
+    let body = fs::read_to_string(p).unwrap_or_default();
+    body.lines().rev().take(5).map(|s| s.to_string()).collect()
+}
+
+impl DoctorReport {
+    /// True iff every check is in a healthy state.
+    pub fn is_healthy(&self) -> bool {
+        self.first_failure().is_none()
+    }
+
+    /// Returns the first non-healthy check as a short label, or None if all
+    /// checks pass. Used to make the doctor error message actionable.
+    pub fn first_failure(&self) -> Option<&'static str> {
+        for h in &self.hooks {
+            match &h.state {
+                HookState::Missing => return Some("hook missing"),
+                HookState::Unreadable(_) => return Some("hook unreadable"),
+                HookState::Tampered => return Some("hook tampered"),
+                HookState::Foreign => return Some("hook foreign (not managed)"),
+                HookState::Managed { .. } => {}
+            }
+        }
+        if !self.canary_roundtrip {
+            return Some("canary roundtrip failed");
+        }
+        if self.store_size_bytes.is_err() {
+            return Some("store unreadable");
+        }
+        if self.snapshots.is_err() {
+            return Some("snapshots unreadable");
+        }
+        if self.corrupt_snapshots > 0 {
+            return Some("corrupt snapshots present");
+        }
+        if !self.recent_hook_errors.is_empty() {
+            return Some("recent hook errors logged");
+        }
+        None
+    }
+
+    pub fn render(&self) -> String {
+        let mut s = String::new();
+        let _ = writeln!(s, "gitsafe doctor:");
+        for h in &self.hooks {
+            let state = match &h.state {
+                HookState::Missing => "MISSING".into(),
+                HookState::Unreadable(e) => format!("UNREADABLE: {e}"),
+                HookState::Managed { chained: true } => "OK (chained)".into(),
+                HookState::Managed { chained: false } => "OK".into(),
+                HookState::Tampered => "TAMPERED (manually edited)".into(),
+                HookState::Foreign => "FOREIGN (not gitsafe-managed)".into(),
+            };
+            let _ = writeln!(s, "  hook {:>22}: {state}", h.name);
+        }
+        match &self.store_size_bytes {
+            Ok(n) => {
+                let _ = writeln!(s, "  store size          : {n} bytes");
+            }
+            Err(e) => {
+                let _ = writeln!(s, "  store size          : UNREADABLE ({e})");
+            }
+        }
+        match &self.snapshots {
+            Ok(n) => {
+                let _ = writeln!(s, "  snapshots           : {n}");
+            }
+            Err(e) => {
+                let _ = writeln!(s, "  snapshots           : UNREADABLE ({e})");
+            }
+        }
+        let _ = writeln!(s, "  corrupt snapshots   : {}", self.corrupt_snapshots);
+        let _ = writeln!(s, "  shim                : off");
+        let _ = writeln!(
+            s,
+            "  canary roundtrip    : {}",
+            if self.canary_roundtrip { "ok" } else { "FAILED" }
+        );
+        if !self.recent_hook_errors.is_empty() {
+            let _ = writeln!(s, "  recent hook errors  :");
+            for line in &self.recent_hook_errors {
+                let _ = writeln!(s, "    {line}");
+            }
+        }
+        let _ = writeln!(
+            s,
+            "  overall             : {}",
+            if self.is_healthy() {
+                "HEALTHY".to_string()
+            } else {
+                format!("needs attention ({})", self.first_failure().unwrap_or("?"))
+            }
+        );
+        s
+    }
+}
+
+fn dir_size(p: &std::path::Path) -> Result<u64> {
+    use crate::error::Error;
+    if !p.exists() {
+        return Err(Error::io(p, std::io::Error::from(std::io::ErrorKind::NotFound)));
+    }
+    let mut total = 0;
+    let mut stack = vec![p.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).map_err(|e| Error::io(&dir, e))? {
+            let entry = entry.map_err(|e| Error::io(&dir, e))?;
+            let md = entry.metadata().map_err(|e| Error::io(entry.path(), e))?;
+            if md.is_dir() {
+                stack.push(entry.path());
+            } else {
+                total += md.len();
+            }
+        }
+    }
+    Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hooks;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn init_repo(td: &std::path::Path) -> Repo {
+        Command::new("git").arg("init").arg("-q").arg(td).status().unwrap();
+        Command::new("git")
+            .args(["-C", td.to_str().unwrap(), "config", "user.email", "t@t"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["-C", td.to_str().unwrap(), "config", "user.name", "t"])
+            .status()
+            .unwrap();
+        Repo::discover(td).unwrap()
+    }
+
+    #[test]
+    fn doctor_reports_missing_hooks_on_fresh_repo() {
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        let report = run(&repo, &store).unwrap();
+        assert!(report
+            .hooks
+            .iter()
+            .all(|h| matches!(h.state, HookState::Missing)));
+        assert!(report.canary_roundtrip);
+        assert!(!report.is_healthy());
+        assert_eq!(report.first_failure(), Some("hook missing"));
+    }
+
+    #[test]
+    fn doctor_reports_healthy_after_install() {
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        hooks::install(&repo, &store.root.join("hook-errors.log")).unwrap();
+        let report = run(&repo, &store).unwrap();
+        for h in &report.hooks {
+            assert!(matches!(h.state, HookState::Managed { .. }), "{:?}", h);
+        }
+        assert!(report.is_healthy(), "report=\n{}", report.render());
+        assert_eq!(report.first_failure(), None);
+    }
+
+    #[test]
+    fn doctor_reports_tampered_when_marker_stripped() {
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        hooks::install(&repo, &store.root.join("hook-errors.log")).unwrap();
+        // Manually strip the marker but leave the gitsafe call.
+        let p = repo.root.join(".git").join("hooks").join("post-checkout");
+        let body = fs::read_to_string(&p).unwrap();
+        let stripped = body.replace(crate::hooks::MARKER, "# foo");
+        fs::write(&p, stripped).unwrap();
+        let report = run(&repo, &store).unwrap();
+        let pc = report
+            .hooks
+            .iter()
+            .find(|h| h.name == "post-checkout")
+            .unwrap();
+        assert!(matches!(pc.state, HookState::Tampered), "got {:?}", pc.state);
+        assert!(!report.is_healthy());
+        assert_eq!(report.first_failure(), Some("hook tampered"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_reports_unreadable_store() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        hooks::install(&repo, &store.root.join("hook-errors.log")).unwrap();
+        // Make the objects dir unreadable.
+        let objects = store.root.join("objects");
+        fs::set_permissions(&objects, fs::Permissions::from_mode(0o000)).unwrap();
+        let report = run(&repo, &store);
+        // Restore perms regardless, so TempDir can clean up.
+        let _ = fs::set_permissions(&objects, fs::Permissions::from_mode(0o755));
+        let report = report.unwrap();
+        // Either canary fails, or store_size returns Err — both unhealthy.
+        assert!(!report.is_healthy(), "report=\n{}", report.render());
+    }
+}

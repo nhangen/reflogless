@@ -1,4 +1,6 @@
+pub mod doctor;
 pub mod error;
+pub mod hooks;
 pub mod manifest;
 pub mod repo;
 pub mod select;

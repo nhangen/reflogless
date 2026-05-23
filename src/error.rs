@@ -14,6 +14,12 @@ pub enum Error {
     #[error("configuration error: {0}")]
     Config(String),
 
+    #[error("not yet implemented: {0}")]
+    Unimplemented(String),
+
+    #[error("doctor: {0}")]
+    Doctor(String),
+
     #[error("ambiguous snapshot id {id}: {} matches", matches.len())]
     AmbiguousSnapshot { id: String, matches: Vec<String> },
 

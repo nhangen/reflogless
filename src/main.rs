@@ -2,6 +2,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use gitsafe::doctor;
+use gitsafe::hooks;
 use gitsafe::manifest::Manifest;
 use gitsafe::repo::Repo;
 use gitsafe::snapshot::{restore, snap};
@@ -44,6 +46,23 @@ enum Cmd {
         #[arg(long, default_value_t = DEFAULT_MAX_STORE_BYTES)]
         max_bytes: u64,
     },
+    /// Install gitsafe hooks into the current repo.
+    Init {
+        /// Reserved for Phase 5 — installs a git PATH shim. Currently rejected.
+        #[arg(long, hide = true)]
+        shim: bool,
+    },
+    /// Remove gitsafe hooks; restore any prior chained third-party hooks.
+    Uninstall {
+        /// Also delete the on-disk snapshot store for this repo. Requires --yes.
+        #[arg(long)]
+        purge: bool,
+        /// Confirms a destructive operation (required with --purge).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Verify install + store + canary.
+    Doctor,
 }
 
 fn main() -> ExitCode {
@@ -118,6 +137,60 @@ fn run() -> gitsafe::Result<()> {
                 report.snapshots_corrupt_evicted,
                 report.blobs_evicted
             );
+        }
+        Cmd::Init { shim } => {
+            if shim {
+                return Err(gitsafe::Error::Unimplemented(
+                    "--shim lands in Phase 5".into(),
+                ));
+            }
+            let log = store.root.join("hook-errors.log");
+            let report = hooks::install(&repo, &log)?;
+            println!("installed into {}", report.hooks_dir.display());
+            for h in &report.installed {
+                println!("  + {h}");
+            }
+            for h in &report.chained {
+                println!("  chained (preserved existing hook): {h}");
+            }
+        }
+        Cmd::Uninstall { purge, yes } => {
+            if purge && !yes {
+                return Err(gitsafe::Error::Config(
+                    "--purge requires --yes (destructive: deletes the snapshot store)".into(),
+                ));
+            }
+            let report = hooks::uninstall(&repo)?;
+            for h in &report.removed {
+                println!("removed {h}");
+            }
+            for h in &report.restored {
+                println!("restored prior {h}");
+            }
+            for h in &report.skipped {
+                println!("skipped {h} (not gitsafe-managed)");
+            }
+            if purge {
+                if store.root.exists() {
+                    std::fs::remove_dir_all(&store.root)
+                        .map_err(|e| gitsafe::Error::io(&store.root, e))?;
+                    println!("purged store at {}", store.root.display());
+                } else {
+                    println!("store already absent at {}", store.root.display());
+                }
+            }
+        }
+        Cmd::Doctor => {
+            let report = doctor::run(&repo, &store)?;
+            print!("{}", report.render());
+            if !report.is_healthy() {
+                return Err(gitsafe::Error::Doctor(
+                    report
+                        .first_failure()
+                        .unwrap_or("not healthy")
+                        .into(),
+                ));
+            }
         }
     }
     Ok(())

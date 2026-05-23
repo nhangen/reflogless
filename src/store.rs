@@ -67,6 +67,15 @@ impl Store {
         Ok(buf)
     }
 
+    pub fn delete_blob(&self, digest: &str) -> Result<()> {
+        let (a, b) = digest.split_at(2);
+        let p = self.objects_dir().join(a).join(b);
+        if p.exists() {
+            fs::remove_file(&p).map_err(|e| Error::io(&p, e))?;
+        }
+        Ok(())
+    }
+
     pub fn write_manifest(&self, m: &Manifest) -> Result<PathBuf> {
         let p = self.snapshots_dir().join(format!("{}.json", m.id));
         let json = serde_json::to_vec_pretty(m)?;

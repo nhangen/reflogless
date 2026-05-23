@@ -2,7 +2,7 @@
 
 Local untracked-file safety net for git. Snapshots untracked + dirty files into a content-addressed store so `git clean -fdx`, `git reset --hard`, and bad rebases don't destroy work.
 
-> **Status:** Phase 1 (Core) — manual `gitsafe snap` only. Hooks, encryption, packaging, and the optional `--shim` arrive in later phases. See [`Projects/Development/2026-05-19-gitsafe-plan.md`](../docs/) for the full roadmap.
+> **Status:** Phase 2 (Hooks + init + doctor). Manual snap, plus auto-snap on `post-checkout` / `pre-rebase` / `post-rewrite` / `reference-transaction` after `gitsafe init`. Encryption (Phase 3), packaging (Phase 4), and the optional `--shim` (Phase 5) are still ahead.
 
 ## Wedge
 
@@ -24,6 +24,8 @@ Homebrew / Scoop / cargo-dist arrive in Phase 4.
 ## Usage
 
 ```sh
+gitsafe init                      # install hooks (honors core.hooksPath)
+gitsafe doctor                    # verify install + store + canary
 gitsafe snap -m "before rebase"   # manual snapshot
 gitsafe list                      # all snapshots for this repo
 gitsafe show <id>                 # files in a snapshot
@@ -32,6 +34,8 @@ gitsafe restore latest            # restore most recent
 gitsafe restore <id> path/to/file # restore one path
 gitsafe diff <id> [path]          # unified diff snap vs work
 gitsafe gc                        # LRU + age eviction
+gitsafe uninstall                 # remove hooks; restore prior chained hooks
+gitsafe uninstall --purge --yes   # also delete the store (--yes required)
 ```
 
 Snapshot IDs accept a unique prefix (`gitsafe restore 20260519T13` works if it disambiguates).
@@ -50,9 +54,19 @@ Snapshot IDs accept a unique prefix (`gitsafe restore 20260519T13` works if it d
 - Default-deny: `node_modules/`, `vendor/`, `.venv/`, `target/`, `dist/`, `*.log`.
 - Per-file cap: 10 MB. Larger files are skipped with a note.
 
-## Hook coverage (preview, not in Phase 1)
+## Hook coverage
 
-`git` exposes no hooks on `clean` or `reset --hard`. Phase 2 wires `post-checkout`, `pre-rebase`, `post-rewrite`, and `reference-transaction`. Phase 5 adds an opt-in `--shim` for `clean` / `reset --hard` / `restore` / `switch -f` coverage. The README will say so plainly when those land.
+After `gitsafe init`:
+
+- `post-checkout` — auto-snap on branch switch.
+- `pre-rebase`, `post-rewrite` — bracket rebase operations.
+- `reference-transaction` (git ≥ 2.28) — belt-and-suspenders for ref updates.
+
+Hooks are best-effort: a snap failure never blocks the underlying git op. **`git` exposes no hooks on `clean` or `reset --hard`** — those land in Phase 5 via the opt-in `--shim`.
+
+If a third-party hook is already installed (husky, lefthook, hand-written), gitsafe preserves it: the prior file is renamed to `<hook>.gitsafe-orig` and gitsafe's wrapper `exec`s it after taking the snapshot. `gitsafe uninstall` restores the prior hook from `.gitsafe-orig`.
+
+`gitsafe doctor` reports each hook's state (`OK`, `OK (chained)`, `FOREIGN`, `MISSING`), store size + snapshot count, canary roundtrip, and shim status (currently always `off`).
 
 ## Roadmap
 

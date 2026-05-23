@@ -35,12 +35,22 @@ pub struct Selection {
 }
 
 pub fn collect(repo: &Repo) -> Result<Selection> {
-    collect_with_cap(repo, PER_FILE_CAP_BYTES)
+    collect_with_cap(repo, PER_FILE_CAP_BYTES, &[])
 }
 
-pub fn collect_with_cap(repo: &Repo, per_file_cap: u64) -> Result<Selection> {
+pub fn collect_with_cap(
+    repo: &Repo,
+    per_file_cap: u64,
+    exclude_abs: &[PathBuf],
+) -> Result<Selection> {
     let entries = repo.status_porcelain()?;
     let deny = build_default_deny(&repo.root)?;
+    // Canonicalize excludes so symlinked store paths still match. Skip
+    // un-canonicalizable entries silently — they simply won't match.
+    let excludes_canon: Vec<PathBuf> = exclude_abs
+        .iter()
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .collect();
 
     let mut files = Vec::new();
     let mut skipped = Vec::new();
@@ -52,6 +62,13 @@ pub fn collect_with_cap(repo: &Repo, per_file_cap: u64) -> Result<Selection> {
         let abs = repo.root.join(&e.path);
         if !abs.exists() {
             skipped.push(Skipped::Missing { rel: e.path });
+            continue;
+        }
+        let abs_canon = std::fs::canonicalize(&abs).unwrap_or_else(|_| abs.clone());
+        if excludes_canon.iter().any(|root| abs_canon.starts_with(root))
+            || exclude_abs.iter().any(|root| abs.starts_with(root))
+        {
+            skipped.push(Skipped::DenyMatch { rel: e.path });
             continue;
         }
         if deny.matched_path_or_any_parents(&e.path, false).is_ignore() {
