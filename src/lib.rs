@@ -1,6 +1,9 @@
+pub mod config;
+pub mod crypto;
 pub mod doctor;
 pub mod error;
 pub mod hooks;
+pub mod keystore;
 pub mod manifest;
 pub mod repo;
 pub mod select;

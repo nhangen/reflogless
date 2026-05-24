@@ -2,7 +2,7 @@
 
 Local untracked-file safety net for git. Snapshots untracked + dirty files into a content-addressed store so `git clean -fdx`, `git reset --hard`, and bad rebases don't destroy work.
 
-> **Status:** Phase 2 (Hooks + init + doctor). Manual snap, plus auto-snap on `post-checkout` / `pre-rebase` / `post-rewrite` / `reference-transaction` after `gitsafe init`. Encryption (Phase 3), packaging (Phase 4), and the optional `--shim` (Phase 5) are still ahead.
+> **Status:** Phase 3 (Encryption). Manual snap + hook-driven snaps with at-rest encryption: age-based blob/manifest encryption with the identity stored in the OS keychain (macOS Keychain / Linux Secret Service / Windows DPAPI via the `keyring` crate). Packaging (Phase 4) and the optional `--shim` (Phase 5) are still ahead.
 
 ## Wedge
 
@@ -24,9 +24,10 @@ Homebrew / Scoop / cargo-dist arrive in Phase 4.
 ## Usage
 
 ```sh
-gitsafe init                      # install hooks (honors core.hooksPath)
-gitsafe doctor                    # verify install + store + canary
-gitsafe snap -m "before rebase"   # manual snapshot
+gitsafe init                      # install hooks + provision encryption identity in OS keychain
+gitsafe init --insecure-file-key  # store key on disk (loud warning; doctor surfaces it)
+gitsafe doctor                    # verify install + store + canary + encryption roundtrip
+gitsafe snap -m "before rebase"   # manual snapshot (honors .gitsafe.toml policy)
 gitsafe list                      # all snapshots for this repo
 gitsafe show <id>                 # files in a snapshot
 gitsafe restore <id>              # restore (refuses overwrite without --force)
@@ -67,6 +68,35 @@ Hooks are best-effort: a snap failure never blocks the underlying git op. **`git
 If a third-party hook is already installed (husky, lefthook, hand-written), gitsafe preserves it: the prior file is renamed to `<hook>.gitsafe-orig` and gitsafe's wrapper `exec`s it after taking the snapshot. `gitsafe uninstall` restores the prior hook from `.gitsafe-orig`.
 
 `gitsafe doctor` reports each hook's state (`OK`, `OK (chained)`, `FOREIGN`, `MISSING`), store size + snapshot count, canary roundtrip, and shim status (currently always `off`).
+
+## Encryption
+
+`gitsafe init` provisions an [age](https://github.com/FiloSottile/age) x25519 identity:
+
+- Secret key lives in the OS keychain (service `gitsafe`, account = repo hash).
+- Public recipient is written to `<store>/recipient.txt` (not secret).
+- `--insecure-file-key` falls back to a 0600 file at `<store>/identity.key`. Doctor surfaces this as `INSECURE FILE KEY`.
+
+Encryption policy is set in `.gitsafe.toml` at the repo root:
+
+```toml
+encrypt = "secrets"  # default — encrypt secret-shaped paths only
+# encrypt = "all"    # encrypt every blob
+# encrypt = "none"   # only secret-shaped paths get encrypted; everything else stays plain
+```
+
+Secret-shaped paths (always encrypted regardless of policy):
+
+- `.env*`, `id_rsa*`, `id_ecdsa*`, `id_ed25519*`, `id_dsa*`
+- Extensions: `.pem`, `.key`, `.p12`, `.pfx`, `.jks`, `.asc`, `.gpg`
+
+When an identity is provisioned, **the manifest itself is always encrypted** (`<id>.json.age`) so filenames in entries (e.g. `.env.production`, `customers.sql`) don't leak.
+
+`gitsafe doctor` runs an encrypt/decrypt canary on every invocation. It fails fast with `encryption canary roundtrip failed` if the keychain denies access or the identity is corrupt.
+
+## Multi-user safety
+
+`gitsafe` refuses to operate when the repo root is owned by a different unix uid than the current process. This blocks accidental cross-user access (e.g. running as your shell user against a repo under another user's home directory). Windows ownership semantics differ — no-op there for now.
 
 ## Roadmap
 

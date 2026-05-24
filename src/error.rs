@@ -35,6 +35,18 @@ pub enum Error {
     #[error("refusing to overwrite existing path {0} without --force")]
     Overwrite(PathBuf),
 
+    #[error("encryption failed: {0}")]
+    Encryption(String),
+
+    #[error("decryption failed: {0}")]
+    Decryption(String),
+
+    #[error("keychain error: {0}")]
+    Keychain(String),
+
+    #[error("refusing to operate: {0}")]
+    UnsafeOwnership(String),
+
     #[error("io error at {path}: {source}")]
     Io {
         path: PathBuf,

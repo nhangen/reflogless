@@ -1,3 +1,4 @@
+use crate::config::{should_encrypt, EncryptPolicy};
 use crate::error::{Error, Result};
 use crate::manifest::{Manifest, ManifestEntry};
 use crate::repo::Repo;
@@ -22,11 +23,25 @@ pub fn snap(
     event: &str,
     message: Option<String>,
 ) -> Result<SnapshotResult> {
+    snap_with_policy(repo, store, event, message, EncryptPolicy::Secrets)
+}
+
+/// Take a snapshot using an explicit encryption policy. Per-entry decision is:
+/// secret-shaped paths are always encrypted; the policy controls everything
+/// else. Encryption is only applied when the store has a crypto context.
+pub fn snap_with_policy(
+    repo: &Repo,
+    store: &Store,
+    event: &str,
+    message: Option<String>,
+    policy: EncryptPolicy,
+) -> Result<SnapshotResult> {
     if event == "latest" {
         return Err(Error::Config(
             "event name 'latest' would collide with the restore-latest alias".into(),
         ));
     }
+    repo.assert_safe_ownership()?;
     // Defensively exclude the store itself — prevents recursive snapshotting
     // when the user puts $GITSAFE_DATA_DIR inside the repo (tests, sandboxes).
     let exclude = vec![store.root.clone()];
@@ -42,13 +57,23 @@ pub fn snap(
     let mut bytes = 0u64;
     for f in &files {
         let data = fs::read(&f.abs).map_err(|e| Error::io(&f.abs, e))?;
-        let digest = store.write_blob(&data)?;
+        let encrypt_this = match store.crypto() {
+            Some(_) => should_encrypt(&f.rel, policy),
+            None => false,
+        };
+        let (digest, encrypted) = if encrypt_this {
+            let ctx = store.crypto().expect("encrypt_this implies crypto present");
+            (store.write_blob_encrypted(&data, &ctx.recipient)?, true)
+        } else {
+            (store.write_blob(&data)?, false)
+        };
         bytes += f.size;
         manifest.entries.push(ManifestEntry {
             path: f.rel.clone(),
             blob: digest,
             size: f.size,
             mode: f.mode,
+            encrypted,
         });
     }
     let manifest_path = store.write_manifest(&manifest)?;
@@ -79,6 +104,7 @@ pub fn restore(
         });
     }
 
+    repo.assert_safe_ownership()?;
     // Phase 1: stage all blobs in memory (10 MB per-file cap bounds memory).
     // A read failure here aborts before any byte lands in the user's tree.
     let mut staged: Vec<(&ManifestEntry, Vec<u8>)> = Vec::with_capacity(selected.len());
@@ -89,7 +115,7 @@ pub fn restore(
             refused.push(e.path.clone());
             continue;
         }
-        let data = store.read_blob(&e.blob)?;
+        let data = store.read_entry(e)?;
         staged.push((e, data));
     }
 
@@ -340,6 +366,208 @@ mod tests {
         assert_eq!(s1.files_written, 1);
         let s2 = snap(&repo, &store, "manual", None).unwrap();
         assert_eq!(s2.files_written, 1, "store files leaked into second snap");
+    }
+
+    fn encrypted_store(repo: &Repo, base: &Path) -> (Store, age::x25519::Identity) {
+        use crate::crypto;
+        let store = Store::for_repo_with_base(repo, base.to_path_buf()).unwrap();
+        let id = crypto::generate_identity();
+        let recipient = crypto::recipient_of(&id);
+        store.save_recipient(&recipient).unwrap();
+        let store = store.with_crypto(crate::store::CryptoCtx::from_identity(id.clone()));
+        (store, id)
+    }
+
+    #[test]
+    fn encrypted_snap_writes_age_manifest_and_roundtrips() {
+        let workdir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let repo = make_repo(workdir.path());
+        let (store, _id) = encrypted_store(&repo, data_dir.path());
+
+        fs::write(repo.root.join(".env.production"), b"DATABASE_URL=postgres://prod").unwrap();
+        fs::write(repo.root.join("notes.md"), b"safe").unwrap();
+
+        let r = snap_with_policy(&repo, &store, "manual", None, EncryptPolicy::Secrets).unwrap();
+        assert_eq!(r.files_written, 2);
+        // Manifest landed at .json.age path.
+        let snap_dir = store.snapshots_dir();
+        let names: Vec<_> = fs::read_dir(&snap_dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().into_string().unwrap()))
+            .collect();
+        assert!(
+            names.iter().any(|n| n.ends_with(".json.age")),
+            "no encrypted manifest found in {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.ends_with(".json") && !n.ends_with(".json.age")),
+            "plaintext manifest leaked: {names:?}"
+        );
+
+        // Manifest contents are unreadable as JSON.
+        let enc_path = snap_dir
+            .read_dir()
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().ends_with(".json.age"))
+            .unwrap()
+            .path();
+        let raw = fs::read(&enc_path).unwrap();
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&raw).is_err(),
+            "encrypted manifest still parses as JSON"
+        );
+
+        // Restore via the identity-attached store works.
+        fs::remove_file(repo.root.join(".env.production")).unwrap();
+        fs::remove_file(repo.root.join("notes.md")).unwrap();
+        let rr = restore(&repo, &store, &r.manifest_id, &[], false).unwrap();
+        assert_eq!(rr.restored, 2);
+        assert_eq!(
+            fs::read(repo.root.join(".env.production")).unwrap(),
+            b"DATABASE_URL=postgres://prod"
+        );
+    }
+
+    #[test]
+    fn secrets_policy_encrypts_only_secret_shaped_blobs() {
+        let workdir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let repo = make_repo(workdir.path());
+        let (store, _id) = encrypted_store(&repo, data_dir.path());
+
+        fs::write(repo.root.join("safe.txt"), b"plaintext-fine").unwrap();
+        fs::write(repo.root.join(".env"), b"DB=prod").unwrap();
+
+        let r = snap_with_policy(&repo, &store, "manual", None, EncryptPolicy::Secrets).unwrap();
+        let m = store.load_manifest(&r.manifest_id).unwrap();
+        let env_entry = m.entries.iter().find(|e| e.path == PathBuf::from(".env")).unwrap();
+        let safe_entry = m.entries.iter().find(|e| e.path == PathBuf::from("safe.txt")).unwrap();
+        assert!(env_entry.encrypted, ".env should be encrypted");
+        assert!(!safe_entry.encrypted, "safe.txt should be plain");
+
+        // The plain blob is byte-equal to plaintext on disk.
+        let plain = store.read_blob(&safe_entry.blob).unwrap();
+        assert_eq!(plain, b"plaintext-fine");
+    }
+
+    #[test]
+    fn all_policy_encrypts_every_blob() {
+        let workdir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let repo = make_repo(workdir.path());
+        let (store, _id) = encrypted_store(&repo, data_dir.path());
+
+        fs::write(repo.root.join("safe.txt"), b"plain").unwrap();
+        let r = snap_with_policy(&repo, &store, "manual", None, EncryptPolicy::All).unwrap();
+        let m = store.load_manifest(&r.manifest_id).unwrap();
+        assert!(m.entries.iter().all(|e| e.encrypted));
+    }
+
+    #[test]
+    fn none_policy_still_encrypts_secret_shaped_paths() {
+        let workdir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let repo = make_repo(workdir.path());
+        let (store, _id) = encrypted_store(&repo, data_dir.path());
+
+        fs::write(repo.root.join("plain.md"), b"plain").unwrap();
+        fs::write(repo.root.join("id_rsa_prod"), b"-----BEGIN KEY-----").unwrap();
+        let r = snap_with_policy(&repo, &store, "manual", None, EncryptPolicy::Off).unwrap();
+        let m = store.load_manifest(&r.manifest_id).unwrap();
+        let key = m.entries.iter().find(|e| e.path == PathBuf::from("id_rsa_prod")).unwrap();
+        let plain = m.entries.iter().find(|e| e.path == PathBuf::from("plain.md")).unwrap();
+        assert!(key.encrypted, "id_rsa_prod must always be encrypted");
+        assert!(!plain.encrypted, "plain.md under 'none' policy stays plain");
+    }
+
+    #[test]
+    fn gitsafe_toml_policy_applies_end_to_end() {
+        // Pins the wiring `Config::load_or_default(repo_root).encrypt →
+        // snap_with_policy(..., cfg.encrypt)` exercised by main.rs::run.
+        use crate::config::Config;
+        let workdir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let repo = make_repo(workdir.path());
+        let (store, _id) = encrypted_store(&repo, data_dir.path());
+
+        // .gitsafe.toml requests `encrypt = "all"`.
+        fs::write(repo.root.join(".gitsafe.toml"), "encrypt = \"all\"\n").unwrap();
+        fs::write(repo.root.join("README.md"), b"docs").unwrap();
+        let cfg = Config::load_or_default(&repo.root).unwrap();
+        let r = snap_with_policy(&repo, &store, "manual", None, cfg.encrypt).unwrap();
+        let m = store.load_manifest(&r.manifest_id).unwrap();
+        let readme = m
+            .entries
+            .iter()
+            .find(|e| e.path == PathBuf::from("README.md"))
+            .unwrap();
+        assert!(
+            readme.encrypted,
+            "encrypt = \"all\" in .gitsafe.toml must encrypt non-secret blobs"
+        );
+    }
+
+    #[test]
+    fn read_entry_returns_plaintext_for_encrypted_entry() {
+        // Regression for the diff_snapshot bug: any code path that reads a
+        // manifest entry must go through Store::read_entry, which decrypts
+        // when `entry.encrypted`. Pre-fix, `gitsafe diff <id> .env.production`
+        // returned ciphertext bytes for a text-diff pass.
+        let workdir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let repo = make_repo(workdir.path());
+        let (store, _id) = encrypted_store(&repo, data_dir.path());
+
+        fs::write(repo.root.join(".env"), b"SECRET=prod\n").unwrap();
+        let r = snap_with_policy(&repo, &store, "manual", None, EncryptPolicy::Secrets).unwrap();
+        let m = store.load_manifest(&r.manifest_id).unwrap();
+        let entry = m.entries.iter().find(|e| e.path == PathBuf::from(".env")).unwrap();
+        assert!(entry.encrypted);
+        // Raw read_blob returns ciphertext.
+        let raw = store.read_blob(&entry.blob).unwrap();
+        assert_ne!(raw, b"SECRET=prod\n", "raw blob must be ciphertext");
+        // read_entry must return plaintext for downstream consumers (restore, diff).
+        let decoded = store.read_entry(entry).unwrap();
+        assert_eq!(decoded, b"SECRET=prod\n");
+    }
+
+    #[test]
+    fn read_entry_errors_loudly_on_encrypted_without_identity() {
+        let workdir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let repo = make_repo(workdir.path());
+        let (store_with_id, _id) = encrypted_store(&repo, data_dir.path());
+        fs::write(repo.root.join(".env"), b"x").unwrap();
+        let r = snap_with_policy(&repo, &store_with_id, "manual", None, EncryptPolicy::Secrets).unwrap();
+        let m = store_with_id.load_manifest(&r.manifest_id).unwrap();
+        let entry = m.entries.iter().find(|e| e.path == PathBuf::from(".env")).unwrap().clone();
+
+        let bare = Store::for_repo_with_base(&repo, data_dir.path().to_path_buf()).unwrap();
+        match bare.read_entry(&entry) {
+            Err(Error::Decryption(_)) => {}
+            other => panic!("expected Decryption error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restore_fails_loudly_when_identity_missing() {
+        let workdir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let repo = make_repo(workdir.path());
+        let (store_with_id, _id) = encrypted_store(&repo, data_dir.path());
+
+        fs::write(repo.root.join(".env"), b"x").unwrap();
+        let r = snap_with_policy(&repo, &store_with_id, "manual", None, EncryptPolicy::Secrets).unwrap();
+        fs::remove_file(repo.root.join(".env")).unwrap();
+
+        // Reattach a store WITHOUT identity and verify restore errors cleanly.
+        let bare = Store::for_repo_with_base(&repo, data_dir.path().to_path_buf()).unwrap();
+        match restore(&repo, &bare, &r.manifest_id, &[], false) {
+            Err(Error::Decryption(_)) => {}
+            other => panic!("expected Decryption error, got {other:?}"),
+        }
     }
 
     #[test]

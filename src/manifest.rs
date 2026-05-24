@@ -21,6 +21,10 @@ pub struct ManifestEntry {
     pub blob: String,
     pub size: u64,
     pub mode: u32,
+    /// Set to true when the blob on disk is age-encrypted. Older manifests
+    /// (Phase 1/2) omit the field and default to false on load.
+    #[serde(default)]
+    pub encrypted: bool,
 }
 
 impl Manifest {

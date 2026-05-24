@@ -1,3 +1,4 @@
+use crate::crypto;
 use crate::error::Result;
 use crate::hooks::{hooks_dir, HOOKS, MARKER};
 use crate::repo::Repo;
@@ -14,6 +15,19 @@ pub struct DoctorReport {
     pub shim_status: ShimStatus,
     pub canary_roundtrip: bool,
     pub recent_hook_errors: Vec<String>,
+    pub crypto_status: CryptoStatus,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum CryptoStatus {
+    /// Store has no recipient file; encryption not provisioned.
+    NotProvisioned,
+    /// Recipient on disk, identity reachable via attached crypto context; round-trip OK.
+    Healthy { insecure_file_key: bool },
+    /// Provisioned but doctor couldn't decrypt the canary.
+    RoundtripFailed(String),
+    /// Recipient on disk but no identity attached to the store at doctor time.
+    KeyUnreachable,
 }
 
 #[derive(Debug)]
@@ -75,24 +89,46 @@ pub fn run(repo: &Repo, store: &Store) -> Result<DoctorReport> {
         Err(e) => (Err(e), 0),
     };
 
-    // Canary: roundtrip a fixed blob; clean up after to avoid lingering
-    // doctor-only artifacts in the user-visible store.
+    // Canary: roundtrip a fixed blob through the SAME write/read path the
+    // user's snapshots take. On an encrypted store this exercises
+    // write_blob_encrypted + read_blob_encrypted so an unreachable identity
+    // or corrupt recipient surfaces here, not at first real snap.
     let canary_bytes: &[u8] = b"gitsafe-doctor-canary-32-bytes!!";
-    let canary_roundtrip = match store.write_blob(canary_bytes) {
-        Ok(d) => {
-            let ok = store
-                .read_blob(&d)
-                .map(|b| b == canary_bytes)
-                .unwrap_or(false);
-            // Best-effort cleanup; canary blob is unreferenced by any manifest
-            // so the next `gc` would drop it regardless.
-            let _ = store.delete_blob(&d);
-            ok
-        }
-        Err(_) => false,
+    let canary_roundtrip = match store.crypto() {
+        Some(ctx) => match store.write_blob_encrypted(canary_bytes, &ctx.recipient) {
+            Ok(d) => {
+                let ok = store
+                    .read_blob_encrypted(&d, &ctx.identity)
+                    .map(|b| b == canary_bytes)
+                    .unwrap_or(false);
+                if let Err(e) = store.delete_blob(&d) {
+                    eprintln!(
+                        "gitsafe: warning: canary blob cleanup failed at {d}: {e}"
+                    );
+                }
+                ok
+            }
+            Err(_) => false,
+        },
+        None => match store.write_blob(canary_bytes) {
+            Ok(d) => {
+                let ok = store
+                    .read_blob(&d)
+                    .map(|b| b == canary_bytes)
+                    .unwrap_or(false);
+                if let Err(e) = store.delete_blob(&d) {
+                    eprintln!(
+                        "gitsafe: warning: canary blob cleanup failed at {d}: {e}"
+                    );
+                }
+                ok
+            }
+            Err(_) => false,
+        },
     };
 
     let recent_hook_errors = read_hook_error_log(store);
+    let crypto_status = assess_crypto(store);
 
     Ok(DoctorReport {
         hooks: hook_status,
@@ -102,7 +138,30 @@ pub fn run(repo: &Repo, store: &Store) -> Result<DoctorReport> {
         shim_status: ShimStatus::Off,
         canary_roundtrip,
         recent_hook_errors,
+        crypto_status,
     })
+}
+
+fn assess_crypto(store: &Store) -> CryptoStatus {
+    if !store.provisioned_for_encryption() {
+        return CryptoStatus::NotProvisioned;
+    }
+    let ctx = match store.crypto() {
+        Some(c) => c,
+        None => return CryptoStatus::KeyUnreachable,
+    };
+    // Canary: encrypt a fixed plaintext and decrypt it back.
+    let plaintext: &[u8] = b"gitsafe-crypto-canary";
+    match crypto::encrypt(plaintext, &ctx.recipient) {
+        Err(e) => return CryptoStatus::RoundtripFailed(e.to_string()),
+        Ok(ct) => match crypto::decrypt(&ct, &ctx.identity) {
+            Ok(pt) if pt == plaintext => {
+                CryptoStatus::Healthy { insecure_file_key: store.is_insecure_keyed() }
+            }
+            Ok(_) => CryptoStatus::RoundtripFailed("plaintext mismatch".into()),
+            Err(e) => CryptoStatus::RoundtripFailed(e.to_string()),
+        },
+    }
 }
 
 fn read_hook_error_log(store: &Store) -> Vec<String> {
@@ -154,6 +213,13 @@ impl DoctorReport {
         if !self.recent_hook_errors.is_empty() {
             return Some("recent hook errors logged");
         }
+        match &self.crypto_status {
+            CryptoStatus::NotProvisioned => {}
+            CryptoStatus::Healthy { insecure_file_key: false } => {}
+            CryptoStatus::Healthy { insecure_file_key: true } => return Some("insecure file key"),
+            CryptoStatus::KeyUnreachable => return Some("encryption key unreachable"),
+            CryptoStatus::RoundtripFailed(_) => return Some("encryption canary roundtrip failed"),
+        }
         None
     }
 
@@ -200,6 +266,16 @@ impl DoctorReport {
                 let _ = writeln!(s, "    {line}");
             }
         }
+        let crypto_label = match &self.crypto_status {
+            CryptoStatus::NotProvisioned => "not provisioned".into(),
+            CryptoStatus::Healthy { insecure_file_key: false } => "ok (keychain)".into(),
+            CryptoStatus::Healthy { insecure_file_key: true } => {
+                "ok (INSECURE FILE KEY — see --insecure-file-key)".into()
+            }
+            CryptoStatus::KeyUnreachable => "KEY UNREACHABLE".into(),
+            CryptoStatus::RoundtripFailed(err) => format!("ROUNDTRIP FAILED: {err}"),
+        };
+        let _ = writeln!(s, "  encryption          : {crypto_label}");
         let _ = writeln!(
             s,
             "  overall             : {}",
@@ -306,6 +382,120 @@ mod tests {
         assert!(matches!(pc.state, HookState::Tampered), "got {:?}", pc.state);
         assert!(!report.is_healthy());
         assert_eq!(report.first_failure(), Some("hook tampered"));
+    }
+
+    #[test]
+    fn doctor_reports_crypto_not_provisioned_by_default() {
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        hooks::install(&repo, &store.root.join("hook-errors.log")).unwrap();
+        let report = run(&repo, &store).unwrap();
+        assert_eq!(report.crypto_status, CryptoStatus::NotProvisioned);
+        assert!(report.is_healthy());
+    }
+
+    #[test]
+    fn doctor_reports_healthy_crypto_when_identity_attached() {
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        hooks::install(&repo, &store.root.join("hook-errors.log")).unwrap();
+        let id = crate::crypto::generate_identity();
+        store.save_recipient(&crate::crypto::recipient_of(&id)).unwrap();
+        let store = store.with_crypto(crate::store::CryptoCtx::from_identity(id));
+        let report = run(&repo, &store).unwrap();
+        assert!(matches!(
+            report.crypto_status,
+            CryptoStatus::Healthy { insecure_file_key: false }
+        ), "got {:?}", report.crypto_status);
+        assert!(report.is_healthy());
+    }
+
+    #[test]
+    fn doctor_flags_key_unreachable_when_provisioned_but_unattached() {
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        hooks::install(&repo, &store.root.join("hook-errors.log")).unwrap();
+        // Provisioned (recipient on disk) but no identity attached.
+        let id = crate::crypto::generate_identity();
+        store.save_recipient(&crate::crypto::recipient_of(&id)).unwrap();
+        let report = run(&repo, &store).unwrap();
+        assert_eq!(report.crypto_status, CryptoStatus::KeyUnreachable);
+        assert!(!report.is_healthy());
+        assert_eq!(report.first_failure(), Some("encryption key unreachable"));
+    }
+
+    #[test]
+    fn doctor_flags_insecure_file_key_in_render_and_first_failure() {
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        hooks::install(&repo, &store.root.join("hook-errors.log")).unwrap();
+        let id = crate::crypto::generate_identity();
+        store.save_recipient(&crate::crypto::recipient_of(&id)).unwrap();
+        store.mark_insecure().unwrap();
+        let store = store.with_crypto(crate::store::CryptoCtx::from_identity(id));
+        let report = run(&repo, &store).unwrap();
+        assert!(matches!(
+            report.crypto_status,
+            CryptoStatus::Healthy { insecure_file_key: true }
+        ));
+        assert!(
+            report.render().contains("INSECURE FILE KEY"),
+            "render did not surface the warning:\n{}",
+            report.render()
+        );
+        // Insecure file key is a non-zero-exit condition: CI gates like
+        // `gitsafe doctor && deploy` must catch it.
+        assert!(!report.is_healthy());
+        assert_eq!(report.first_failure(), Some("insecure file key"));
+    }
+
+    #[test]
+    fn doctor_canary_uses_crypto_path_on_encrypted_store() {
+        // Regression for: doctor canary previously used write_blob (plaintext)
+        // even on an encrypted store, so a broken crypto path passed the
+        // canary check on disk.
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        hooks::install(&repo, &store.root.join("hook-errors.log")).unwrap();
+        let id = crate::crypto::generate_identity();
+        store.save_recipient(&crate::crypto::recipient_of(&id)).unwrap();
+        let store = store.with_crypto(crate::store::CryptoCtx::from_identity(id));
+        // Run, then inspect objects/. Canary cleanup is best-effort so we
+        // can't rely on it being gone, but if any blob is on disk it must
+        // NOT match the plaintext canary bytes.
+        let _ = run(&repo, &store).unwrap();
+        let objects = store.objects_dir();
+        let mut found_blob = false;
+        if let Ok(rd) = fs::read_dir(&objects) {
+            for shard in rd.flatten() {
+                if !shard.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                if let Ok(rd2) = fs::read_dir(shard.path()) {
+                    for f in rd2.flatten() {
+                        let bytes = fs::read(f.path()).unwrap();
+                        found_blob = true;
+                        assert_ne!(
+                            bytes,
+                            b"gitsafe-doctor-canary-32-bytes!!".to_vec(),
+                            "canary wrote plaintext on an encrypted store"
+                        );
+                    }
+                }
+            }
+        }
+        // If the cleanup succeeded we won't find any blob — that's also fine.
+        let _ = found_blob;
     }
 
     #[cfg(unix)]

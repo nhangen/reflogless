@@ -29,6 +29,23 @@ impl Repo {
         hex::encode_short(&digest[..8])
     }
 
+    /// Refuse to operate on a repo owned by another user.
+    ///
+    /// On unix, compares `repo.root`'s owner uid against the current effective
+    /// uid. Returns `Error::UnsafeOwnership` if they differ. No-op on non-unix
+    /// (Windows ownership semantics differ; future work).
+    #[cfg(unix)]
+    pub fn assert_safe_ownership(&self) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::metadata(&self.root).map_err(|e| Error::io(&self.root, e))?;
+        is_uid_safe(md.uid(), unsafe { libc_geteuid() }, &self.root)
+    }
+
+    #[cfg(not(unix))]
+    pub fn assert_safe_ownership(&self) -> Result<()> {
+        Ok(())
+    }
+
     pub fn status_porcelain(&self) -> Result<Vec<StatusEntry>> {
         let out = Command::new("git")
             .arg("-C")
@@ -93,6 +110,29 @@ fn parse_porcelain_z(buf: &[u8]) -> Vec<StatusEntry> {
     out
 }
 
+#[cfg(unix)]
+extern "C" {
+    fn geteuid() -> u32;
+}
+
+#[cfg(unix)]
+unsafe fn libc_geteuid() -> u32 {
+    geteuid()
+}
+
+/// Pure helper extracted from `assert_safe_ownership` so the safety invariant
+/// is exercised without needing a real chown'd fixture in tests.
+#[cfg(unix)]
+fn is_uid_safe(owner: u32, me: u32, root: &Path) -> Result<()> {
+    if owner != me {
+        return Err(Error::UnsafeOwnership(format!(
+            "repo {} is owned by uid {owner}, but current uid is {me}",
+            root.display()
+        )));
+    }
+    Ok(())
+}
+
 mod hex {
     pub fn encode_short(bytes: &[u8]) -> String {
         let mut s = String::with_capacity(bytes.len() * 2);
@@ -123,6 +163,27 @@ mod tests {
         let entries = parse_porcelain_z(buf);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path, PathBuf::from("other.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_uid_safe_accepts_matching_owner() {
+        let p = PathBuf::from("/tmp/x");
+        assert!(is_uid_safe(501, 501, &p).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_uid_safe_rejects_uid_mismatch() {
+        let p = PathBuf::from("/tmp/foreign");
+        match is_uid_safe(0, 501, &p) {
+            Err(Error::UnsafeOwnership(msg)) => {
+                assert!(msg.contains("/tmp/foreign"));
+                assert!(msg.contains("uid 0"));
+                assert!(msg.contains("uid is 501"));
+            }
+            other => panic!("expected UnsafeOwnership, got {other:?}"),
+        }
     }
 
     #[test]

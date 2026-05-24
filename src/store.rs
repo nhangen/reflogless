@@ -1,6 +1,8 @@
+use crate::crypto;
 use crate::error::{Error, Result};
 use crate::manifest::Manifest;
 use crate::repo::Repo;
+use age::x25519::{Identity, Recipient};
 use chrono::{Duration, Utc};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -9,6 +11,9 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub const RECIPIENT_FILENAME: &str = "recipient.txt";
+pub const INSECURE_KEY_MARKER: &str = "insecure-file-key";
+
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub const DEFAULT_MAX_STORE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -16,6 +21,23 @@ pub const DEFAULT_MAX_AGE_DAYS: i64 = 30;
 
 pub struct Store {
     pub root: PathBuf,
+    crypto: Option<CryptoCtx>,
+}
+
+/// Bundle of materials needed to encrypt blobs (`recipient`) and decrypt them
+/// (`identity`). Stored on `Store` so all manifest/blob read paths can pick up
+/// encryption transparently without leaking it into every signature.
+#[derive(Clone)]
+pub struct CryptoCtx {
+    pub identity: Identity,
+    pub recipient: Recipient,
+}
+
+impl CryptoCtx {
+    pub fn from_identity(identity: Identity) -> Self {
+        let recipient = crypto::recipient_of(&identity);
+        Self { identity, recipient }
+    }
 }
 
 impl Store {
@@ -25,10 +47,68 @@ impl Store {
 
     pub fn for_repo_with_base(repo: &Repo, base: PathBuf) -> Result<Self> {
         let root = base.join("gitsafe").join(repo.id());
-        fs::create_dir_all(root.join("objects")).map_err(|e| Error::io(&root, e))?;
-        fs::create_dir_all(root.join("snapshots")).map_err(|e| Error::io(&root, e))?;
+        let objects = root.join("objects");
+        let snapshots = root.join("snapshots");
+        fs::create_dir_all(&objects).map_err(|e| Error::io(&root, e))?;
+        fs::create_dir_all(&snapshots).map_err(|e| Error::io(&root, e))?;
         set_dir_perms(&root)?;
-        Ok(Self { root })
+        set_dir_perms(&objects)?;
+        set_dir_perms(&snapshots)?;
+        Ok(Self {
+            root,
+            crypto: None,
+        })
+    }
+
+    /// Attach a crypto context. Subsequent manifest writes/reads will encrypt
+    /// the manifest body, and `write_blob_via_policy` / `read_entry` will route
+    /// through encryption when the policy says so.
+    pub fn with_crypto(mut self, ctx: CryptoCtx) -> Self {
+        self.crypto = Some(ctx);
+        self
+    }
+
+    pub fn crypto(&self) -> Option<&CryptoCtx> {
+        self.crypto.as_ref()
+    }
+
+    /// Path to the on-disk recipient (public key) file. Presence indicates the
+    /// store was provisioned for encryption.
+    pub fn recipient_path(&self) -> PathBuf {
+        self.root.join(RECIPIENT_FILENAME)
+    }
+
+    /// Path to the insecure-file-key marker. Presence indicates the identity
+    /// lives in a local file rather than the OS keychain. Doctor surfaces this.
+    pub fn insecure_marker_path(&self) -> PathBuf {
+        self.root.join(INSECURE_KEY_MARKER)
+    }
+
+    pub fn provisioned_for_encryption(&self) -> bool {
+        self.recipient_path().exists()
+    }
+
+    pub fn save_recipient(&self, recipient: &Recipient) -> Result<()> {
+        let p = self.recipient_path();
+        atomic_write(&p, recipient.to_string().as_bytes())?;
+        set_file_perms(&p)?;
+        Ok(())
+    }
+
+    pub fn load_recipient(&self) -> Result<Recipient> {
+        let p = self.recipient_path();
+        let s = fs::read_to_string(&p).map_err(|e| Error::io(&p, e))?;
+        crypto::parse_recipient(&s)
+    }
+
+    pub fn mark_insecure(&self) -> Result<()> {
+        let p = self.insecure_marker_path();
+        atomic_write(&p, b"")?;
+        set_file_perms(&p)
+    }
+
+    pub fn is_insecure_keyed(&self) -> bool {
+        self.insecure_marker_path().exists()
     }
 
     pub fn objects_dir(&self) -> PathBuf {
@@ -39,20 +119,40 @@ impl Store {
         self.root.join("snapshots")
     }
 
+    /// Write plaintext bytes to a CAS blob keyed by sha256 of plaintext.
+    /// Returns the plaintext digest. Used when no encryption is desired.
     pub fn write_blob(&self, bytes: &[u8]) -> Result<String> {
+        self.write_blob_inner(bytes, bytes)
+    }
+
+    /// Write a blob whose disk-content is encrypted with `recipient`. CAS key
+    /// stays the *plaintext* digest so dedup works across snapshots regardless
+    /// of nonce churn. Caller records `encrypted: true` in the manifest entry.
+    pub fn write_blob_encrypted(&self, plaintext: &[u8], recipient: &Recipient) -> Result<String> {
+        let ciphertext = crypto::encrypt(plaintext, recipient)?;
+        self.write_blob_inner(plaintext, &ciphertext)
+    }
+
+    fn write_blob_inner(&self, plaintext_for_digest: &[u8], on_disk: &[u8]) -> Result<String> {
         let mut h = Sha256::new();
-        h.update(bytes);
+        h.update(plaintext_for_digest);
         let digest = format!("{:x}", h.finalize());
         let (a, b) = digest.split_at(2);
         let dir = self.objects_dir().join(a);
+        let dir_existed = dir.exists();
         fs::create_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
+        if !dir_existed {
+            // 0700 on new shards too, not just the root, so blob existence
+            // can't be enumerated by world-readable directory traversal.
+            set_dir_perms(&dir)?;
+        }
         let p = dir.join(b);
         let rewrite = match fs::metadata(&p) {
-            Ok(md) => md.len() != bytes.len() as u64,
+            Ok(md) => md.len() != on_disk.len() as u64,
             Err(_) => true,
         };
         if rewrite {
-            atomic_write(&p, bytes)?;
+            atomic_write(&p, on_disk)?;
             set_file_perms(&p)?;
         }
         Ok(digest)
@@ -67,6 +167,30 @@ impl Store {
         Ok(buf)
     }
 
+    /// Read an age-encrypted blob and return decrypted plaintext.
+    pub fn read_blob_encrypted(&self, digest: &str, identity: &Identity) -> Result<Vec<u8>> {
+        let ct = self.read_blob(digest)?;
+        crypto::decrypt(&ct, identity)
+    }
+
+    /// Read a manifest entry's bytes, branching on `entry.encrypted` so callers
+    /// can't accidentally feed ciphertext into a text-diff or restore path.
+    /// Errors loudly when an encrypted entry is read against a store with no
+    /// crypto context attached.
+    pub fn read_entry(&self, entry: &crate::manifest::ManifestEntry) -> Result<Vec<u8>> {
+        if entry.encrypted {
+            let ctx = self.crypto.as_ref().ok_or_else(|| {
+                Error::Decryption(format!(
+                    "entry {} is encrypted but no identity attached to store",
+                    entry.path.display()
+                ))
+            })?;
+            self.read_blob_encrypted(&entry.blob, &ctx.identity)
+        } else {
+            self.read_blob(&entry.blob)
+        }
+    }
+
     pub fn delete_blob(&self, digest: &str) -> Result<()> {
         let (a, b) = digest.split_at(2);
         let p = self.objects_dir().join(a).join(b);
@@ -76,11 +200,26 @@ impl Store {
         Ok(())
     }
 
+    /// Write the manifest. When the store has a crypto context attached, the
+    /// body is age-encrypted and written as `<id>.json.age`. Otherwise plain
+    /// JSON at `<id>.json`.
     pub fn write_manifest(&self, m: &Manifest) -> Result<PathBuf> {
-        let p = self.snapshots_dir().join(format!("{}.json", m.id));
         let json = serde_json::to_vec_pretty(m)?;
-        atomic_write(&p, &json)?;
-        set_file_perms(&p)?;
+        let p = match &self.crypto {
+            Some(ctx) => {
+                let body = crypto::encrypt(&json, &ctx.recipient)?;
+                let p = self.snapshots_dir().join(format!("{}.json.age", m.id));
+                atomic_write(&p, &body)?;
+                set_file_perms(&p)?;
+                p
+            }
+            None => {
+                let p = self.snapshots_dir().join(format!("{}.json", m.id));
+                atomic_write(&p, &json)?;
+                set_file_perms(&p)?;
+                p
+            }
+        };
         Ok(p)
     }
 
@@ -88,7 +227,12 @@ impl Store {
         if id.is_empty() {
             return Err(Error::SnapshotNotFound("(empty)".into()));
         }
-        // exact match
+        // exact match: try encrypted first, then plain, so an encrypted store
+        // can still surface a pre-encryption manifest if one lingers.
+        let enc = self.snapshots_dir().join(format!("{}.json.age", id));
+        if enc.exists() {
+            return self.read_manifest_file(&enc);
+        }
         let exact = self.snapshots_dir().join(format!("{}.json", id));
         if exact.exists() {
             return self.read_manifest_file(&exact);
@@ -106,8 +250,7 @@ impl Store {
             .list_manifest_paths()?
             .into_iter()
             .filter(|p| {
-                p.file_stem()
-                    .and_then(|s| s.to_str())
+                manifest_id_from_path(p.as_path())
                     .map(|s| s.starts_with(id))
                     .unwrap_or(false)
             })
@@ -118,7 +261,7 @@ impl Store {
             _ => {
                 let ids: Vec<String> = matches
                     .iter()
-                    .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(String::from))
+                    .filter_map(|p| manifest_id_from_path(p))
                     .collect();
                 Err(Error::AmbiguousSnapshot {
                     id: id.into(),
@@ -160,7 +303,11 @@ impl Store {
         for entry in rd {
             let entry = entry.map_err(|e| Error::io(&dir, e))?;
             let p = entry.path();
-            if p.extension().and_then(|s| s.to_str()) == Some("json") {
+            let name = match p.file_name().and_then(|s| s.to_str()) {
+                Some(s) => s,
+                None => continue,
+            };
+            if name.ends_with(".json") || name.ends_with(".json.age") {
                 paths.push(p);
             }
         }
@@ -171,7 +318,18 @@ impl Store {
         let mut f = fs::File::open(p).map_err(|e| Error::io(p, e))?;
         let mut buf = Vec::new();
         f.read_to_end(&mut buf).map_err(|e| Error::io(p, e))?;
-        Ok(serde_json::from_slice(&buf)?)
+        let plaintext = if is_encrypted_manifest_path(p) {
+            let ctx = self.crypto.as_ref().ok_or_else(|| {
+                Error::Decryption(format!(
+                    "encrypted manifest {} but no identity attached",
+                    p.display()
+                ))
+            })?;
+            crypto::decrypt(&buf, &ctx.identity)?
+        } else {
+            buf
+        };
+        Ok(serde_json::from_slice(&plaintext)?)
     }
 
     /// Evict snapshots older than `max_age_days`, then enforce `max_bytes` by LRU
@@ -289,6 +447,26 @@ pub struct GcReport {
     pub blobs_evicted: usize,
 }
 
+/// Strip `.json` or `.json.age` extension and return the manifest id portion of
+/// a snapshot filename. Returns None when the filename has neither suffix.
+fn manifest_id_from_path(p: &Path) -> Option<String> {
+    let name = p.file_name()?.to_str()?;
+    if let Some(stem) = name.strip_suffix(".json.age") {
+        return Some(stem.to_string());
+    }
+    if let Some(stem) = name.strip_suffix(".json") {
+        return Some(stem.to_string());
+    }
+    None
+}
+
+fn is_encrypted_manifest_path(p: &Path) -> bool {
+    p.file_name()
+        .and_then(|s| s.to_str())
+        .map(|n| n.ends_with(".json.age"))
+        .unwrap_or(false)
+}
+
 fn base_data_dir() -> Result<PathBuf> {
     // Explicit override beats platform default.
     if let Ok(p) = std::env::var("GITSAFE_DATA_DIR") {
@@ -367,7 +545,13 @@ mod tests {
         let root = td.path().join("gitsafe").join("test");
         fs::create_dir_all(root.join("objects")).unwrap();
         fs::create_dir_all(root.join("snapshots")).unwrap();
-        (td, Store { root })
+        (
+            td,
+            Store {
+                root,
+                crypto: None,
+            },
+        )
     }
 
     #[test]
@@ -395,6 +579,48 @@ mod tests {
             .filter(|d| d.file_name().to_string_lossy().starts_with(".gitsafe-tmp-"))
             .collect();
         assert!(leftovers.is_empty(), "tmp leftover: {leftovers:?}");
+    }
+
+    #[test]
+    fn load_manifest_prefers_encrypted_when_both_exist() {
+        // Pre-Phase-3 manifests may linger next to their re-encrypted siblings
+        // during migration. The encrypted file is canonical for a crypto-attached
+        // store and must win.
+        use crate::crypto;
+        let (_td, store) = ephemeral_store();
+        let id_str = "20260523T000000000Z-manual";
+        // Write plaintext directly.
+        let m = make_manifest(id_str, Utc::now(), vec![]);
+        let plain_json = serde_json::to_vec_pretty(&m).unwrap();
+        atomic_write(&store.snapshots_dir().join(format!("{id_str}.json")), &plain_json).unwrap();
+        // Write encrypted with a different message under same id.
+        let id = crypto::generate_identity();
+        let recipient = crypto::recipient_of(&id);
+        let store = store.with_crypto(CryptoCtx::from_identity(id));
+        let mut m2 = make_manifest(id_str, Utc::now(), vec![]);
+        m2.message = Some("from-encrypted".into());
+        let body = serde_json::to_vec_pretty(&m2).unwrap();
+        let ct = crypto::encrypt(&body, &recipient).unwrap();
+        atomic_write(&store.snapshots_dir().join(format!("{id_str}.json.age")), &ct).unwrap();
+
+        let loaded = store.load_manifest(id_str).unwrap();
+        assert_eq!(loaded.message.as_deref(), Some("from-encrypted"));
+    }
+
+    #[test]
+    fn gc_evicts_corrupt_encrypted_manifest() {
+        use crate::crypto;
+        let (_td, store) = ephemeral_store();
+        let id = crypto::generate_identity();
+        let store = store.with_crypto(CryptoCtx::from_identity(id));
+        // Sabotage an encrypted manifest path with non-ciphertext bytes.
+        fs::write(
+            store.snapshots_dir().join("20260523T000000000Z-manual.json.age"),
+            b"not-age-encrypted",
+        )
+        .unwrap();
+        let report = store.gc(365, u64::MAX).unwrap();
+        assert_eq!(report.snapshots_corrupt_evicted, 1);
     }
 
     #[test]
@@ -493,6 +719,7 @@ mod tests {
             blob: digest.clone(),
             size: 7,
             mode: 0o644,
+            encrypted: false,
         }];
         store
             .write_manifest(&make_manifest(
@@ -523,6 +750,7 @@ mod tests {
                     blob: digest.into(),
                     size: 1000,
                     mode: 0o644,
+                    encrypted: false,
                 }],
             )
         };
@@ -568,6 +796,7 @@ mod tests {
                     blob: digest.clone(),
                     size: 1,
                     mode: 0o644,
+                    encrypted: false,
                 }],
             ))
             .unwrap();
