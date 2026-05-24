@@ -42,7 +42,7 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 powershell -ExecutionPolicy ByPass -c "irm https://github.com/nhangen/llm-tools/releases/latest/download/gitsafe-installer.ps1 | iex"
 ```
 
-Or download a per-platform archive directly from the [releases page](https://github.com/nhangen/llm-tools/releases): `gitsafe-aarch64-apple-darwin.tar.xz` (Apple Silicon), `gitsafe-x86_64-apple-darwin.tar.xz` (Intel Mac), `gitsafe-x86_64-unknown-linux-gnu.tar.xz`, `gitsafe-aarch64-unknown-linux-gnu.tar.xz`, `gitsafe-x86_64-pc-windows-msvc.zip`.
+Or download a per-platform archive directly from the [releases page](https://github.com/nhangen/llm-tools/releases): `gitsafe-aarch64-apple-darwin.tar.xz` (Apple Silicon), `gitsafe-x86_64-apple-darwin.tar.xz` (Intel Mac), `gitsafe-x86_64-unknown-linux-gnu.tar.xz`, `gitsafe-x86_64-pc-windows-msvc.zip`. aarch64-linux (Graviton, RPi, Ampere) needs to build from source for v0.1.0 — prebuilt arm64-linux is a follow-up.
 
 > **Windows users:** v0.1.0 binaries are unsigned. SmartScreen will warn on first run ("Windows protected your PC") — choose *More info* → *Run anyway*. On enterprise machines with Smart App Control or AppLocker in enforcement mode the binary may be blocked silently with no warning dialog — use `cargo install --path .` from source or wait for v2 signed builds. Authenticode EV signing is deferred to v2 (cert is $300–600/year + HSM).
 
