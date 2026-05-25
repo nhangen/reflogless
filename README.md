@@ -244,6 +244,30 @@ installed shim at /Users/me/.local/bin/git (delegates to /Users/me/.cargo/bin/re
   ensure /Users/me/.local/bin is earlier on PATH than your system git
 ```
 
+#### Once per machine, not per repo
+
+The shim is a single file at `~/.local/bin/git` that catches `git clean` and `git reset --hard` system-wide — every repo, every directory. Install it once and you're covered everywhere.
+
+| What | Scope | Where |
+|---|---|---|
+| Shim script | **per machine** | `~/.local/bin/git` |
+| Hooks (`post-checkout`, `pre-rebase`, `post-rewrite`, `reference-transaction`) | **per repo** | `<repo>/.git/hooks/` |
+| Snapshot store + encryption identity | **per repo** | `$XDG_DATA_HOME/reflogless/<repo-hash>/` + keychain entry keyed on `<repo-hash>` |
+| `.reflogless.toml` policy | **per repo** | `<repo>/.reflogless.toml` |
+
+Typical workflow:
+
+```sh
+# once per machine
+reflogless init --shim
+
+# in every other repo you also want hooks + encryption for
+cd ../another-repo
+reflogless init   # (no --shim — already installed; the call is idempotent if you do pass it)
+```
+
+In a repo where you've never run `reflogless init`, the shim still catches destructive `git` commands and snapshots into a freshly-created (unencrypted) store. You'll have shim coverage but not hook coverage and not encryption until you `init` that repo. `reflogless doctor` from inside the repo will then flag the missing pieces.
+
 The shim is a five-line `/bin/sh` script — `cat ~/.local/bin/git` to see exactly what it does. `reflogless doctor` reports its status:
 
 - `shim: on (/path/to/git)` — installed and first on PATH.
