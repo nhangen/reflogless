@@ -19,6 +19,9 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub const DEFAULT_MAX_STORE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const DEFAULT_MAX_AGE_DAYS: i64 = 30;
 
+/// (successfully-parsed manifests, per-path read errors for the rest).
+pub type LenientManifestList = (Vec<Manifest>, Vec<(PathBuf, Error)>);
+
 pub struct Store {
     pub root: PathBuf,
     crypto: Option<CryptoCtx>,
@@ -36,7 +39,10 @@ pub struct CryptoCtx {
 impl CryptoCtx {
     pub fn from_identity(identity: Identity) -> Self {
         let recipient = crypto::recipient_of(&identity);
-        Self { identity, recipient }
+        Self {
+            identity,
+            recipient,
+        }
     }
 }
 
@@ -54,10 +60,7 @@ impl Store {
         set_dir_perms(&root)?;
         set_dir_perms(&objects)?;
         set_dir_perms(&snapshots)?;
-        Ok(Self {
-            root,
-            crypto: None,
-        })
+        Ok(Self { root, crypto: None })
     }
 
     /// Attach a crypto context. Subsequent manifest writes/reads will encrypt
@@ -284,7 +287,7 @@ impl Store {
 
     /// Returns successfully-parsed manifests plus per-path errors for the rest.
     /// One bad manifest never blinds the user to the N-1 good ones.
-    pub fn list_manifests_lenient(&self) -> Result<(Vec<Manifest>, Vec<(PathBuf, Error)>)> {
+    pub fn list_manifests_lenient(&self) -> Result<LenientManifestList> {
         let mut ok = Vec::new();
         let mut warnings = Vec::new();
         for p in self.list_manifest_paths()? {
@@ -485,11 +488,7 @@ fn base_data_dir() -> Result<PathBuf> {
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().unwrap_or(Path::new("."));
     let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = parent.join(format!(
-        ".reflogless-tmp-{}-{}",
-        std::process::id(),
-        n
-    ));
+    let tmp = parent.join(format!(".reflogless-tmp-{}-{}", std::process::id(), n));
     let write_result = (|| -> Result<()> {
         let mut f = fs::File::create(&tmp).map_err(|e| Error::io(&tmp, e))?;
         f.write_all(bytes).map_err(|e| Error::io(&tmp, e))?;
@@ -545,13 +544,7 @@ mod tests {
         let root = td.path().join("reflogless").join("test");
         fs::create_dir_all(root.join("objects")).unwrap();
         fs::create_dir_all(root.join("snapshots")).unwrap();
-        (
-            td,
-            Store {
-                root,
-                crypto: None,
-            },
-        )
+        (td, Store { root, crypto: None })
     }
 
     #[test]
@@ -576,7 +569,11 @@ mod tests {
         let leftovers: Vec<_> = fs::read_dir(p.parent().unwrap())
             .unwrap()
             .filter_map(|d| d.ok())
-            .filter(|d| d.file_name().to_string_lossy().starts_with(".reflogless-tmp-"))
+            .filter(|d| {
+                d.file_name()
+                    .to_string_lossy()
+                    .starts_with(".reflogless-tmp-")
+            })
             .collect();
         assert!(leftovers.is_empty(), "tmp leftover: {leftovers:?}");
     }
@@ -592,7 +589,11 @@ mod tests {
         // Write plaintext directly.
         let m = make_manifest(id_str, Utc::now(), vec![]);
         let plain_json = serde_json::to_vec_pretty(&m).unwrap();
-        atomic_write(&store.snapshots_dir().join(format!("{id_str}.json")), &plain_json).unwrap();
+        atomic_write(
+            &store.snapshots_dir().join(format!("{id_str}.json")),
+            &plain_json,
+        )
+        .unwrap();
         // Write encrypted with a different message under same id.
         let id = crypto::generate_identity();
         let recipient = crypto::recipient_of(&id);
@@ -601,7 +602,11 @@ mod tests {
         m2.message = Some("from-encrypted".into());
         let body = serde_json::to_vec_pretty(&m2).unwrap();
         let ct = crypto::encrypt(&body, &recipient).unwrap();
-        atomic_write(&store.snapshots_dir().join(format!("{id_str}.json.age")), &ct).unwrap();
+        atomic_write(
+            &store.snapshots_dir().join(format!("{id_str}.json.age")),
+            &ct,
+        )
+        .unwrap();
 
         let loaded = store.load_manifest(id_str).unwrap();
         assert_eq!(loaded.message.as_deref(), Some("from-encrypted"));
@@ -615,7 +620,9 @@ mod tests {
         let store = store.with_crypto(CryptoCtx::from_identity(id));
         // Sabotage an encrypted manifest path with non-ciphertext bytes.
         fs::write(
-            store.snapshots_dir().join("20260523T000000000Z-manual.json.age"),
+            store
+                .snapshots_dir()
+                .join("20260523T000000000Z-manual.json.age"),
             b"not-age-encrypted",
         )
         .unwrap();
@@ -673,10 +680,18 @@ mod tests {
     fn load_manifest_prefix_match_returns_unique() {
         let (_td, store) = ephemeral_store();
         store
-            .write_manifest(&make_manifest("20260520T000000000Z-manual", Utc::now(), vec![]))
+            .write_manifest(&make_manifest(
+                "20260520T000000000Z-manual",
+                Utc::now(),
+                vec![],
+            ))
             .unwrap();
         store
-            .write_manifest(&make_manifest("20260521T000000000Z-manual", Utc::now(), vec![]))
+            .write_manifest(&make_manifest(
+                "20260521T000000000Z-manual",
+                Utc::now(),
+                vec![],
+            ))
             .unwrap();
         let m = store.load_manifest("20260520").unwrap();
         assert_eq!(m.id, "20260520T000000000Z-manual");
@@ -686,10 +701,18 @@ mod tests {
     fn load_manifest_ambiguous_prefix_errors() {
         let (_td, store) = ephemeral_store();
         store
-            .write_manifest(&make_manifest("20260520T000000000Z-manual", Utc::now(), vec![]))
+            .write_manifest(&make_manifest(
+                "20260520T000000000Z-manual",
+                Utc::now(),
+                vec![],
+            ))
             .unwrap();
         store
-            .write_manifest(&make_manifest("20260520T000000001Z-manual", Utc::now(), vec![]))
+            .write_manifest(&make_manifest(
+                "20260520T000000001Z-manual",
+                Utc::now(),
+                vec![],
+            ))
             .unwrap();
         match store.load_manifest("20260520") {
             Err(Error::AmbiguousSnapshot { matches, .. }) => assert_eq!(matches.len(), 2),
@@ -805,5 +828,4 @@ mod tests {
         assert_eq!(report.snapshots_corrupt_evicted, 1);
         assert!(store.load_manifest("good").is_ok());
     }
-
 }

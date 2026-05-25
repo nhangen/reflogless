@@ -142,9 +142,7 @@ pub fn run(repo: &Repo, store: &Store) -> Result<DoctorReport> {
                     .map(|b| b == canary_bytes)
                     .unwrap_or(false);
                 if let Err(e) = store.delete_blob(&d) {
-                    eprintln!(
-                        "reflogless: warning: canary blob cleanup failed at {d}: {e}"
-                    );
+                    eprintln!("reflogless: warning: canary blob cleanup failed at {d}: {e}");
                 }
                 ok
             }
@@ -157,9 +155,7 @@ pub fn run(repo: &Repo, store: &Store) -> Result<DoctorReport> {
                     .map(|b| b == canary_bytes)
                     .unwrap_or(false);
                 if let Err(e) = store.delete_blob(&d) {
-                    eprintln!(
-                        "reflogless: warning: canary blob cleanup failed at {d}: {e}"
-                    );
+                    eprintln!("reflogless: warning: canary blob cleanup failed at {d}: {e}");
                 }
                 ok
             }
@@ -193,11 +189,11 @@ fn assess_crypto(store: &Store) -> CryptoStatus {
     // Canary: encrypt a fixed plaintext and decrypt it back.
     let plaintext: &[u8] = b"reflogless-crypto-canary";
     match crypto::encrypt(plaintext, &ctx.recipient) {
-        Err(e) => return CryptoStatus::RoundtripFailed(e.to_string()),
+        Err(e) => CryptoStatus::RoundtripFailed(e.to_string()),
         Ok(ct) => match crypto::decrypt(&ct, &ctx.identity) {
-            Ok(pt) if pt == plaintext => {
-                CryptoStatus::Healthy { insecure_file_key: store.is_insecure_keyed() }
-            }
+            Ok(pt) if pt == plaintext => CryptoStatus::Healthy {
+                insecure_file_key: store.is_insecure_keyed(),
+            },
             Ok(_) => CryptoStatus::RoundtripFailed("plaintext mismatch".into()),
             Err(e) => CryptoStatus::RoundtripFailed(e.to_string()),
         },
@@ -255,8 +251,12 @@ impl DoctorReport {
         }
         match &self.crypto_status {
             CryptoStatus::NotProvisioned => {}
-            CryptoStatus::Healthy { insecure_file_key: false } => {}
-            CryptoStatus::Healthy { insecure_file_key: true } => return Some("insecure file key"),
+            CryptoStatus::Healthy {
+                insecure_file_key: false,
+            } => {}
+            CryptoStatus::Healthy {
+                insecure_file_key: true,
+            } => return Some("insecure file key"),
             CryptoStatus::KeyUnreachable => return Some("encryption key unreachable"),
             CryptoStatus::RoundtripFailed(_) => return Some("encryption canary roundtrip failed"),
         }
@@ -301,11 +301,19 @@ impl DoctorReport {
             }
         }
         let _ = writeln!(s, "  corrupt snapshots   : {}", self.corrupt_snapshots);
-        let _ = writeln!(s, "  shim                : {}", render_shim(&self.shim_status));
+        let _ = writeln!(
+            s,
+            "  shim                : {}",
+            render_shim(&self.shim_status)
+        );
         let _ = writeln!(
             s,
             "  canary roundtrip    : {}",
-            if self.canary_roundtrip { "ok" } else { "FAILED" }
+            if self.canary_roundtrip {
+                "ok"
+            } else {
+                "FAILED"
+            }
         );
         if !self.recent_hook_errors.is_empty() {
             let _ = writeln!(s, "  recent hook errors  :");
@@ -315,10 +323,12 @@ impl DoctorReport {
         }
         let crypto_label = match &self.crypto_status {
             CryptoStatus::NotProvisioned => "not provisioned".into(),
-            CryptoStatus::Healthy { insecure_file_key: false } => "ok (keychain)".into(),
-            CryptoStatus::Healthy { insecure_file_key: true } => {
-                "ok (INSECURE FILE KEY — see --insecure-file-key)".into()
-            }
+            CryptoStatus::Healthy {
+                insecure_file_key: false,
+            } => "ok (keychain)".into(),
+            CryptoStatus::Healthy {
+                insecure_file_key: true,
+            } => "ok (INSECURE FILE KEY — see --insecure-file-key)".into(),
             CryptoStatus::KeyUnreachable => "KEY UNREACHABLE".into(),
             CryptoStatus::RoundtripFailed(err) => format!("ROUNDTRIP FAILED: {err}"),
         };
@@ -346,7 +356,10 @@ fn render_shim(s: &ShimStatus) -> String {
             precedes.display()
         ),
         ShimStatus::Foreign { path } => {
-            format!("FOREIGN ({} exists but is not reflogless-managed)", path.display())
+            format!(
+                "FOREIGN ({} exists but is not reflogless-managed)",
+                path.display()
+            )
         }
         ShimStatus::Stale {
             path,
@@ -370,7 +383,10 @@ fn render_shim(s: &ShimStatus) -> String {
 fn dir_size(p: &std::path::Path) -> Result<u64> {
     use crate::error::Error;
     if !p.exists() {
-        return Err(Error::io(p, std::io::Error::from(std::io::ErrorKind::NotFound)));
+        return Err(Error::io(
+            p,
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+        ));
     }
     let mut total = 0;
     let mut stack = vec![p.to_path_buf()];
@@ -396,7 +412,12 @@ mod tests {
     use tempfile::TempDir;
 
     fn init_repo(td: &std::path::Path) -> Repo {
-        Command::new("git").arg("init").arg("-q").arg(td).status().unwrap();
+        Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(td)
+            .status()
+            .unwrap();
         Command::new("git")
             .args(["-C", td.to_str().unwrap(), "config", "user.email", "t@t"])
             .status()
@@ -457,7 +478,11 @@ mod tests {
             .iter()
             .find(|h| h.name == "post-checkout")
             .unwrap();
-        assert!(matches!(pc.state, HookState::Tampered), "got {:?}", pc.state);
+        assert!(
+            matches!(pc.state, HookState::Tampered),
+            "got {:?}",
+            pc.state
+        );
         assert!(!report.is_healthy());
         assert_eq!(report.first_failure(), Some("hook tampered"));
     }
@@ -482,13 +507,21 @@ mod tests {
         let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
         hooks::install(&repo, &store.root.join("hook-errors.log")).unwrap();
         let id = crate::crypto::generate_identity();
-        store.save_recipient(&crate::crypto::recipient_of(&id)).unwrap();
+        store
+            .save_recipient(&crate::crypto::recipient_of(&id))
+            .unwrap();
         let store = store.with_crypto(crate::store::CryptoCtx::from_identity(id));
         let report = run(&repo, &store).unwrap();
-        assert!(matches!(
-            report.crypto_status,
-            CryptoStatus::Healthy { insecure_file_key: false }
-        ), "got {:?}", report.crypto_status);
+        assert!(
+            matches!(
+                report.crypto_status,
+                CryptoStatus::Healthy {
+                    insecure_file_key: false
+                }
+            ),
+            "got {:?}",
+            report.crypto_status
+        );
         assert!(report.is_healthy());
     }
 
@@ -501,7 +534,9 @@ mod tests {
         hooks::install(&repo, &store.root.join("hook-errors.log")).unwrap();
         // Provisioned (recipient on disk) but no identity attached.
         let id = crate::crypto::generate_identity();
-        store.save_recipient(&crate::crypto::recipient_of(&id)).unwrap();
+        store
+            .save_recipient(&crate::crypto::recipient_of(&id))
+            .unwrap();
         let report = run(&repo, &store).unwrap();
         assert_eq!(report.crypto_status, CryptoStatus::KeyUnreachable);
         assert!(!report.is_healthy());
@@ -516,13 +551,17 @@ mod tests {
         let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
         hooks::install(&repo, &store.root.join("hook-errors.log")).unwrap();
         let id = crate::crypto::generate_identity();
-        store.save_recipient(&crate::crypto::recipient_of(&id)).unwrap();
+        store
+            .save_recipient(&crate::crypto::recipient_of(&id))
+            .unwrap();
         store.mark_insecure().unwrap();
         let store = store.with_crypto(crate::store::CryptoCtx::from_identity(id));
         let report = run(&repo, &store).unwrap();
         assert!(matches!(
             report.crypto_status,
-            CryptoStatus::Healthy { insecure_file_key: true }
+            CryptoStatus::Healthy {
+                insecure_file_key: true
+            }
         ));
         assert!(
             report.render().contains("INSECURE FILE KEY"),
@@ -546,7 +585,9 @@ mod tests {
         let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
         hooks::install(&repo, &store.root.join("hook-errors.log")).unwrap();
         let id = crate::crypto::generate_identity();
-        store.save_recipient(&crate::crypto::recipient_of(&id)).unwrap();
+        store
+            .save_recipient(&crate::crypto::recipient_of(&id))
+            .unwrap();
         let store = store.with_crypto(crate::store::CryptoCtx::from_identity(id));
         // Run, then inspect objects/. Canary cleanup is best-effort so we
         // can't rely on it being gone, but if any blob is on disk it must

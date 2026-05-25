@@ -139,10 +139,7 @@ pub fn restore(
     })
 }
 
-fn select_entries<'a>(
-    m: &'a Manifest,
-    only: &[PathBuf],
-) -> (Vec<&'a ManifestEntry>, Vec<PathBuf>) {
+fn select_entries<'a>(m: &'a Manifest, only: &[PathBuf]) -> (Vec<&'a ManifestEntry>, Vec<PathBuf>) {
     if only.is_empty() {
         return (m.entries.iter().collect(), Vec::new());
     }
@@ -195,9 +192,20 @@ mod tests {
     use tempfile::TempDir;
 
     fn make_repo(td: &Path) -> Repo {
-        Command::new("git").arg("init").arg("-q").arg(td).status().unwrap();
         Command::new("git")
-            .args(["-C", td.to_str().unwrap(), "config", "user.email", "t@example.com"])
+            .arg("init")
+            .arg("-q")
+            .arg(td)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args([
+                "-C",
+                td.to_str().unwrap(),
+                "config",
+                "user.email",
+                "t@example.com",
+            ])
             .status()
             .unwrap();
         Command::new("git")
@@ -225,7 +233,10 @@ mod tests {
 
         let r = restore(&repo, &store, &snap_res.manifest_id, &[], false).unwrap();
         assert_eq!(r.restored, 1);
-        assert_eq!(fs::read(repo.root.join("hello.txt")).unwrap(), b"hello world\n");
+        assert_eq!(
+            fs::read(repo.root.join("hello.txt")).unwrap(),
+            b"hello world\n"
+        );
     }
 
     #[test]
@@ -291,7 +302,13 @@ mod tests {
         let store = Store::for_repo_with_base(&repo, data_dir.path().to_path_buf()).unwrap();
         fs::write(repo.root.join("real.txt"), b"x").unwrap();
         let s = snap(&repo, &store, "manual", None).unwrap();
-        match restore(&repo, &store, &s.manifest_id, &[PathBuf::from("typo.txt")], false) {
+        match restore(
+            &repo,
+            &store,
+            &s.manifest_id,
+            &[PathBuf::from("typo.txt")],
+            false,
+        ) {
             Err(Error::NotInSnapshot { missing, .. }) => {
                 assert_eq!(missing, vec![PathBuf::from("typo.txt")])
             }
@@ -385,7 +402,11 @@ mod tests {
         let repo = make_repo(workdir.path());
         let (store, _id) = encrypted_store(&repo, data_dir.path());
 
-        fs::write(repo.root.join(".env.production"), b"DATABASE_URL=postgres://prod").unwrap();
+        fs::write(
+            repo.root.join(".env.production"),
+            b"DATABASE_URL=postgres://prod",
+        )
+        .unwrap();
         fs::write(repo.root.join("notes.md"), b"safe").unwrap();
 
         let r = snap_with_policy(&repo, &store, "manual", None, EncryptPolicy::Secrets).unwrap();
@@ -401,7 +422,9 @@ mod tests {
             "no encrypted manifest found in {names:?}"
         );
         assert!(
-            !names.iter().any(|n| n.ends_with(".json") && !n.ends_with(".json.age")),
+            !names
+                .iter()
+                .any(|n| n.ends_with(".json") && !n.ends_with(".json.age")),
             "plaintext manifest leaked: {names:?}"
         );
 
@@ -442,8 +465,16 @@ mod tests {
 
         let r = snap_with_policy(&repo, &store, "manual", None, EncryptPolicy::Secrets).unwrap();
         let m = store.load_manifest(&r.manifest_id).unwrap();
-        let env_entry = m.entries.iter().find(|e| e.path == PathBuf::from(".env")).unwrap();
-        let safe_entry = m.entries.iter().find(|e| e.path == PathBuf::from("safe.txt")).unwrap();
+        let env_entry = m
+            .entries
+            .iter()
+            .find(|e| e.path == Path::new(".env"))
+            .unwrap();
+        let safe_entry = m
+            .entries
+            .iter()
+            .find(|e| e.path == Path::new("safe.txt"))
+            .unwrap();
         assert!(env_entry.encrypted, ".env should be encrypted");
         assert!(!safe_entry.encrypted, "safe.txt should be plain");
 
@@ -476,8 +507,16 @@ mod tests {
         fs::write(repo.root.join("id_rsa_prod"), b"-----BEGIN KEY-----").unwrap();
         let r = snap_with_policy(&repo, &store, "manual", None, EncryptPolicy::Off).unwrap();
         let m = store.load_manifest(&r.manifest_id).unwrap();
-        let key = m.entries.iter().find(|e| e.path == PathBuf::from("id_rsa_prod")).unwrap();
-        let plain = m.entries.iter().find(|e| e.path == PathBuf::from("plain.md")).unwrap();
+        let key = m
+            .entries
+            .iter()
+            .find(|e| e.path == Path::new("id_rsa_prod"))
+            .unwrap();
+        let plain = m
+            .entries
+            .iter()
+            .find(|e| e.path == Path::new("plain.md"))
+            .unwrap();
         assert!(key.encrypted, "id_rsa_prod must always be encrypted");
         assert!(!plain.encrypted, "plain.md under 'none' policy stays plain");
     }
@@ -501,7 +540,7 @@ mod tests {
         let readme = m
             .entries
             .iter()
-            .find(|e| e.path == PathBuf::from("README.md"))
+            .find(|e| e.path == Path::new("README.md"))
             .unwrap();
         assert!(
             readme.encrypted,
@@ -523,7 +562,11 @@ mod tests {
         fs::write(repo.root.join(".env"), b"SECRET=prod\n").unwrap();
         let r = snap_with_policy(&repo, &store, "manual", None, EncryptPolicy::Secrets).unwrap();
         let m = store.load_manifest(&r.manifest_id).unwrap();
-        let entry = m.entries.iter().find(|e| e.path == PathBuf::from(".env")).unwrap();
+        let entry = m
+            .entries
+            .iter()
+            .find(|e| e.path == Path::new(".env"))
+            .unwrap();
         assert!(entry.encrypted);
         // Raw read_blob returns ciphertext.
         let raw = store.read_blob(&entry.blob).unwrap();
@@ -540,9 +583,21 @@ mod tests {
         let repo = make_repo(workdir.path());
         let (store_with_id, _id) = encrypted_store(&repo, data_dir.path());
         fs::write(repo.root.join(".env"), b"x").unwrap();
-        let r = snap_with_policy(&repo, &store_with_id, "manual", None, EncryptPolicy::Secrets).unwrap();
+        let r = snap_with_policy(
+            &repo,
+            &store_with_id,
+            "manual",
+            None,
+            EncryptPolicy::Secrets,
+        )
+        .unwrap();
         let m = store_with_id.load_manifest(&r.manifest_id).unwrap();
-        let entry = m.entries.iter().find(|e| e.path == PathBuf::from(".env")).unwrap().clone();
+        let entry = m
+            .entries
+            .iter()
+            .find(|e| e.path == Path::new(".env"))
+            .unwrap()
+            .clone();
 
         let bare = Store::for_repo_with_base(&repo, data_dir.path().to_path_buf()).unwrap();
         match bare.read_entry(&entry) {
@@ -559,7 +614,14 @@ mod tests {
         let (store_with_id, _id) = encrypted_store(&repo, data_dir.path());
 
         fs::write(repo.root.join(".env"), b"x").unwrap();
-        let r = snap_with_policy(&repo, &store_with_id, "manual", None, EncryptPolicy::Secrets).unwrap();
+        let r = snap_with_policy(
+            &repo,
+            &store_with_id,
+            "manual",
+            None,
+            EncryptPolicy::Secrets,
+        )
+        .unwrap();
         fs::remove_file(repo.root.join(".env")).unwrap();
 
         // Reattach a store WITHOUT identity and verify restore errors cleanly.

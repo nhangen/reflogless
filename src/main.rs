@@ -14,7 +14,11 @@ use reflogless::snapshot::{restore, snap_with_policy};
 use reflogless::store::{CryptoCtx, Store, DEFAULT_MAX_AGE_DAYS, DEFAULT_MAX_STORE_BYTES};
 
 #[derive(Parser)]
-#[command(name = "reflogless", version, about = "Local untracked-file safety net for git")]
+#[command(
+    name = "reflogless",
+    version,
+    about = "Local untracked-file safety net for git"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -196,7 +200,10 @@ fn run() -> reflogless::Result<()> {
                 );
                 println!(
                     "  ensure {} is earlier on PATH than your system git",
-                    r.shim_path.parent().map(|p| p.display().to_string()).unwrap_or_default()
+                    r.shim_path
+                        .parent()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
                 );
             }
         }
@@ -263,10 +270,7 @@ fn run() -> reflogless::Result<()> {
             print!("{}", report.render());
             if !report.is_healthy() {
                 return Err(reflogless::Error::Doctor(
-                    report
-                        .first_failure()
-                        .unwrap_or("not healthy")
-                        .into(),
+                    report.first_failure().unwrap_or("not healthy").into(),
                 ));
             }
         }
@@ -276,7 +280,10 @@ fn run() -> reflogless::Result<()> {
 
 fn provision_identity(repo: &Repo, store: &Store, insecure: bool) -> reflogless::Result<()> {
     if store.provisioned_for_encryption() {
-        println!("identity already provisioned (recipient: {})", store.recipient_path().display());
+        println!(
+            "identity already provisioned (recipient: {})",
+            store.recipient_path().display()
+        );
         return Ok(());
     }
     let identity = crypto::generate_identity();
@@ -296,12 +303,17 @@ fn provision_identity(repo: &Repo, store: &Store, insecure: bool) -> reflogless:
             "reflogless: WARNING — encryption key stored unencrypted at {}",
             file.display()
         );
-        eprintln!("reflogless:           anyone with read access to that file can decrypt every snapshot");
+        eprintln!(
+            "reflogless:           anyone with read access to that file can decrypt every snapshot"
+        );
         println!("provisioned identity (file key at {})", file.display());
     } else {
         KeychainStore.save(&repo.id(), &identity)?;
         store.save_recipient(&recipient)?;
-        println!("provisioned identity (keychain service=reflogless account={})", repo.id());
+        println!(
+            "provisioned identity (keychain service=reflogless account={})",
+            repo.id()
+        );
     }
     Ok(())
 }
@@ -365,12 +377,7 @@ fn diff_snapshot(
         let snap_text = String::from_utf8_lossy(&snap_bytes);
         let cur_text = String::from_utf8_lossy(&cur_bytes);
         let diff = similar::TextDiff::from_lines(&snap_text, &cur_text);
-        println!(
-            "--- snap:{}/{}\n+++ {}",
-            m.id,
-            e.path.display(),
-            work_label
-        );
+        println!("--- snap:{}/{}\n+++ {}", m.id, e.path.display(), work_label);
         for change in diff.iter_all_changes() {
             let sign = match change.tag() {
                 similar::ChangeTag::Delete => "-",

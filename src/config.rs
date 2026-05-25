@@ -5,10 +5,11 @@ use std::path::Path;
 
 pub const CONFIG_FILENAME: &str = ".reflogless.toml";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 pub enum EncryptPolicy {
     /// Encrypt files matching secret-shaped patterns. Default.
     #[serde(rename = "secrets")]
+    #[default]
     Secrets,
     /// Encrypt every blob and the manifest.
     #[serde(rename = "all")]
@@ -18,12 +19,6 @@ pub enum EncryptPolicy {
     /// in pattern matches across the crate.
     #[serde(rename = "none")]
     Off,
-}
-
-impl Default for EncryptPolicy {
-    fn default() -> Self {
-        EncryptPolicy::Secrets
-    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -48,11 +43,11 @@ impl Config {
 /// Filename patterns that are always encrypted regardless of `encrypt` setting.
 /// Matched case-insensitively against the path's filename only.
 const SECRET_PATTERNS: &[&str] = &[
-    ".env",        // matches .env, .env.production, .env.local, etc. (prefix)
-    "id_rsa",      // matches id_rsa, id_rsa_prod, id_rsa.pub
-    "id_ecdsa",    // matches id_ecdsa*
-    "id_ed25519",  // matches id_ed25519*
-    "id_dsa",      // matches id_dsa*
+    ".env",       // matches .env, .env.production, .env.local, etc. (prefix)
+    "id_rsa",     // matches id_rsa, id_rsa_prod, id_rsa.pub
+    "id_ecdsa",   // matches id_ecdsa*
+    "id_ed25519", // matches id_ed25519*
+    "id_dsa",     // matches id_dsa*
 ];
 
 const SECRET_EXTENSIONS: &[&str] = &["pem", "key", "p12", "pfx", "jks", "asc", "gpg"];
@@ -158,7 +153,10 @@ mod tests {
             "android.jks",
             "signature.asc",
         ] {
-            assert!(is_secret_shaped(Path::new(p)), "expected secret-shaped: {p}");
+            assert!(
+                is_secret_shaped(Path::new(p)),
+                "expected secret-shaped: {p}"
+            );
         }
     }
 
@@ -183,7 +181,10 @@ mod tests {
 
     #[test]
     fn should_encrypt_secret_paths_under_none_policy() {
-        assert!(should_encrypt(Path::new(".env.production"), EncryptPolicy::Off));
+        assert!(should_encrypt(
+            Path::new(".env.production"),
+            EncryptPolicy::Off
+        ));
         assert!(should_encrypt(Path::new("id_rsa"), EncryptPolicy::Off));
     }
 
@@ -194,7 +195,10 @@ mod tests {
 
     #[test]
     fn should_encrypt_secrets_policy_only_encrypts_secrets() {
-        assert!(!should_encrypt(Path::new("README.md"), EncryptPolicy::Secrets));
+        assert!(!should_encrypt(
+            Path::new("README.md"),
+            EncryptPolicy::Secrets
+        ));
         assert!(should_encrypt(Path::new(".env"), EncryptPolicy::Secrets));
     }
 }
