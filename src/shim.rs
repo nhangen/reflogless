@@ -251,6 +251,11 @@ pub enum ShimStatus {
     Shadowed { ours: PathBuf, precedes: PathBuf },
     /// A file at the shim path exists but is not reflogless-managed.
     Foreign { path: PathBuf },
+    /// A file at the shim path exists but can't be read (EACCES, EIO,
+    /// dangling symlink). Distinct from `Foreign` so doctor surfaces the
+    /// actual I/O error to the user instead of telling them to remove a
+    /// "third-party" file.
+    Unreadable { path: PathBuf, error: String },
     /// Shim is reflogless-managed but its hardcoded reflogless binary
     /// path doesn't match the current binary (or doesn't exist at all).
     /// Every `git` invocation through this shim will fail. Fix:
@@ -295,7 +300,12 @@ pub fn observe() -> ShimStatus {
     }
     let body = match fs::read_to_string(&shim_path) {
         Ok(b) => b,
-        Err(_) => return ShimStatus::Foreign { path: shim_path },
+        Err(e) => {
+            return ShimStatus::Unreadable {
+                path: shim_path,
+                error: e.to_string(),
+            }
+        }
     };
     if !body.contains(MARKER) {
         return ShimStatus::Foreign { path: shim_path };
@@ -636,6 +646,33 @@ mod tests {
         assert_eq!(extract_shim_target(""), None);
         // Malformed exec line (no closing quote)
         assert_eq!(extract_shim_target("exec \"/bin/foo unterminated\n"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observe_reports_unreadable_when_shim_chmod_zero() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = ENV_LOCK.lock().unwrap();
+        let td = tempfile::tempdir().unwrap();
+        let shim_path = td.path().join("git");
+        fs::write(&shim_path, "#!/bin/sh\nfoo\n").unwrap();
+        let mut perms = fs::metadata(&shim_path).unwrap().permissions();
+        perms.set_mode(0o0);
+        fs::set_permissions(&shim_path, perms).unwrap();
+
+        std::env::set_var("REFLOGLESS_SHIM_DIR", td.path());
+        let status = observe();
+        // Restore perms before assert so tempdir cleanup works.
+        let mut restore = fs::metadata(&shim_path).unwrap().permissions();
+        restore.set_mode(0o644);
+        let _ = fs::set_permissions(&shim_path, restore);
+        match status {
+            ShimStatus::Unreadable { path, error } => {
+                assert_eq!(path, shim_path);
+                assert!(!error.is_empty());
+            }
+            other => panic!("expected Unreadable, got {other:?}"),
+        }
     }
 
     #[test]
