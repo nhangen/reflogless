@@ -218,6 +218,36 @@ pub enum ShimStatus {
     },
     /// A file at the shim path exists but is not reflogless-managed.
     Foreign { path: PathBuf },
+    /// Shim is reflogless-managed but its hardcoded reflogless binary
+    /// path doesn't match the current binary (or doesn't exist at all).
+    /// Every `git` invocation through this shim will fail. Fix:
+    /// `reflogless init --shim` to refresh the path.
+    Stale {
+        path: PathBuf,
+        script_points_at: PathBuf,
+        current_binary_at: Option<PathBuf>,
+    },
+}
+
+/// Extract the reflogless binary path the shim script will exec. Returns
+/// `None` if the body doesn't look like a managed shim or the exec line
+/// can't be parsed.
+fn extract_shim_target(body: &str) -> Option<PathBuf> {
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("exec ") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(after_quote) = rest.strip_prefix('"') else {
+            continue;
+        };
+        let Some(end) = after_quote.find('"') else {
+            continue;
+        };
+        return Some(PathBuf::from(&after_quote[..end]));
+    }
+    None
 }
 
 /// Inspect the filesystem and PATH to classify the shim.
@@ -236,6 +266,26 @@ pub fn observe() -> ShimStatus {
     };
     if !body.contains(MARKER) {
         return ShimStatus::Foreign { path: shim_path };
+    }
+
+    // Detect stale binary path: the shim script bakes in the reflogless
+    // path at install time. If reflogless was reinstalled to a new
+    // location, the shim still points at the old (now-missing) binary
+    // and every `git` invocation fails. Fix: `reflogless init --shim`.
+    if let Some(script_target) = extract_shim_target(&body) {
+        let current_binary = std::env::current_exe().ok();
+        let script_target_exists = script_target.exists();
+        let same_target = current_binary
+            .as_ref()
+            .map(|c| same_file(&script_target, c))
+            .unwrap_or(false);
+        if !script_target_exists || !same_target {
+            return ShimStatus::Stale {
+                path: shim_path,
+                script_points_at: script_target,
+                current_binary_at: current_binary,
+            };
+        }
     }
 
     // Walk PATH to confirm our shim is what `git` resolves to.
@@ -442,6 +492,46 @@ mod tests {
     fn install_with_shim_dir(dir: &Path) -> Result<InstallReport> {
         std::env::set_var("REFLOGLESS_SHIM_DIR", dir);
         install()
+    }
+
+    #[test]
+    fn extract_shim_target_parses_rendered_script() {
+        let bin = PathBuf::from("/home/user/.cargo/bin/reflogless");
+        let script = render_shim_script(&bin);
+        assert_eq!(extract_shim_target(&script), Some(bin));
+    }
+
+    #[test]
+    fn extract_shim_target_returns_none_on_unmanaged_body() {
+        assert_eq!(extract_shim_target("#!/bin/sh\necho hi\n"), None);
+        assert_eq!(extract_shim_target(""), None);
+        // Malformed exec line (no closing quote)
+        assert_eq!(extract_shim_target("exec \"/bin/foo unterminated\n"), None);
+    }
+
+    #[test]
+    fn observe_reports_stale_when_script_points_to_missing_path() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let td = tempfile::tempdir().unwrap();
+        let shim_path = td.path().join("git");
+        // Write a managed-looking shim that points at a path that doesn't exist.
+        let body = format!(
+            "#!/bin/sh\n{MARKER}\nexec \"/nonexistent/reflogless\" _shim --shim-dir=\"$(dirname \"$0\")\" -- \"$@\"\n"
+        );
+        fs::write(&shim_path, body).unwrap();
+
+        std::env::set_var("REFLOGLESS_SHIM_DIR", td.path());
+        match observe() {
+            ShimStatus::Stale {
+                path,
+                script_points_at,
+                ..
+            } => {
+                assert_eq!(path, shim_path);
+                assert_eq!(script_points_at, PathBuf::from("/nonexistent/reflogless"));
+            }
+            other => panic!("expected Stale, got {other:?}"),
+        }
     }
 
     #[test]
