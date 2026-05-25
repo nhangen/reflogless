@@ -308,7 +308,14 @@ Encryption policy is set in `.reflogless.toml` at the repo root (optional; defau
 encrypt = "secrets"  # default — encrypt secret-shaped paths only
 # encrypt = "all"    # encrypt every blob
 # encrypt = "none"   # only secret-shaped paths get encrypted; everything else stays plain
+
+shim = true          # default — global PATH shim may snapshot this repo
+# shim = false       # opt this repo out; destructive git commands pass through unsnapped
 ```
+
+`shim = false` is per repo. Use it for repositories where the global PATH shim
+should not snapshot, such as very large trees or repos whose local contents are
+too sensitive for any automatic capture.
 
 Secret-shaped paths (always encrypted regardless of policy):
 
