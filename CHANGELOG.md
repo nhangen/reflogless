@@ -6,7 +6,19 @@ follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.0] — 2026-05-25
+
 ### Added
+- Homebrew publishing via `nhangen/homebrew-tap`, so macOS and Linux users
+  can install with `brew install nhangen/tap/reflogless` (#3).
+- Scoop bucket publishing via `nhangen/scoop-bucket`, so Windows users can
+  install with `scoop bucket add nhangen https://github.com/nhangen/scoop-bucket`
+  followed by `scoop install reflogless` (#3).
+- Windows shim support (#8): `reflogless init --shim` now installs a managed
+  `git.cmd` wrapper next to `reflogless.exe`, `reflogless uninstall` removes it,
+  and `doctor` accounts for Windows `PATHEXT` resolution.
+- Per-repo shim opt-out (#12): set `shim = false` in `.reflogless.toml` to
+  bypass global shim snapshotting for that repo.
 - Expanded shim allowlist (#9): `git restore`, `git switch -f` /
   `--discard-changes`, `git checkout -f` / `--force`, and `git checkout
   <ref> -- <pathspec>` now snapshot before exec.
@@ -17,6 +29,10 @@ follow [SemVer](https://semver.org/).
   hardcoded `reflogless` path no longer matches the current binary
   (e.g. after reinstall to a different toolchain) and prints the fix
   (#11).
+- `ShimStatus::Unreadable` variant: doctor now reports unreadable shim files
+  distinctly from foreign third-party files.
+- Doctor now surfaces recent `<store>/shim-errors.log` entries alongside hook
+  errors.
 - PR-time CI gate: `cargo fmt --check` + `cargo clippy --all-targets
   -- -D warnings` + `cargo test --all-targets` on Linux + macOS.
 
@@ -24,6 +40,10 @@ follow [SemVer](https://semver.org/).
 - Lint cleanup: 13 → 0 clippy warnings across the crate (cmp_owned,
   manual_contains, type_complexity, derivable_impls, needless_return).
 - Bulk `cargo fmt` across the crate; rustfmt is now enforced.
+
+### Fixed
+- Windows shim wrapper quotes `--shim-dir=%~dp0.` safely so the trailing
+  backslash in `%~dp0` cannot escape the closing quote.
 
 ## [0.1.2] — 2026-05-25
 
@@ -69,7 +89,8 @@ follow [SemVer](https://semver.org/).
 - Tag-driven multi-OS release via cargo-dist: macOS arm64 + x86,
   Linux x86, Windows x86 prebuilt binaries.
 
-[Unreleased]: https://github.com/nhangen/reflogless/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/nhangen/reflogless/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/nhangen/reflogless/compare/v0.1.2...v1.0.0
 [0.1.2]: https://github.com/nhangen/reflogless/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/nhangen/reflogless/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/nhangen/reflogless/releases/tag/v0.1.0

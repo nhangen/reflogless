@@ -1,0 +1,105 @@
+name: publish-scoop
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish, e.g. v1.0.0"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: publish Scoop manifest
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Resolve release tag
+        id: release
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${{ github.event.release.tag_name }}"
+          fi
+          case "$tag" in
+            v*) ;;
+            *) echo "release tag must start with v: $tag" >&2; exit 1 ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download Windows release asset
+        shell: bash
+        run: |
+          mkdir -p dist
+          gh release download "${{ steps.release.outputs.tag }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "reflogless-x86_64-pc-windows-msvc.zip" \
+            --pattern "reflogless-x86_64-pc-windows-msvc.zip.sha256" \
+            --dir dist
+
+      - name: Render Scoop manifest
+        shell: bash
+        run: |
+          checksum_file="dist/reflogless-x86_64-pc-windows-msvc.zip.sha256"
+          hash="$(awk '{print $1}' "$checksum_file")"
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${{ steps.release.outputs.tag }}/reflogless-x86_64-pc-windows-msvc.zip"
+          mkdir -p generated
+          cat > generated/reflogless.json <<EOF
+          {
+              "version": "${{ steps.release.outputs.version }}",
+              "description": "Local untracked-file safety net for git",
+              "homepage": "https://github.com/nhangen/reflogless",
+              "license": "MIT",
+              "architecture": {
+                  "64bit": {
+                      "url": "$url",
+                      "hash": "$hash"
+                  }
+              },
+              "bin": "reflogless.exe",
+              "checkver": {
+                  "github": "https://github.com/nhangen/reflogless"
+              },
+              "autoupdate": {
+                  "architecture": {
+                      "64bit": {
+                          "url": "https://github.com/nhangen/reflogless/releases/download/v\$version/reflogless-x86_64-pc-windows-msvc.zip"
+                      }
+                  },
+                  "hash": {
+                      "url": "https://github.com/nhangen/reflogless/releases/download/v\$version/reflogless-x86_64-pc-windows-msvc.zip.sha256"
+                  }
+              }
+          }
+          EOF
+
+      - name: Check out Scoop bucket
+        uses: actions/checkout@v4
+        with:
+          repository: nhangen/scoop-bucket
+          token: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          path: scoop-bucket
+
+      - name: Publish manifest
+        shell: bash
+        run: |
+          mkdir -p scoop-bucket/bucket
+          cp generated/reflogless.json scoop-bucket/bucket/reflogless.json
+          git -C scoop-bucket config user.name "github-actions[bot]"
+          git -C scoop-bucket config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C scoop-bucket add bucket/reflogless.json
+          if git -C scoop-bucket diff --cached --quiet; then
+            echo "Scoop manifest already up to date"
+          else
+            git -C scoop-bucket commit -m "Update reflogless to ${{ steps.release.outputs.tag }}"
+            git -C scoop-bucket push
+          fi

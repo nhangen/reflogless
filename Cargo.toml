@@ -1,10 +1,11 @@
 [package]
 name = "reflogless"
-version = "0.1.2"
+version = "1.0.0"
 edition = "2021"
 description = "Local untracked-file safety net for git"
 license = "MIT"
 repository = "https://github.com/nhangen/reflogless"
+homepage = "https://github.com/nhangen/reflogless"
 
 [[bin]]
 name = "reflogless"
