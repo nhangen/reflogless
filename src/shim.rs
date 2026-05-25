@@ -9,12 +9,15 @@ pub const MARKER: &str = "# reflogless-managed shim";
 /// Detect whether a `git <args>` invocation modifies the working tree in a
 /// way reflogless wants to snapshot.
 ///
-/// Conservative v0.1.x scope:
-/// - `git clean ...` (every form — flags can't make `clean` non-destructive
-///   except `--dry-run`/`-n`, but over-snapshotting is cheaper than missing
-///   a real clean).
-/// - `git reset --hard ...` (the `--hard` flag can appear before or after a
-///   commit-ish positional argument).
+/// Allowlist:
+/// - `git clean ...` — every form except `--dry-run` / `-n`.
+/// - `git reset --hard ...` — `--hard` anywhere in args.
+/// - `git restore ...` — every form except `--staged`-only (index-only).
+/// - `git switch -f` / `--discard-changes` — clean switch is refused by
+///   git on dirty trees, so only the force form needs snapshotting.
+/// - `git checkout -f` / `--force` — force-overwrites worktree.
+/// - `git checkout <ref> -- <pathspec>` — pathspec form overwrites the
+///   named paths.
 ///
 /// Returns the event tag to use for the snapshot, or `None` to passthrough.
 pub fn destructive_event(args: &[String]) -> Option<&'static str> {
@@ -31,6 +34,40 @@ pub fn destructive_event(args: &[String]) -> Option<&'static str> {
         "reset" => {
             if after.iter().any(|a| a == "--hard") {
                 Some("shim-reset-hard")
+            } else {
+                None
+            }
+        }
+        "restore" => {
+            // `--staged` without `--worktree` only touches the index, not
+            // the working tree — passthrough. Every other form overwrites
+            // worktree files.
+            let has_staged = after.iter().any(|a| a == "--staged" || a == "-S");
+            let has_worktree = after.iter().any(|a| a == "--worktree" || a == "-W");
+            if has_staged && !has_worktree {
+                None
+            } else {
+                Some("shim-restore")
+            }
+        }
+        "switch" => {
+            // `switch` refuses on dirty trees unless given `-f` /
+            // `--discard-changes`; only the force form is destructive.
+            if after.iter().any(|a| a == "-f" || a == "--discard-changes") {
+                Some("shim-switch-force")
+            } else {
+                None
+            }
+        }
+        "checkout" => {
+            // Two destructive shapes:
+            // - `-f` / `--force` anywhere (force-overwrites worktree)
+            // - `--` separator (pathspec form: `checkout <ref> -- <path>`
+            //   overwrites the named paths from the ref)
+            let forced = after.iter().any(|a| a == "-f" || a == "--force");
+            let pathspec = after.iter().any(|a| a == "--");
+            if forced || pathspec {
+                Some("shim-checkout-force")
             } else {
                 None
             }
@@ -419,11 +456,103 @@ mod tests {
         assert_eq!(destructive_event(&args(&["commit"])), None);
         assert_eq!(destructive_event(&args(&["push"])), None);
         assert_eq!(destructive_event(&args(&["pull"])), None);
-        // Outside the conservative v0.1.x allowlist — restore/switch/checkout
-        // -f are tracked as follow-up issues but currently passthrough.
-        assert_eq!(destructive_event(&args(&["restore", "file"])), None);
-        assert_eq!(destructive_event(&args(&["switch", "-f", "main"])), None);
-        assert_eq!(destructive_event(&args(&["checkout", "-f"])), None);
+        // Clean (non-force) checkout/switch don't lose work — passthrough.
+        assert_eq!(destructive_event(&args(&["checkout", "main"])), None);
+        assert_eq!(
+            destructive_event(&args(&["checkout", "-b", "feature"])),
+            None
+        );
+        assert_eq!(destructive_event(&args(&["switch", "main"])), None);
+    }
+
+    #[test]
+    fn destructive_event_restore_snaps_unless_staged_only() {
+        assert_eq!(
+            destructive_event(&args(&["restore", "file.txt"])),
+            Some("shim-restore")
+        );
+        assert_eq!(
+            destructive_event(&args(&["restore", "--source", "HEAD~1", "file.txt"])),
+            Some("shim-restore")
+        );
+        // --staged only — index-only, no worktree write
+        assert_eq!(
+            destructive_event(&args(&["restore", "--staged", "file.txt"])),
+            None
+        );
+        assert_eq!(
+            destructive_event(&args(&["restore", "-S", "file.txt"])),
+            None
+        );
+        // --staged combined with --worktree → both, destructive
+        assert_eq!(
+            destructive_event(&args(&["restore", "--staged", "--worktree", "file.txt"])),
+            Some("shim-restore")
+        );
+        // Explicit --worktree
+        assert_eq!(
+            destructive_event(&args(&["restore", "--worktree", "file.txt"])),
+            Some("shim-restore")
+        );
+    }
+
+    #[test]
+    fn destructive_event_switch_snaps_only_with_force() {
+        assert_eq!(
+            destructive_event(&args(&["switch", "-f", "main"])),
+            Some("shim-switch-force")
+        );
+        assert_eq!(
+            destructive_event(&args(&["switch", "main", "-f"])),
+            Some("shim-switch-force")
+        );
+        assert_eq!(
+            destructive_event(&args(&["switch", "--discard-changes", "main"])),
+            Some("shim-switch-force")
+        );
+        // Clean switch — git refuses on dirty trees, no need to snap.
+        assert_eq!(destructive_event(&args(&["switch", "main"])), None);
+        assert_eq!(destructive_event(&args(&["switch", "-c", "feature"])), None);
+    }
+
+    #[test]
+    fn destructive_event_checkout_snaps_on_force_or_pathspec() {
+        assert_eq!(
+            destructive_event(&args(&["checkout", "-f"])),
+            Some("shim-checkout-force")
+        );
+        assert_eq!(
+            destructive_event(&args(&["checkout", "--force", "main"])),
+            Some("shim-checkout-force")
+        );
+        // Pathspec form — overwrites the named paths from HEAD
+        assert_eq!(
+            destructive_event(&args(&["checkout", "--", "file.txt"])),
+            Some("shim-checkout-force")
+        );
+        assert_eq!(
+            destructive_event(&args(&["checkout", "HEAD~1", "--", "src/foo.rs"])),
+            Some("shim-checkout-force")
+        );
+        // Clean checkout — passthrough
+        assert_eq!(destructive_event(&args(&["checkout", "main"])), None);
+    }
+
+    #[test]
+    fn destructive_event_global_flags_with_expanded_allowlist() {
+        // -C subdir restore <file>
+        assert_eq!(
+            destructive_event(&args(&["-C", "sub", "restore", "f"])),
+            Some("shim-restore")
+        );
+        assert_eq!(
+            destructive_event(&args(&["-C", "sub", "switch", "-f", "main"])),
+            Some("shim-switch-force")
+        );
+        assert_eq!(
+            destructive_event(&args(&["-c", "foo=bar", "checkout", "-f"])),
+            Some("shim-checkout-force")
+        );
     }
 
     #[test]
