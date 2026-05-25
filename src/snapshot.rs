@@ -43,7 +43,7 @@ pub fn snap_with_policy(
     }
     repo.assert_safe_ownership()?;
     // Defensively exclude the store itself — prevents recursive snapshotting
-    // when the user puts $GITSAFE_DATA_DIR inside the repo (tests, sandboxes).
+    // when the user puts $REFLOGLESS_DATA_DIR inside the repo (tests, sandboxes).
     let exclude = vec![store.root.clone()];
     let Selection { files, skipped } =
         select::collect_with_cap(repo, select::PER_FILE_CAP_BYTES, &exclude)?;
@@ -358,7 +358,7 @@ mod tests {
         let repo = make_repo(workdir.path());
         // Store base lives INSIDE the repo (pathological config; defend
         // against recursive snapshotting).
-        let store_base = repo.root.join(".gitsafe-data");
+        let store_base = repo.root.join(".reflogless-data");
         let store = Store::for_repo_with_base(&repo, store_base.clone()).unwrap();
         fs::write(repo.root.join("keep.txt"), b"keep").unwrap();
         // First snap creates store files; second snap should NOT see them.
@@ -483,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn gitsafe_toml_policy_applies_end_to_end() {
+    fn reflogless_toml_policy_applies_end_to_end() {
         // Pins the wiring `Config::load_or_default(repo_root).encrypt →
         // snap_with_policy(..., cfg.encrypt)` exercised by main.rs::run.
         use crate::config::Config;
@@ -492,8 +492,8 @@ mod tests {
         let repo = make_repo(workdir.path());
         let (store, _id) = encrypted_store(&repo, data_dir.path());
 
-        // .gitsafe.toml requests `encrypt = "all"`.
-        fs::write(repo.root.join(".gitsafe.toml"), "encrypt = \"all\"\n").unwrap();
+        // .reflogless.toml requests `encrypt = "all"`.
+        fs::write(repo.root.join(".reflogless.toml"), "encrypt = \"all\"\n").unwrap();
         fs::write(repo.root.join("README.md"), b"docs").unwrap();
         let cfg = Config::load_or_default(&repo.root).unwrap();
         let r = snap_with_policy(&repo, &store, "manual", None, cfg.encrypt).unwrap();
@@ -505,7 +505,7 @@ mod tests {
             .unwrap();
         assert!(
             readme.encrypted,
-            "encrypt = \"all\" in .gitsafe.toml must encrypt non-secret blobs"
+            "encrypt = \"all\" in .reflogless.toml must encrypt non-secret blobs"
         );
     }
 
@@ -513,7 +513,7 @@ mod tests {
     fn read_entry_returns_plaintext_for_encrypted_entry() {
         // Regression for the diff_snapshot bug: any code path that reads a
         // manifest entry must go through Store::read_entry, which decrypts
-        // when `entry.encrypted`. Pre-fix, `gitsafe diff <id> .env.production`
+        // when `entry.encrypted`. Pre-fix, `reflogless diff <id> .env.production`
         // returned ciphertext bytes for a text-diff pass.
         let workdir = TempDir::new().unwrap();
         let data_dir = TempDir::new().unwrap();

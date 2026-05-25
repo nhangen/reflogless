@@ -55,7 +55,7 @@ pub fn run(repo: &Repo, store: &Store) -> Result<DoctorReport> {
     let mut hook_status = Vec::new();
     for h in HOOKS {
         let p = dir.join(h);
-        let backup = p.with_extension("gitsafe-orig");
+        let backup = p.with_extension("reflogless-orig");
         let state = if !p.exists() {
             HookState::Missing
         } else {
@@ -66,9 +66,9 @@ pub fn run(repo: &Repo, store: &Store) -> Result<DoctorReport> {
                         HookState::Managed {
                             chained: backup.exists(),
                         }
-                    } else if body.contains("gitsafe snap --event") {
-                        // A user hand-edited the gitsafe wrapper and stripped
-                        // the marker, but the gitsafe call is still present —
+                    } else if body.contains("reflogless snap --event") {
+                        // A user hand-edited the reflogless wrapper and stripped
+                        // the marker, but the reflogless call is still present —
                         // distinct from a legitimate third-party hook.
                         HookState::Tampered
                     } else {
@@ -93,7 +93,7 @@ pub fn run(repo: &Repo, store: &Store) -> Result<DoctorReport> {
     // user's snapshots take. On an encrypted store this exercises
     // write_blob_encrypted + read_blob_encrypted so an unreachable identity
     // or corrupt recipient surfaces here, not at first real snap.
-    let canary_bytes: &[u8] = b"gitsafe-doctor-canary-32-bytes!!";
+    let canary_bytes: &[u8] = b"reflogless-doctor-canary-32-bytes!!";
     let canary_roundtrip = match store.crypto() {
         Some(ctx) => match store.write_blob_encrypted(canary_bytes, &ctx.recipient) {
             Ok(d) => {
@@ -103,7 +103,7 @@ pub fn run(repo: &Repo, store: &Store) -> Result<DoctorReport> {
                     .unwrap_or(false);
                 if let Err(e) = store.delete_blob(&d) {
                     eprintln!(
-                        "gitsafe: warning: canary blob cleanup failed at {d}: {e}"
+                        "reflogless: warning: canary blob cleanup failed at {d}: {e}"
                     );
                 }
                 ok
@@ -118,7 +118,7 @@ pub fn run(repo: &Repo, store: &Store) -> Result<DoctorReport> {
                     .unwrap_or(false);
                 if let Err(e) = store.delete_blob(&d) {
                     eprintln!(
-                        "gitsafe: warning: canary blob cleanup failed at {d}: {e}"
+                        "reflogless: warning: canary blob cleanup failed at {d}: {e}"
                     );
                 }
                 ok
@@ -151,7 +151,7 @@ fn assess_crypto(store: &Store) -> CryptoStatus {
         None => return CryptoStatus::KeyUnreachable,
     };
     // Canary: encrypt a fixed plaintext and decrypt it back.
-    let plaintext: &[u8] = b"gitsafe-crypto-canary";
+    let plaintext: &[u8] = b"reflogless-crypto-canary";
     match crypto::encrypt(plaintext, &ctx.recipient) {
         Err(e) => return CryptoStatus::RoundtripFailed(e.to_string()),
         Ok(ct) => match crypto::decrypt(&ct, &ctx.identity) {
@@ -165,7 +165,7 @@ fn assess_crypto(store: &Store) -> CryptoStatus {
 }
 
 fn read_hook_error_log(store: &Store) -> Vec<String> {
-    let log = std::env::var("GITSAFE_HOOK_LOG").unwrap_or_else(|_| {
+    let log = std::env::var("REFLOGLESS_HOOK_LOG").unwrap_or_else(|_| {
         store
             .root
             .join("hook-errors.log")
@@ -225,7 +225,7 @@ impl DoctorReport {
 
     pub fn render(&self) -> String {
         let mut s = String::new();
-        let _ = writeln!(s, "gitsafe doctor:");
+        let _ = writeln!(s, "reflogless doctor:");
         for h in &self.hooks {
             let state = match &h.state {
                 HookState::Missing => "MISSING".into(),
@@ -233,7 +233,7 @@ impl DoctorReport {
                 HookState::Managed { chained: true } => "OK (chained)".into(),
                 HookState::Managed { chained: false } => "OK".into(),
                 HookState::Tampered => "TAMPERED (manually edited)".into(),
-                HookState::Foreign => "FOREIGN (not gitsafe-managed)".into(),
+                HookState::Foreign => "FOREIGN (not reflogless-managed)".into(),
             };
             let _ = writeln!(s, "  hook {:>22}: {state}", h.name);
         }
@@ -368,7 +368,7 @@ mod tests {
         let repo = init_repo(td.path());
         let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
         hooks::install(&repo, &store.root.join("hook-errors.log")).unwrap();
-        // Manually strip the marker but leave the gitsafe call.
+        // Manually strip the marker but leave the reflogless call.
         let p = repo.root.join(".git").join("hooks").join("post-checkout");
         let body = fs::read_to_string(&p).unwrap();
         let stripped = body.replace(crate::hooks::MARKER, "# foo");
@@ -452,7 +452,7 @@ mod tests {
             report.render()
         );
         // Insecure file key is a non-zero-exit condition: CI gates like
-        // `gitsafe doctor && deploy` must catch it.
+        // `reflogless doctor && deploy` must catch it.
         assert!(!report.is_healthy());
         assert_eq!(report.first_failure(), Some("insecure file key"));
     }
@@ -487,7 +487,7 @@ mod tests {
                         found_blob = true;
                         assert_ne!(
                             bytes,
-                            b"gitsafe-doctor-canary-32-bytes!!".to_vec(),
+                            b"reflogless-doctor-canary-32-bytes!!".to_vec(),
                             "canary wrote plaintext on an encrypted store"
                         );
                     }

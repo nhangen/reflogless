@@ -46,7 +46,7 @@ impl Store {
     }
 
     pub fn for_repo_with_base(repo: &Repo, base: PathBuf) -> Result<Self> {
-        let root = base.join("gitsafe").join(repo.id());
+        let root = base.join("reflogless").join(repo.id());
         let objects = root.join("objects");
         let snapshots = root.join("snapshots");
         fs::create_dir_all(&objects).map_err(|e| Error::io(&root, e))?;
@@ -469,7 +469,7 @@ fn is_encrypted_manifest_path(p: &Path) -> bool {
 
 fn base_data_dir() -> Result<PathBuf> {
     // Explicit override beats platform default.
-    if let Ok(p) = std::env::var("GITSAFE_DATA_DIR") {
+    if let Ok(p) = std::env::var("REFLOGLESS_DATA_DIR") {
         if !p.is_empty() {
             return Ok(PathBuf::from(p));
         }
@@ -486,7 +486,7 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().unwrap_or(Path::new("."));
     let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = parent.join(format!(
-        ".gitsafe-tmp-{}-{}",
+        ".reflogless-tmp-{}-{}",
         std::process::id(),
         n
     ));
@@ -542,7 +542,7 @@ mod tests {
 
     fn ephemeral_store() -> (TempDir, Store) {
         let td = TempDir::new().unwrap();
-        let root = td.path().join("gitsafe").join("test");
+        let root = td.path().join("reflogless").join("test");
         fs::create_dir_all(root.join("objects")).unwrap();
         fs::create_dir_all(root.join("snapshots")).unwrap();
         (
@@ -576,7 +576,7 @@ mod tests {
         let leftovers: Vec<_> = fs::read_dir(p.parent().unwrap())
             .unwrap()
             .filter_map(|d| d.ok())
-            .filter(|d| d.file_name().to_string_lossy().starts_with(".gitsafe-tmp-"))
+            .filter(|d| d.file_name().to_string_lossy().starts_with(".reflogless-tmp-"))
             .collect();
         assert!(leftovers.is_empty(), "tmp leftover: {leftovers:?}");
     }

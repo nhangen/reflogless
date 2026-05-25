@@ -4,7 +4,7 @@ use age::x25519::Identity;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const KEYCHAIN_SERVICE: &str = "gitsafe";
+pub const KEYCHAIN_SERVICE: &str = "reflogless";
 
 pub trait KeyStore {
     fn save(&self, repo_id: &str, identity: &Identity) -> Result<()>;

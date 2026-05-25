@@ -120,11 +120,11 @@ fn build_default_deny(root: &Path) -> Result<Gitignore> {
         b.add_line(None, pat)
             .map_err(|e| Error::Config(format!("invalid default-deny pattern {pat:?}: {e}")))?;
     }
-    let extra = root.join(".gitsafeignore");
+    let extra = root.join(".refloglessignore");
     if extra.exists() {
         if let Some(e) = b.add(&extra) {
             return Err(Error::Config(format!(
-                ".gitsafeignore at {} is malformed: {e}",
+                ".refloglessignore at {} is malformed: {e}",
                 extra.display()
             )));
         }
@@ -148,12 +148,12 @@ mod tests {
     }
 
     #[test]
-    fn malformed_gitsafeignore_returns_config_error() {
+    fn malformed_refloglessignore_returns_config_error() {
         let td = TempDir::new().unwrap();
-        std::fs::write(td.path().join(".gitsafeignore"), b"\\\n").unwrap();
+        std::fs::write(td.path().join(".refloglessignore"), b"\\\n").unwrap();
         let err = build_default_deny(td.path()).unwrap_err();
         match err {
-            Error::Config(msg) => assert!(msg.contains(".gitsafeignore"), "msg={msg}"),
+            Error::Config(msg) => assert!(msg.contains(".refloglessignore"), "msg={msg}"),
             other => panic!("expected Config error, got {other:?}"),
         }
     }

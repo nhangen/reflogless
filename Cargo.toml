@@ -1,17 +1,17 @@
 [package]
-name = "gitsafe"
+name = "reflogless"
 version = "0.1.0"
 edition = "2021"
 description = "Local untracked-file safety net for git"
 license = "MIT"
-repository = "https://github.com/nhangen/llm-tools"
+repository = "https://github.com/nhangen/reflogless"
 
 [[bin]]
-name = "gitsafe"
+name = "reflogless"
 path = "src/main.rs"
 
 [lib]
-name = "gitsafe"
+name = "reflogless"
 path = "src/lib.rs"
 
 [dependencies]

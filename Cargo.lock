@@ -698,25 +698,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitsafe"
-version = "0.1.0"
-dependencies = [
- "age",
- "chrono",
- "clap",
- "dirs",
- "ignore",
- "keyring",
- "serde",
- "serde_json",
- "sha2",
- "similar",
- "tempfile",
- "thiserror",
- "toml 0.8.23",
-]
-
-[[package]]
 name = "globset"
 version = "0.4.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1266,6 +1247,25 @@ dependencies = [
  "getrandom 0.2.17",
  "libredox",
  "thiserror",
+]
+
+[[package]]
+name = "reflogless"
+version = "0.1.0"
+dependencies = [
+ "age",
+ "chrono",
+ "clap",
+ "dirs",
+ "ignore",
+ "keyring",
+ "serde",
+ "serde_json",
+ "sha2",
+ "similar",
+ "tempfile",
+ "thiserror",
+ "toml 0.8.23",
 ]
 
 [[package]]

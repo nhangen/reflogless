@@ -1,0 +1,23 @@
+[workspace]
+members = ["cargo:."]
+
+[dist]
+cargo-dist-version = "0.32.0"
+ci = "github"
+installers = ["shell", "powershell"]
+# aarch64-unknown-linux-gnu is deferred: keyring -> secret-service -> libdbus-sys
+# needs libdbus-1-dev cross-compiled for arm64. Restore via native ubuntu-22.04-arm
+# runner or full multilib in a follow-up.
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+install-path = "CARGO_HOME"
+hosting = "github"
+install-updater = false
+# Preserve hand edits in .github/workflows/release.yml (per-job permissions,
+# concurrency group, artifacts-existence guard) across `dist generate`.
+allow-dirty = ["ci"]
+
+# libdbus-1-dev + pkg-config are required for keyring's secret-service backend
+# on Linux. The default cargo-dist ubuntu-22.04 runner doesn't ship either.
+[dist.dependencies.apt]
+libdbus-1-dev = "*"
+pkg-config = "*"

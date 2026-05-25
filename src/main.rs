@@ -2,18 +2,18 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use gitsafe::config::Config;
-use gitsafe::crypto;
-use gitsafe::doctor;
-use gitsafe::hooks;
-use gitsafe::keystore::{FileStore, KeyStore, KeychainStore};
-use gitsafe::manifest::Manifest;
-use gitsafe::repo::Repo;
-use gitsafe::snapshot::{restore, snap_with_policy};
-use gitsafe::store::{CryptoCtx, Store, DEFAULT_MAX_AGE_DAYS, DEFAULT_MAX_STORE_BYTES};
+use reflogless::config::Config;
+use reflogless::crypto;
+use reflogless::doctor;
+use reflogless::hooks;
+use reflogless::keystore::{FileStore, KeyStore, KeychainStore};
+use reflogless::manifest::Manifest;
+use reflogless::repo::Repo;
+use reflogless::snapshot::{restore, snap_with_policy};
+use reflogless::store::{CryptoCtx, Store, DEFAULT_MAX_AGE_DAYS, DEFAULT_MAX_STORE_BYTES};
 
 #[derive(Parser)]
-#[command(name = "gitsafe", version, about = "Local untracked-file safety net for git")]
+#[command(name = "reflogless", version, about = "Local untracked-file safety net for git")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -49,19 +49,19 @@ enum Cmd {
         #[arg(long, default_value_t = DEFAULT_MAX_STORE_BYTES)]
         max_bytes: u64,
     },
-    /// Install gitsafe hooks into the current repo and provision an
+    /// Install reflogless hooks into the current repo and provision an
     /// encryption identity (keychain by default; pass --insecure-file-key
     /// to store the key on disk under the store dir).
     Init {
         /// Reserved for Phase 5 — installs a git PATH shim. Currently rejected.
         #[arg(long, hide = true)]
         shim: bool,
-        /// Store the encryption key in a 0600 file under the gitsafe store
+        /// Store the encryption key in a 0600 file under the reflogless store
         /// instead of the OS keychain. Loud warning; doctor surfaces this.
         #[arg(long)]
         insecure_file_key: bool,
     },
-    /// Remove gitsafe hooks; restore any prior chained third-party hooks.
+    /// Remove reflogless hooks; restore any prior chained third-party hooks.
     Uninstall {
         /// Also delete the on-disk snapshot store for this repo. Requires --yes.
         #[arg(long)]
@@ -78,15 +78,15 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("gitsafe: {e}");
+            eprintln!("reflogless: {e}");
             ExitCode::from(1)
         }
     }
 }
 
-fn run() -> gitsafe::Result<()> {
+fn run() -> reflogless::Result<()> {
     let cli = Cli::parse();
-    let cwd = std::env::current_dir().map_err(|e| gitsafe::Error::io(".", e))?;
+    let cwd = std::env::current_dir().map_err(|e| reflogless::Error::io(".", e))?;
     let repo = Repo::discover(&cwd)?;
     repo.assert_safe_ownership()?;
     let raw_store = Store::for_repo(&repo)?;
@@ -114,7 +114,7 @@ fn run() -> gitsafe::Result<()> {
                 );
             }
             for (p, e) in warnings {
-                eprintln!("gitsafe: warning: skipping {}: {e}", p.display());
+                eprintln!("reflogless: warning: skipping {}: {e}", p.display());
             }
         }
         Cmd::Show { id } => {
@@ -155,7 +155,7 @@ fn run() -> gitsafe::Result<()> {
             insecure_file_key,
         } => {
             if shim {
-                return Err(gitsafe::Error::Unimplemented(
+                return Err(reflogless::Error::Unimplemented(
                     "--shim lands in Phase 5".into(),
                 ));
             }
@@ -172,7 +172,7 @@ fn run() -> gitsafe::Result<()> {
         }
         Cmd::Uninstall { purge, yes } => {
             if purge && !yes {
-                return Err(gitsafe::Error::Config(
+                return Err(reflogless::Error::Config(
                     "--purge requires --yes (destructive: deletes the snapshot store)".into(),
                 ));
             }
@@ -184,7 +184,7 @@ fn run() -> gitsafe::Result<()> {
                 println!("restored prior {h}");
             }
             for h in &report.skipped {
-                println!("skipped {h} (not gitsafe-managed)");
+                println!("skipped {h} (not reflogless-managed)");
             }
             if purge {
                 let mut purge_warnings = 0u32;
@@ -192,9 +192,9 @@ fn run() -> gitsafe::Result<()> {
                 // to stderr (per safety-invariant-scope: destructive command
                 // failures must not be silent) but don't abort the disk wipe.
                 if let Err(e) = KeychainStore.delete(&repo.id()) {
-                    eprintln!("gitsafe: warning: keychain entry not removed: {e}");
+                    eprintln!("reflogless: warning: keychain entry not removed: {e}");
                     eprintln!(
-                        "gitsafe:          manually run: security delete-generic-password -s gitsafe -a {}",
+                        "reflogless:          manually run: security delete-generic-password -s reflogless -a {}",
                         repo.id()
                     );
                     purge_warnings += 1;
@@ -203,7 +203,7 @@ fn run() -> gitsafe::Result<()> {
                 if identity_file.exists() {
                     if let Err(e) = std::fs::remove_file(&identity_file) {
                         eprintln!(
-                            "gitsafe: warning: identity file not removed at {}: {e}",
+                            "reflogless: warning: identity file not removed at {}: {e}",
                             identity_file.display()
                         );
                         purge_warnings += 1;
@@ -211,13 +211,13 @@ fn run() -> gitsafe::Result<()> {
                 }
                 if store.root.exists() {
                     std::fs::remove_dir_all(&store.root)
-                        .map_err(|e| gitsafe::Error::io(&store.root, e))?;
+                        .map_err(|e| reflogless::Error::io(&store.root, e))?;
                     println!("purged store at {}", store.root.display());
                 } else {
                     println!("store already absent at {}", store.root.display());
                 }
                 if purge_warnings > 0 {
-                    return Err(gitsafe::Error::Config(format!(
+                    return Err(reflogless::Error::Config(format!(
                         "purge incomplete: {purge_warnings} resource(s) not removed (see stderr)"
                     )));
                 }
@@ -227,7 +227,7 @@ fn run() -> gitsafe::Result<()> {
             let report = doctor::run(&repo, &store)?;
             print!("{}", report.render());
             if !report.is_healthy() {
-                return Err(gitsafe::Error::Doctor(
+                return Err(reflogless::Error::Doctor(
                     report
                         .first_failure()
                         .unwrap_or("not healthy")
@@ -239,7 +239,7 @@ fn run() -> gitsafe::Result<()> {
     Ok(())
 }
 
-fn provision_identity(repo: &Repo, store: &Store, insecure: bool) -> gitsafe::Result<()> {
+fn provision_identity(repo: &Repo, store: &Store, insecure: bool) -> reflogless::Result<()> {
     if store.provisioned_for_encryption() {
         println!("identity already provisioned (recipient: {})", store.recipient_path().display());
         return Ok(());
@@ -258,20 +258,20 @@ fn provision_identity(repo: &Repo, store: &Store, insecure: bool) -> gitsafe::Re
         store.save_recipient(&recipient)?;
         store.mark_insecure()?;
         eprintln!(
-            "gitsafe: WARNING — encryption key stored unencrypted at {}",
+            "reflogless: WARNING — encryption key stored unencrypted at {}",
             file.display()
         );
-        eprintln!("gitsafe:           anyone with read access to that file can decrypt every snapshot");
+        eprintln!("reflogless:           anyone with read access to that file can decrypt every snapshot");
         println!("provisioned identity (file key at {})", file.display());
     } else {
         KeychainStore.save(&repo.id(), &identity)?;
         store.save_recipient(&recipient)?;
-        println!("provisioned identity (keychain service=gitsafe account={})", repo.id());
+        println!("provisioned identity (keychain service=reflogless account={})", repo.id());
     }
     Ok(())
 }
 
-fn attach_identity_if_provisioned(repo: &Repo, store: Store) -> gitsafe::Result<Store> {
+fn attach_identity_if_provisioned(repo: &Repo, store: Store) -> reflogless::Result<Store> {
     if !store.provisioned_for_encryption() {
         return Ok(store);
     }
@@ -308,7 +308,7 @@ fn diff_snapshot(
     store: &Store,
     m: &Manifest,
     only: Option<&std::path::Path>,
-) -> gitsafe::Result<()> {
+) -> reflogless::Result<()> {
     for e in &m.entries {
         if let Some(p) = only {
             if p != e.path {
@@ -322,7 +322,7 @@ fn diff_snapshot(
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 (Vec::new(), format!("work:{} (missing)", e.path.display()))
             }
-            Err(err) => return Err(gitsafe::Error::io(&cur_path, err)),
+            Err(err) => return Err(reflogless::Error::io(&cur_path, err)),
         };
         if snap_bytes == cur_bytes {
             continue;

@@ -11,8 +11,8 @@ pub const HOOKS: &[&str] = &[
     "reference-transaction",
 ];
 
-pub const MARKER: &str = "# gitsafe-managed (do not edit manually)";
-pub const MARKER_VERSION: &str = "# gitsafe-hook-version: 1";
+pub const MARKER: &str = "# reflogless-managed (do not edit manually)";
+pub const MARKER_VERSION: &str = "# reflogless-hook-version: 1";
 
 #[derive(Debug)]
 pub struct InstallReport {
@@ -64,7 +64,7 @@ pub fn install(repo: &Repo, hook_log_path: &Path) -> Result<InstallReport> {
                 continue;
             }
             // Preserve and chain existing third-party hook.
-            let backup = path.with_extension("gitsafe-orig");
+            let backup = path.with_extension("reflogless-orig");
             if !backup.exists() {
                 fs::copy(&path, &backup).map_err(|e| Error::io(&backup, e))?;
             }
@@ -95,7 +95,7 @@ pub fn uninstall(repo: &Repo) -> Result<UninstallReport> {
             report.skipped.push((*hook).to_string());
             continue;
         }
-        let backup = path.with_extension("gitsafe-orig");
+        let backup = path.with_extension("reflogless-orig");
         if backup.exists() {
             fs::rename(&backup, &path).map_err(|e| Error::io(&path, e))?;
             report.restored.push((*hook).to_string());
@@ -128,15 +128,15 @@ fn build_hook_body(hook: &str, hook_log_path: &Path, prior: Option<&Path>) -> St
     s.push('\n');
     s.push_str(&format!("# hook: {hook}\n"));
     // Best-effort snap. Never block the underlying git op. Stderr is captured
-    // to a per-store log so `gitsafe doctor` can surface silent failures.
+    // to a per-store log so `reflogless doctor` can surface silent failures.
     // The default log path is single-quote-escaped in a separate assignment
     // (POSIX parameter expansion defaults do not honor inline single quotes
     // when the whole expression is double-quoted).
     let log_q = sh_squote(hook_log_path);
-    s.push_str(&format!("__GITSAFE_DEFAULT_LOG={log_q}\n"));
-    s.push_str("GITSAFE_HOOK_LOG=\"${GITSAFE_HOOK_LOG:-$__GITSAFE_DEFAULT_LOG}\"\n");
+    s.push_str(&format!("__REFLOGLESS_DEFAULT_LOG={log_q}\n"));
+    s.push_str("REFLOGLESS_HOOK_LOG=\"${REFLOGLESS_HOOK_LOG:-$__REFLOGLESS_DEFAULT_LOG}\"\n");
     s.push_str(&format!(
-        "gitsafe snap --event {hook} 2>>\"$GITSAFE_HOOK_LOG\" >/dev/null || true\n"
+        "reflogless snap --event {hook} 2>>\"$REFLOGLESS_HOOK_LOG\" >/dev/null || true\n"
     ));
     if let Some(p) = prior {
         let q = sh_squote(p);
@@ -209,7 +209,7 @@ mod tests {
             let p = repo.root.join(".git").join("hooks").join(hook);
             let body = fs::read_to_string(&p).unwrap();
             assert!(body.contains(MARKER), "{hook} missing marker");
-            assert!(body.contains(&format!("gitsafe snap --event {hook}")));
+            assert!(body.contains(&format!("reflogless snap --event {hook}")));
         }
     }
 
@@ -225,11 +225,11 @@ mod tests {
         let log = repo.root.join("hook-errors.log");
         let report = install(&repo, &log).unwrap();
         assert!(report.chained.contains(&"post-checkout".to_string()));
-        let backup = hooks.join("post-checkout.gitsafe-orig");
+        let backup = hooks.join("post-checkout.reflogless-orig");
         assert!(backup.exists(), "backup not preserved");
         let body = fs::read_to_string(&existing).unwrap();
-        assert!(body.contains("gitsafe snap --event post-checkout"));
-        assert!(body.contains("post-checkout.gitsafe-orig"));
+        assert!(body.contains("reflogless snap --event post-checkout"));
+        assert!(body.contains("post-checkout.reflogless-orig"));
         // Chained exec must single-quote the prior path for POSIX safety.
         assert!(body.contains("exec '"));
     }
@@ -251,7 +251,7 @@ mod tests {
     #[test]
     fn build_hook_body_is_posix_valid() {
         use std::process::Command;
-        let path = std::path::PathBuf::from("/tmp/foo$bar/post-checkout.gitsafe-orig");
+        let path = std::path::PathBuf::from("/tmp/foo$bar/post-checkout.reflogless-orig");
         let log = std::path::PathBuf::from("/tmp/foo$bar/log");
         let body = build_hook_body("post-checkout", &log, Some(&path));
         // `sh -n` parses the script without executing — catches quoting bugs.
@@ -298,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_removes_gitsafe_hooks() {
+    fn uninstall_removes_reflogless_hooks() {
         let td = TempDir::new().unwrap();
         let repo = init_repo(td.path());
         install(&repo, &repo.root.join("hook-errors.log")).unwrap();
@@ -323,7 +323,7 @@ mod tests {
         assert!(report.restored.contains(&"post-checkout".to_string()));
         let body = fs::read_to_string(&p).unwrap();
         assert_eq!(body, "#!/bin/sh\necho husky\n");
-        assert!(!hooks.join("post-checkout.gitsafe-orig").exists());
+        assert!(!hooks.join("post-checkout.reflogless-orig").exists());
     }
 
     #[test]

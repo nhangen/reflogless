@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::fs;
 use std::path::Path;
 
-pub const CONFIG_FILENAME: &str = ".gitsafe.toml";
+pub const CONFIG_FILENAME: &str = ".reflogless.toml";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum EncryptPolicy {
@@ -33,7 +33,7 @@ pub struct Config {
 }
 
 impl Config {
-    /// Load `.gitsafe.toml` from the repo root. Missing file returns defaults.
+    /// Load `.reflogless.toml` from the repo root. Missing file returns defaults.
     /// Parse errors propagate as `Error::Config`.
     pub fn load_or_default(repo_root: &Path) -> Result<Self> {
         let path = repo_root.join(CONFIG_FILENAME);
