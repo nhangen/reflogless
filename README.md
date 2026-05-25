@@ -6,7 +6,7 @@ Local safety net for the working-tree state git refuses to track. Snapshots untr
 
 Blobs and snapshot manifests are encrypted at rest with [age](https://github.com/FiloSottile/age), keyed to the OS keychain (macOS Keychain / Linux Secret Service / Windows DPAPI via the [`keyring`](https://crates.io/crates/keyring) crate). Hooks run automatically around `post-checkout`, `pre-rebase`, `post-rewrite`, and `reference-transaction`. No cloud, no network, no telemetry.
 
-> **Status:** v0.1.1 pending — restores prebuilt arm64 Linux. Homebrew tap, Scoop manifest, and the optional `--shim` (for `git clean` / `git reset --hard` coverage) are tracked in [open issues](https://github.com/nhangen/reflogless/issues).
+> **Status:** v0.1.2 — adds the optional `--shim` for `git clean` / `git reset --hard` coverage. Homebrew tap, Scoop manifest, and Windows shim support remain tracked in [open issues](https://github.com/nhangen/reflogless/issues).
 
 ## Wedge
 
@@ -113,7 +113,8 @@ Open a new shell first if `reflogless` isn't found — the installer writes to `
 
 ```
 reflogless init                      install hooks + provision encryption identity
-reflogless init --insecure-file-key  same, but store key on disk (loud warning)
+reflogless init --shim               also install the git PATH shim (opt-in)
+reflogless init --insecure-file-key  store key on disk (loud warning)
 reflogless doctor                    verify install + store + canary + encryption
 reflogless snap -m MSG               manual snapshot
 reflogless list                      all snapshots for this repo
@@ -224,9 +225,46 @@ After `reflogless init`:
 | `post-rewrite` | after rebase / commit --amend | rewritten state |
 | `reference-transaction` | any ref update (git ≥ 2.28) | belt-and-suspenders |
 
-Hooks are best-effort: a snap failure never blocks the underlying git op. **`git` exposes no hooks on `clean` or `reset --hard`** — those land via the opt-in `--shim` ([#2](https://github.com/nhangen/reflogless/issues/2)).
+Hooks are best-effort: a snap failure never blocks the underlying git op. **`git` exposes no hooks on `clean` or `reset --hard`** — those are covered by the opt-in `--shim` (see below).
 
 If a third-party hook is already installed (husky, lefthook, hand-written), reflogless preserves it: the prior file is renamed to `<hook>.reflogless-orig` and reflogless's wrapper `exec`s it after taking the snapshot. `reflogless uninstall` restores the prior hook from `.reflogless-orig`.
+
+### Optional `--shim` for `git clean` / `git reset --hard`
+
+`git` doesn't expose hooks on `clean` or `reset --hard`, so those operations are invisible to the four real hooks above. The optional shim closes that gap by installing a tiny shell script named `git` ahead of the real `git` on PATH. When the user runs `git clean -fdx`, PATH resolves to the shim first; the shim asks `reflogless` to take a snapshot, then execs the real `git` with the original arguments.
+
+```sh
+reflogless init --shim
+```
+
+Output:
+
+```
+installed shim at /Users/me/.local/bin/git (delegates to /Users/me/.cargo/bin/reflogless)
+  ensure /Users/me/.local/bin is earlier on PATH than your system git
+```
+
+The shim is a five-line `/bin/sh` script — `cat ~/.local/bin/git` to see exactly what it does. `reflogless doctor` reports its status:
+
+- `shim: on (/path/to/git)` — installed and first on PATH.
+- `shim: SHADOWED (ours at X; PATH resolves git to Y)` — something else precedes us on PATH. Move our directory earlier, or remove the shadowing entry.
+- `shim: FOREIGN (... exists but is not reflogless-managed)` — there's already a `git` script at our install path that we didn't put there. Investigate and remove before re-running `init --shim`.
+
+Conservative v0.1.x allowlist (passthrough on anything else):
+
+| git invocation | shim action |
+|---|---|
+| `git clean ...` (any flags) | snapshot, then exec git |
+| `git reset --hard ...` (`--hard` anywhere in args) | snapshot, then exec git |
+| anything else | exec git directly (no snapshot) |
+
+`git restore`, `git switch -f`, `git checkout -f` are deliberately *not* in v0.1.x — tracked as follow-ups so each new arg-parsing surface gets its own evaluation.
+
+Shim errors (snapshot failure, repo discovery failure outside a git tree) never abort the underlying `git` command. They're logged to `<store>/shim-errors.log`.
+
+Remove the shim with `reflogless uninstall` (also restores any chained third-party hooks).
+
+Currently Unix-only. Windows shim is a separate follow-up.
 
 ## Encryption
 
@@ -281,6 +319,14 @@ Another tool installed the same hook file after reflogless. `reflogless init` wo
 
 - Configure that tool to chain through `reflogless` (most third-party hook managers like husky and lefthook do this automatically — install reflogless first, then re-run the third-party tool's installer).
 - Manually merge: read the foreign hook, prepend `reflogless snap --event <hook-name>` to its first non-shebang line.
+
+### `reflogless doctor` reports `shim shadowed`
+
+The shim is installed but `git` on your PATH resolves to a different binary that appears earlier. The shim never runs. Fix by reordering PATH so the shim's directory (shown in the doctor output as "ours at X") precedes the directory holding the other `git`. Verify with `which -a git` — the shim should be first.
+
+### `reflogless doctor` reports `shim foreign`
+
+There's already a file at the install path (`~/.local/bin/git` or wherever the shim wants to live) that reflogless didn't write. `reflogless init --shim` refuses to overwrite it. Investigate the existing file (`cat ~/.local/bin/git`), remove it if you're sure, then re-run `reflogless init --shim`.
 
 ### Hook errors logged
 
@@ -343,11 +389,11 @@ Conventions:
 
 Phases: Core (`snap` / `restore` / CAS store) → Hooks + `init` + `doctor` → Encryption → Packaging → optional `--shim` (covers `git clean -fdx` / `git reset --hard`) → v1.0 → v2.
 
-v0.1.0 shipped the first four phases; v0.1.1 restores prebuilt arm64 Linux. Open follow-ups:
+v0.1.0 shipped the first four phases; v0.1.1 restored prebuilt arm64 Linux; v0.1.2 lands the optional `--shim` for `git clean` / `git reset --hard` coverage. Open follow-ups:
 
-- [#2](https://github.com/nhangen/reflogless/issues/2) — Phase 5: optional `--shim` for `git clean` / `git reset --hard` coverage.
 - [#3](https://github.com/nhangen/reflogless/issues/3) — v1.0 release criteria.
 - [#4](https://github.com/nhangen/reflogless/issues/4) — v2 backlog (filesystem-watcher daemon, remote backend, multi-repo `list --all`, Authenticode signing).
+- Windows shim, expanded shim allowlist (`restore` / `switch -f` / `checkout -f`), and shim `--dry-run` detection are tracked as follow-ups filed during the Phase 5 PR.
 
 ## History
 

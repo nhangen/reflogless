@@ -47,7 +47,31 @@ pub enum HookState {
 
 #[derive(Debug)]
 pub enum ShimStatus {
+    /// No reflogless-managed shim at the resolved install dir.
     Off,
+    /// Shim present and is the first `git` on PATH.
+    On { path: std::path::PathBuf },
+    /// Shim present but PATH resolves `git` to a different binary that
+    /// precedes it — the shim won't run.
+    Shadowed {
+        ours: std::path::PathBuf,
+        precedes: std::path::PathBuf,
+    },
+    /// A file at the shim path exists but is not reflogless-managed.
+    Foreign { path: std::path::PathBuf },
+}
+
+impl From<crate::shim::ShimStatus> for ShimStatus {
+    fn from(s: crate::shim::ShimStatus) -> Self {
+        match s {
+            crate::shim::ShimStatus::Off => ShimStatus::Off,
+            crate::shim::ShimStatus::On { path } => ShimStatus::On { path },
+            crate::shim::ShimStatus::Shadowed { ours, precedes } => {
+                ShimStatus::Shadowed { ours, precedes }
+            }
+            crate::shim::ShimStatus::Foreign { path } => ShimStatus::Foreign { path },
+        }
+    }
 }
 
 pub fn run(repo: &Repo, store: &Store) -> Result<DoctorReport> {
@@ -135,7 +159,7 @@ pub fn run(repo: &Repo, store: &Store) -> Result<DoctorReport> {
         store_size_bytes,
         snapshots,
         corrupt_snapshots,
-        shim_status: ShimStatus::Off,
+        shim_status: crate::shim::observe().into(),
         canary_roundtrip,
         recent_hook_errors,
         crypto_status,
@@ -220,6 +244,12 @@ impl DoctorReport {
             CryptoStatus::KeyUnreachable => return Some("encryption key unreachable"),
             CryptoStatus::RoundtripFailed(_) => return Some("encryption canary roundtrip failed"),
         }
+        match &self.shim_status {
+            // `Off` is the default for users who didn't opt in to the shim.
+            ShimStatus::Off | ShimStatus::On { .. } => {}
+            ShimStatus::Shadowed { .. } => return Some("shim shadowed by another git"),
+            ShimStatus::Foreign { .. } => return Some("shim path holds a foreign file"),
+        }
         None
     }
 
@@ -254,7 +284,7 @@ impl DoctorReport {
             }
         }
         let _ = writeln!(s, "  corrupt snapshots   : {}", self.corrupt_snapshots);
-        let _ = writeln!(s, "  shim                : off");
+        let _ = writeln!(s, "  shim                : {}", render_shim(&self.shim_status));
         let _ = writeln!(
             s,
             "  canary roundtrip    : {}",
@@ -286,6 +316,21 @@ impl DoctorReport {
             }
         );
         s
+    }
+}
+
+fn render_shim(s: &ShimStatus) -> String {
+    match s {
+        ShimStatus::Off => "off".into(),
+        ShimStatus::On { path } => format!("on ({})", path.display()),
+        ShimStatus::Shadowed { ours, precedes } => format!(
+            "SHADOWED (ours at {}; PATH resolves git to {})",
+            ours.display(),
+            precedes.display()
+        ),
+        ShimStatus::Foreign { path } => {
+            format!("FOREIGN ({} exists but is not reflogless-managed)", path.display())
+        }
     }
 }
 
