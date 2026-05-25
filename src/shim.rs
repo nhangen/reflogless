@@ -138,7 +138,7 @@ pub struct InstallReport {
 pub fn install() -> Result<InstallReport> {
     let shim_dir = resolve_shim_dir()?;
     fs::create_dir_all(&shim_dir).map_err(|e| Error::io(&shim_dir, e))?;
-    let shim_path = shim_dir.join("git");
+    let shim_path = shim_dir.join(shim_file_name());
     let reflogless_bin = std::env::current_exe().map_err(|e| Error::io("<current_exe>", e))?;
 
     if shim_path.exists() {
@@ -165,7 +165,7 @@ pub fn install() -> Result<InstallReport> {
 /// file at the target path.
 pub fn uninstall() -> Result<Option<PathBuf>> {
     let shim_dir = resolve_shim_dir()?;
-    let shim_path = shim_dir.join("git");
+    let shim_path = shim_dir.join(shim_file_name());
     if !shim_path.exists() {
         return Ok(None);
     }
@@ -190,14 +190,24 @@ pub fn resolve_shim_dir() -> Result<PathBuf> {
             return Ok(PathBuf::from(v));
         }
     }
-    if let Some(d) = dirs::executable_dir() {
-        return Ok(d);
+    #[cfg(windows)]
+    {
+        let exe = std::env::current_exe().map_err(|e| Error::io("<current_exe>", e))?;
+        if let Some(parent) = exe.parent() {
+            return Ok(parent.to_path_buf());
+        }
     }
-    // `dirs::executable_dir()` returns None on macOS and Windows. Falling
-    // back to the reflogless binary's parent would target a system bin
-    // (e.g. /opt/homebrew/bin) — default to ~/.local/bin instead.
-    if let Some(home) = dirs::home_dir() {
-        return Ok(home.join(".local").join("bin"));
+    #[cfg(not(windows))]
+    {
+        if let Some(d) = dirs::executable_dir() {
+            return Ok(d);
+        }
+        // `dirs::executable_dir()` returns None on macOS and Windows. Falling
+        // back to the reflogless binary's parent would target a system bin
+        // (e.g. /opt/homebrew/bin) — default to ~/.local/bin instead.
+        if let Some(home) = dirs::home_dir() {
+            return Ok(home.join(".local").join("bin"));
+        }
     }
     let exe = std::env::current_exe().map_err(|e| Error::io("<current_exe>", e))?;
     exe.parent()
@@ -205,14 +215,39 @@ pub fn resolve_shim_dir() -> Result<PathBuf> {
         .ok_or_else(|| Error::Config("could not resolve shim install directory".into()))
 }
 
+#[cfg(windows)]
+fn shim_file_name() -> &'static str {
+    "git.cmd"
+}
+
+#[cfg(not(windows))]
+fn shim_file_name() -> &'static str {
+    "git"
+}
+
 /// Detects a reflogless-managed shim by line-anchored marker match.
 /// Substring matching would false-positive on user wrappers that mention
 /// the marker string in a comment.
 fn is_managed_shim_body(body: &str) -> bool {
-    body.lines().any(|line| line.trim() == MARKER)
+    body.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed == MARKER || trimmed.eq_ignore_ascii_case("rem # reflogless-managed shim")
+    })
 }
 
 fn render_shim_script(reflogless_bin: &Path) -> String {
+    #[cfg(windows)]
+    {
+        return render_windows_shim_script(reflogless_bin);
+    }
+    #[cfg(not(windows))]
+    {
+        render_unix_shim_script(reflogless_bin)
+    }
+}
+
+#[cfg(any(not(windows), test))]
+fn render_unix_shim_script(reflogless_bin: &Path) -> String {
     format!(
         "#!/bin/sh\n\
 {MARKER}\n\
@@ -220,6 +255,19 @@ fn render_shim_script(reflogless_bin: &Path) -> String {
 # Snapshots untracked + dirty files before destructive git subcommands\n\
 # (`clean`, `reset --hard`), then execs the real `git`.\n\
 exec \"{bin}\" _shim --shim-dir=\"$(dirname \"$0\")\" -- \"$@\"\n",
+        bin = reflogless_bin.display(),
+    )
+}
+
+#[cfg(any(windows, test))]
+fn render_windows_shim_script(reflogless_bin: &Path) -> String {
+    format!(
+        "@echo off\r\n\
+REM {MARKER}\r\n\
+REM Managed by `reflogless init --shim`; remove with `reflogless uninstall`.\r\n\
+REM Snapshots untracked + dirty files before destructive git subcommands.\r\n\
+\"{bin}\" _shim --shim-dir=\"%~dp0\" -- %*\r\n\
+exit /b %ERRORLEVEL%\r\n",
         bin = reflogless_bin.display(),
     )
 }
@@ -273,19 +321,24 @@ pub enum ShimStatus {
 fn extract_shim_target(body: &str) -> Option<PathBuf> {
     for line in body.lines() {
         let trimmed = line.trim_start();
-        let Some(rest) = trimmed.strip_prefix("exec ") else {
+        if !trimmed.contains("_shim") {
             continue;
-        };
-        let rest = rest.trim_start();
-        let Some(after_quote) = rest.strip_prefix('"') else {
-            continue;
-        };
-        let Some(end) = after_quote.find('"') else {
-            continue;
-        };
-        return Some(PathBuf::from(&after_quote[..end]));
+        }
+        let rest = trimmed
+            .strip_prefix("exec ")
+            .unwrap_or(trimmed)
+            .trim_start();
+        if let Some(target) = first_quoted_path(rest) {
+            return Some(target);
+        }
     }
     None
+}
+
+fn first_quoted_path(s: &str) -> Option<PathBuf> {
+    let after_quote = s.strip_prefix('"')?;
+    let end = after_quote.find('"')?;
+    Some(PathBuf::from(&after_quote[..end]))
 }
 
 /// Inspect the filesystem and PATH to classify the shim.
@@ -294,7 +347,7 @@ pub fn observe() -> ShimStatus {
         Ok(d) => d,
         Err(_) => return ShimStatus::Off,
     };
-    let shim_path = shim_dir.join("git");
+    let shim_path = shim_dir.join(shim_file_name());
     if !shim_path.exists() {
         return ShimStatus::Off;
     }
@@ -307,7 +360,7 @@ pub fn observe() -> ShimStatus {
             }
         }
     };
-    if !body.contains(MARKER) {
+    if !is_managed_shim_body(&body) {
         return ShimStatus::Foreign { path: shim_path };
     }
 
@@ -334,22 +387,63 @@ pub fn observe() -> ShimStatus {
     // Walk PATH to confirm our shim is what `git` resolves to.
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join("git");
-            if !candidate.exists() {
-                continue;
+            for candidate in git_candidates_for_dir(&dir) {
+                if !candidate.exists() {
+                    continue;
+                }
+                if same_file(&candidate, &shim_path) {
+                    return ShimStatus::On { path: shim_path };
+                }
+                return ShimStatus::Shadowed {
+                    ours: shim_path,
+                    precedes: candidate,
+                };
             }
-            if same_file(&candidate, &shim_path) {
-                return ShimStatus::On { path: shim_path };
-            }
-            return ShimStatus::Shadowed {
-                ours: shim_path,
-                precedes: candidate,
-            };
         }
     }
     // PATH didn't contain any `git` at all but the shim file exists — treat
     // as On (the user's PATH is the user's problem; the shim itself is fine).
     ShimStatus::On { path: shim_path }
+}
+
+fn git_candidates_for_dir(dir: &Path) -> Vec<PathBuf> {
+    git_candidate_names()
+        .into_iter()
+        .map(|name| dir.join(name))
+        .collect()
+}
+
+#[cfg(windows)]
+fn git_candidate_names() -> Vec<String> {
+    git_candidate_names_from_pathext(std::env::var("PATHEXT").ok().as_deref())
+}
+
+#[cfg(not(windows))]
+fn git_candidate_names() -> Vec<String> {
+    vec!["git".into()]
+}
+
+#[cfg(any(windows, test))]
+fn git_candidate_names_from_pathext(pathext: Option<&str>) -> Vec<String> {
+    let mut names = vec!["git".into()];
+    let Some(pathext) = pathext else {
+        names.push("git.cmd".into());
+        return names;
+    };
+    for ext in pathext.split(';') {
+        if ext.is_empty() {
+            continue;
+        }
+        let ext = ext.trim_start_matches('.');
+        names.push(format!("git.{}", ext.to_ascii_lowercase()));
+    }
+    if !names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("git.cmd"))
+    {
+        names.push("git.cmd".into());
+    }
+    names
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {
@@ -596,6 +690,21 @@ mod tests {
     }
 
     #[test]
+    fn rendered_windows_script_is_cmd_wrapper() {
+        let bin = PathBuf::from(r"C:\Users\me\.cargo\bin\reflogless.exe");
+        let s = render_windows_shim_script(&bin);
+        assert!(s.starts_with("@echo off\r\n"));
+        assert!(s.contains(&format!("REM {MARKER}")));
+        assert!(s.contains(r#""C:\Users\me\.cargo\bin\reflogless.exe" _shim"#));
+        assert!(s.contains(r#"--shim-dir="%~dp0" -- %*"#));
+        assert!(is_managed_shim_body(&s));
+        assert_eq!(
+            extract_shim_target(&s),
+            Some(PathBuf::from(r"C:\Users\me\.cargo\bin\reflogless.exe"))
+        );
+    }
+
+    #[test]
     fn path_without_shim_dir_removes_only_matching_entry() {
         let _g = ENV_LOCK.lock().unwrap();
         std::env::set_var("PATH", "/usr/bin:/tmp/shim:/usr/local/bin");
@@ -646,6 +755,22 @@ mod tests {
         assert_eq!(extract_shim_target(""), None);
         // Malformed exec line (no closing quote)
         assert_eq!(extract_shim_target("exec \"/bin/foo unterminated\n"), None);
+    }
+
+    #[test]
+    fn git_candidate_names_follow_windows_pathext_order() {
+        assert_eq!(
+            git_candidate_names_from_pathext(Some(".COM;.EXE;.BAT;.CMD")),
+            vec!["git", "git.com", "git.exe", "git.bat", "git.cmd"]
+        );
+        assert_eq!(
+            git_candidate_names_from_pathext(Some(".CMD;.EXE")),
+            vec!["git", "git.cmd", "git.exe"]
+        );
+        assert_eq!(
+            git_candidate_names_from_pathext(None),
+            vec!["git", "git.cmd"]
+        );
     }
 
     #[cfg(unix)]

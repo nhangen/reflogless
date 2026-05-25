@@ -231,7 +231,7 @@ If a third-party hook is already installed (husky, lefthook, hand-written), refl
 
 ### Optional `--shim` for `git clean` / `git reset --hard`
 
-`git` doesn't expose hooks on `clean` or `reset --hard`, so those operations are invisible to the four real hooks above. The optional shim closes that gap by installing a tiny shell script named `git` ahead of the real `git` on PATH. When the user runs `git clean -fdx`, PATH resolves to the shim first; the shim asks `reflogless` to take a snapshot, then execs the real `git` with the original arguments.
+`git` doesn't expose hooks on `clean` or `reset --hard`, so those operations are invisible to the four real hooks above. The optional shim closes that gap by installing a tiny wrapper named `git` (Unix) or `git.cmd` (Windows) ahead of the real `git` on PATH. When the user runs `git clean -fdx`, PATH resolves to the shim first; the shim asks `reflogless` to take a snapshot, then runs the real `git` with the original arguments.
 
 ```sh
 reflogless init --shim
@@ -246,11 +246,11 @@ installed shim at /Users/me/.local/bin/git (delegates to /Users/me/.cargo/bin/re
 
 #### Once per machine, not per repo
 
-The shim is a single file at `~/.local/bin/git` that catches `git clean` and `git reset --hard` system-wide — every repo, every directory. Install it once and you're covered everywhere.
+The shim is a single file (`~/.local/bin/git` on Unix, `git.cmd` next to `reflogless.exe` on Windows) that catches destructive git commands system-wide — every repo, every directory. Install it once and you're covered everywhere.
 
 | What | Scope | Where |
 |---|---|---|
-| Shim script | **per machine** | `~/.local/bin/git` |
+| Shim script | **per machine** | `~/.local/bin/git` on Unix; `git.cmd` next to `reflogless.exe` on Windows |
 | Hooks (`post-checkout`, `pre-rebase`, `post-rewrite`, `reference-transaction`) | **per repo** | `<repo>/.git/hooks/` |
 | Snapshot store + encryption identity | **per repo** | `$XDG_DATA_HOME/reflogless/<repo-hash>/` + keychain entry keyed on `<repo-hash>` |
 | `.reflogless.toml` policy | **per repo** | `<repo>/.reflogless.toml` |
@@ -268,7 +268,7 @@ reflogless init   # (no --shim — already installed; the call is idempotent if 
 
 In a repo where you've never run `reflogless init`, the shim still catches destructive `git` commands and snapshots into a freshly-created (unencrypted) store. You'll have shim coverage but not hook coverage and not encryption until you `init` that repo. `reflogless doctor` from inside the repo will then flag the missing pieces.
 
-The shim is a five-line `/bin/sh` script — `cat ~/.local/bin/git` to see exactly what it does. `reflogless doctor` reports its status:
+The shim is intentionally small — `cat ~/.local/bin/git` on Unix or `type git.cmd` on Windows to see exactly what it does. `reflogless doctor` reports its status:
 
 - `shim: on (/path/to/git)` — installed and first on PATH.
 - `shim: SHADOWED (ours at X; PATH resolves git to Y)` — something else precedes us on PATH. Move our directory earlier, or remove the shadowing entry.
@@ -291,8 +291,6 @@ Conservative v0.1.x allowlist (passthrough on anything else):
 Shim errors (snapshot failure, repo discovery failure outside a git tree) never abort the underlying `git` command. They're logged to `<store>/shim-errors.log`.
 
 Remove the shim with `reflogless uninstall` (also restores any chained third-party hooks).
-
-Currently Unix-only. Windows shim is a separate follow-up.
 
 ## Encryption
 
@@ -359,9 +357,15 @@ Another tool installed the same hook file after reflogless. `reflogless init` wo
 
 The shim is installed but `git` on your PATH resolves to a different binary that appears earlier. The shim never runs. Fix by reordering PATH so the shim's directory (shown in the doctor output as "ours at X") precedes the directory holding the other `git`. Verify with `which -a git` — the shim should be first.
 
+On Windows, command resolution also follows `PATHEXT`; `reflogless doctor` accounts for `.exe`, `.cmd`, and `.bat` ordering when deciding whether `git.cmd` is shadowed.
+
 ### `reflogless doctor` reports `shim foreign`
 
 There's already a file at the install path (`~/.local/bin/git` or wherever the shim wants to live) that reflogless didn't write. `reflogless init --shim` refuses to overwrite it. Investigate the existing file (`cat ~/.local/bin/git`), remove it if you're sure, then re-run `reflogless init --shim`.
+
+### Windows blocks `git.cmd`
+
+Enterprise Windows policies such as Smart App Control or AppLocker may block unsigned `.cmd` wrappers. If `git` stops launching after `reflogless init --shim`, run `reflogless uninstall` from PowerShell or remove the printed `git.cmd` path manually, then use hook-only coverage until the policy allows the wrapper.
 
 ### Hook errors logged
 
