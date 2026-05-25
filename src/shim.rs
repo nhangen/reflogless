@@ -266,7 +266,7 @@ fn render_windows_shim_script(reflogless_bin: &Path) -> String {
 REM {MARKER}\r\n\
 REM Managed by `reflogless init --shim`; remove with `reflogless uninstall`.\r\n\
 REM Snapshots untracked + dirty files before destructive git subcommands.\r\n\
-\"{bin}\" _shim --shim-dir=\"%~dp0\" -- %*\r\n\
+\"{bin}\" _shim \"--shim-dir=%~dp0.\" -- %*\r\n\
 exit /b %ERRORLEVEL%\r\n",
         bin = reflogless_bin.display(),
     )
@@ -696,7 +696,7 @@ mod tests {
         assert!(s.starts_with("@echo off\r\n"));
         assert!(s.contains(&format!("REM {MARKER}")));
         assert!(s.contains(r#""C:\Users\me\.cargo\bin\reflogless.exe" _shim"#));
-        assert!(s.contains(r#"--shim-dir="%~dp0" -- %*"#));
+        assert!(s.contains(r#""--shim-dir=%~dp0." -- %*"#));
         assert!(is_managed_shim_body(&s));
         assert_eq!(
             extract_shim_target(&s),
