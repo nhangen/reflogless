@@ -9,6 +9,7 @@ use reflogless::hooks;
 use reflogless::keystore::{FileStore, KeyStore, KeychainStore};
 use reflogless::manifest::Manifest;
 use reflogless::repo::Repo;
+use reflogless::shim;
 use reflogless::snapshot::{restore, snap_with_policy};
 use reflogless::store::{CryptoCtx, Store, DEFAULT_MAX_AGE_DAYS, DEFAULT_MAX_STORE_BYTES};
 
@@ -53,8 +54,9 @@ enum Cmd {
     /// encryption identity (keychain by default; pass --insecure-file-key
     /// to store the key on disk under the store dir).
     Init {
-        /// Reserved for Phase 5 — installs a git PATH shim. Currently rejected.
-        #[arg(long, hide = true)]
+        /// Also install a `git` PATH shim that snapshots before
+        /// `git clean` and `git reset --hard`. Opt-in only; see README.
+        #[arg(long)]
         shim: bool,
         /// Store the encryption key in a 0600 file under the reflogless store
         /// instead of the OS keychain. Loud warning; doctor surfaces this.
@@ -72,6 +74,18 @@ enum Cmd {
     },
     /// Verify install + store + canary.
     Doctor,
+    /// Internal: dispatched by the installed PATH shim. Not for direct use.
+    #[command(hide = true)]
+    #[command(name = "_shim")]
+    Shim {
+        /// Directory containing the shim binary; passed by the shim script
+        /// so we can strip it from PATH before exec'ing the real `git`.
+        #[arg(long)]
+        shim_dir: PathBuf,
+        /// Verbatim git arguments to forward.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -86,6 +100,14 @@ fn main() -> ExitCode {
 
 fn run() -> reflogless::Result<()> {
     let cli = Cli::parse();
+
+    // _shim runs from arbitrary cwd, may be outside any git repo, and must
+    // never abort `git` on internal reflogless errors. Dispatch before the
+    // repo-discovery prelude that every other command requires.
+    if let Cmd::Shim { shim_dir, args } = cli.cmd {
+        return run_shim(shim_dir, args);
+    }
+
     let cwd = std::env::current_dir().map_err(|e| reflogless::Error::io(".", e))?;
     let repo = Repo::discover(&cwd)?;
     repo.assert_safe_ownership()?;
@@ -94,6 +116,7 @@ fn run() -> reflogless::Result<()> {
     let store = attach_identity_if_provisioned(&repo, raw_store)?;
 
     match cli.cmd {
+        Cmd::Shim { .. } => unreachable!("handled above"),
         Cmd::Snap { message, event } => {
             let r = snap_with_policy(&repo, &store, &event, message, cfg.encrypt)?;
             println!(
@@ -151,14 +174,9 @@ fn run() -> reflogless::Result<()> {
             );
         }
         Cmd::Init {
-            shim,
+            shim: install_shim,
             insecure_file_key,
         } => {
-            if shim {
-                return Err(reflogless::Error::Unimplemented(
-                    "--shim lands in Phase 5".into(),
-                ));
-            }
             let log = store.root.join("hook-errors.log");
             let report = hooks::install(&repo, &log)?;
             println!("installed into {}", report.hooks_dir.display());
@@ -169,6 +187,18 @@ fn run() -> reflogless::Result<()> {
                 println!("  chained (preserved existing hook): {h}");
             }
             provision_identity(&repo, &store, insecure_file_key)?;
+            if install_shim {
+                let r = shim::install()?;
+                println!(
+                    "installed shim at {} (delegates to {})",
+                    r.shim_path.display(),
+                    r.reflogless_bin.display()
+                );
+                println!(
+                    "  ensure {} is earlier on PATH than your system git",
+                    r.shim_path.parent().map(|p| p.display().to_string()).unwrap_or_default()
+                );
+            }
         }
         Cmd::Uninstall { purge, yes } => {
             if purge && !yes {
@@ -185,6 +215,11 @@ fn run() -> reflogless::Result<()> {
             }
             for h in &report.skipped {
                 println!("skipped {h} (not reflogless-managed)");
+            }
+            match shim::uninstall() {
+                Ok(Some(p)) => println!("removed shim at {}", p.display()),
+                Ok(None) => {}
+                Err(e) => eprintln!("reflogless: warning: shim removal: {e}"),
             }
             if purge {
                 let mut purge_warnings = 0u32;
@@ -346,4 +381,98 @@ fn diff_snapshot(
         }
     }
     Ok(())
+}
+
+/// Body of the hidden `_shim` subcommand. Snapshots the working tree (best
+/// effort) when the forwarded git invocation is destructive, then execs the
+/// real `git` so the user sees its exit code directly.
+///
+/// Errors inside this function never propagate to abort the user's git
+/// command — they're logged to the per-repo `<store>/shim-errors.log` (or
+/// stderr if the store can't be located).
+fn run_shim(shim_dir: PathBuf, args: Vec<String>) -> reflogless::Result<()> {
+    if let Some(event) = shim::destructive_event(&args) {
+        if let Err(e) = snapshot_for_shim(event) {
+            log_shim_error(&format!("snapshot for {event}: {e}"));
+        }
+    }
+
+    let pruned_path = shim::path_without_shim_dir(&shim_dir);
+    let safe_path = if pruned_path.is_empty() {
+        "/usr/bin:/bin".to_string()
+    } else {
+        pruned_path
+    };
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(&args);
+    cmd.env("PATH", &safe_path);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let exec_err = cmd.exec();
+        log_shim_error(&format!(
+            "exec git failed, falling back to spawn: {exec_err}"
+        ));
+    }
+
+    let status = cmd
+        .status()
+        .map_err(|e| reflogless::Error::Config(format!("failed to spawn git: {e}")))?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+fn snapshot_for_shim(event: &str) -> reflogless::Result<()> {
+    let cwd = std::env::current_dir().map_err(|e| reflogless::Error::io(".", e))?;
+    let repo = Repo::discover(&cwd)?;
+    repo.assert_safe_ownership()?;
+    let raw_store = Store::for_repo(&repo)?;
+    let cfg = Config::load_or_default(&repo.root)?;
+    let store = attach_identity_if_provisioned(&repo, raw_store)?;
+    snap_with_policy(&repo, &store, event, None, cfg.encrypt)?;
+    Ok(())
+}
+
+fn log_shim_error(msg: &str) {
+    let store_logged = (|| -> reflogless::Result<()> {
+        let cwd = std::env::current_dir().map_err(|e| reflogless::Error::io(".", e))?;
+        let repo = Repo::discover(&cwd)?;
+        let store = Store::for_repo(&repo)?;
+        write_shim_log_line(&store.root.join("shim-errors.log"), msg)
+    })();
+    if store_logged.is_ok() {
+        return;
+    }
+    if let Some(fallback) = shim_fallback_log_path() {
+        if write_shim_log_line(&fallback, msg).is_ok() {
+            return;
+        }
+    }
+    eprintln!("reflogless-shim: {msg}");
+}
+
+fn write_shim_log_line(path: &std::path::Path, msg: &str) -> reflogless::Result<()> {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| reflogless::Error::io(path, e))?;
+    let ts = chrono::Utc::now().to_rfc3339();
+    writeln!(f, "{ts}  {msg}").map_err(|e| reflogless::Error::io(path, e))
+}
+
+fn shim_fallback_log_path() -> Option<PathBuf> {
+    if let Some(s) = dirs::state_dir() {
+        return Some(s.join("reflogless").join("shim-errors.log"));
+    }
+    dirs::home_dir().map(|h| {
+        h.join(".local")
+            .join("state")
+            .join("reflogless")
+            .join("shim-errors.log")
+    })
 }
