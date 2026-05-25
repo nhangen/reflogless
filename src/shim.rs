@@ -19,10 +19,16 @@ pub const MARKER: &str = "# reflogless-managed shim";
 /// Returns the event tag to use for the snapshot, or `None` to passthrough.
 pub fn destructive_event(args: &[String]) -> Option<&'static str> {
     let (idx, subcommand) = find_subcommand(args)?;
+    let after = &args[idx + 1..];
     match subcommand {
-        "clean" => Some("shim-clean"),
+        "clean" => {
+            if is_clean_dry_run(after) {
+                None
+            } else {
+                Some("shim-clean")
+            }
+        }
         "reset" => {
-            let after = &args[idx + 1..];
             if after.iter().any(|a| a == "--hard") {
                 Some("shim-reset-hard")
             } else {
@@ -31,6 +37,30 @@ pub fn destructive_event(args: &[String]) -> Option<&'static str> {
         }
         _ => None,
     }
+}
+
+/// Detect `git clean --dry-run` / `git clean -n` (including short-flag
+/// clusters like `-nd`, `-ndx`, `-fnd`). Arguments after `--` are pathspecs,
+/// not flags, and are ignored.
+fn is_clean_dry_run(after: &[String]) -> bool {
+    for arg in after {
+        let a = arg.as_str();
+        if a == "--" {
+            return false;
+        }
+        if a == "--dry-run" {
+            return true;
+        }
+        if a.starts_with("--") {
+            continue;
+        }
+        if let Some(short) = a.strip_prefix('-') {
+            if short.contains('n') {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Walk past git's global flags to find the subcommand.
@@ -272,12 +302,36 @@ mod tests {
             destructive_event(&args(&["clean", "--force", "-d"])),
             Some("shim-clean")
         );
-        // We deliberately over-snapshot on --dry-run: detecting it correctly
-        // requires parsing every clean flag, and an extra snapshot on a dry
-        // run is harmless (CAS dedup → ~0 bytes written).
+    }
+
+    #[test]
+    fn destructive_event_clean_dry_run_short_circuits() {
+        // --dry-run is touch-free; no snapshot needed.
+        assert_eq!(destructive_event(&args(&["clean", "--dry-run"])), None);
+        assert_eq!(destructive_event(&args(&["clean", "-n"])), None);
+        // -n clustered with other short flags
+        assert_eq!(destructive_event(&args(&["clean", "-nd"])), None);
+        assert_eq!(destructive_event(&args(&["clean", "-ndx"])), None);
+        assert_eq!(destructive_event(&args(&["clean", "-fnd"])), None);
+        // Dry-run still detected after the global -C subcommand routing
         assert_eq!(
-            destructive_event(&args(&["clean", "--dry-run"])),
+            destructive_event(&args(&["-C", "sub", "clean", "--dry-run"])),
+            None
+        );
+        // Pathspec named "-n" after `--` must NOT trigger dry-run
+        assert_eq!(
+            destructive_event(&args(&["clean", "-fd", "--", "-n"])),
             Some("shim-clean")
+        );
+        // --no-dry-run is not --dry-run
+        assert_eq!(
+            destructive_event(&args(&["clean", "--no-dry-run"])),
+            Some("shim-clean")
+        );
+        // reset --hard has no dry-run; flag should not affect it
+        assert_eq!(
+            destructive_event(&args(&["reset", "--hard", "-n"])),
+            Some("shim-reset-hard")
         );
     }
 
