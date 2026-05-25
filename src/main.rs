@@ -188,7 +188,7 @@ fn run() -> reflogless::Result<()> {
             }
             provision_identity(&repo, &store, insecure_file_key)?;
             if install_shim {
-                let r = shim::install(&repo)?;
+                let r = shim::install()?;
                 println!(
                     "installed shim at {} (delegates to {})",
                     r.shim_path.display(),
@@ -397,29 +397,29 @@ fn run_shim(shim_dir: PathBuf, args: Vec<String>) -> reflogless::Result<()> {
         }
     }
 
-    // Strip the shim's directory from PATH before invoking git, otherwise
-    // the spawned process re-enters this same shim and loops.
     let pruned_path = shim::path_without_shim_dir(&shim_dir);
+    let safe_path = if pruned_path.is_empty() {
+        "/usr/bin:/bin".to_string()
+    } else {
+        pruned_path
+    };
     let mut cmd = std::process::Command::new("git");
     cmd.args(&args);
-    cmd.env("PATH", &pruned_path);
+    cmd.env("PATH", &safe_path);
 
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        let err = cmd.exec();
-        return Err(reflogless::Error::Config(format!(
-            "failed to invoke git: {err}"
-        )));
+        let exec_err = cmd.exec();
+        log_shim_error(&format!(
+            "exec git failed, falling back to spawn: {exec_err}"
+        ));
     }
 
-    #[cfg(not(unix))]
-    {
-        let status = cmd
-            .status()
-            .map_err(|e| reflogless::Error::Config(format!("failed to spawn git: {e}")))?;
-        std::process::exit(status.code().unwrap_or(1));
-    }
+    let status = cmd
+        .status()
+        .map_err(|e| reflogless::Error::Config(format!("failed to spawn git: {e}")))?;
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 fn snapshot_for_shim(event: &str) -> reflogless::Result<()> {
@@ -434,25 +434,45 @@ fn snapshot_for_shim(event: &str) -> reflogless::Result<()> {
 }
 
 fn log_shim_error(msg: &str) {
-    let logged = (|| -> reflogless::Result<()> {
+    let store_logged = (|| -> reflogless::Result<()> {
         let cwd = std::env::current_dir().map_err(|e| reflogless::Error::io(".", e))?;
         let repo = Repo::discover(&cwd)?;
         let store = Store::for_repo(&repo)?;
-        let log = store.root.join("shim-errors.log");
-        if let Some(parent) = log.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log)
-            .map_err(|e| reflogless::Error::io(&log, e))?;
-        let ts = chrono::Utc::now().to_rfc3339();
-        writeln!(f, "{ts}  {msg}").map_err(|e| reflogless::Error::io(&log, e))?;
-        Ok(())
+        write_shim_log_line(&store.root.join("shim-errors.log"), msg)
     })();
-    if logged.is_err() {
-        eprintln!("reflogless shim: {msg}");
+    if store_logged.is_ok() {
+        return;
     }
+    if let Some(fallback) = shim_fallback_log_path() {
+        if write_shim_log_line(&fallback, msg).is_ok() {
+            return;
+        }
+    }
+    eprintln!("reflogless-shim: {msg}");
+}
+
+fn write_shim_log_line(path: &std::path::Path, msg: &str) -> reflogless::Result<()> {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| reflogless::Error::io(path, e))?;
+    let ts = chrono::Utc::now().to_rfc3339();
+    writeln!(f, "{ts}  {msg}").map_err(|e| reflogless::Error::io(path, e))
+}
+
+fn shim_fallback_log_path() -> Option<PathBuf> {
+    if let Some(s) = dirs::state_dir() {
+        return Some(s.join("reflogless").join("shim-errors.log"));
+    }
+    dirs::home_dir().map(|h| {
+        h.join(".local")
+            .join("state")
+            .join("reflogless")
+            .join("shim-errors.log")
+    })
 }
