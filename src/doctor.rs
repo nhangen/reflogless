@@ -15,6 +15,7 @@ pub struct DoctorReport {
     pub shim_status: ShimStatus,
     pub canary_roundtrip: bool,
     pub recent_hook_errors: Vec<String>,
+    pub recent_shim_errors: Vec<String>,
     pub crypto_status: CryptoStatus,
 }
 
@@ -59,6 +60,12 @@ pub enum ShimStatus {
     },
     /// A file at the shim path exists but is not reflogless-managed.
     Foreign { path: std::path::PathBuf },
+    /// A file at the shim path exists but can't be read (permissions,
+    /// I/O error, dangling symlink). Distinct from `Foreign`.
+    Unreadable {
+        path: std::path::PathBuf,
+        error: String,
+    },
     /// Shim is reflogless-managed but its baked-in reflogless binary
     /// path is stale. Fix with `reflogless init --shim`.
     Stale {
@@ -77,6 +84,9 @@ impl From<crate::shim::ShimStatus> for ShimStatus {
                 ShimStatus::Shadowed { ours, precedes }
             }
             crate::shim::ShimStatus::Foreign { path } => ShimStatus::Foreign { path },
+            crate::shim::ShimStatus::Unreadable { path, error } => {
+                ShimStatus::Unreadable { path, error }
+            }
             crate::shim::ShimStatus::Stale {
                 path,
                 script_points_at,
@@ -164,6 +174,7 @@ pub fn run(repo: &Repo, store: &Store) -> Result<DoctorReport> {
     };
 
     let recent_hook_errors = read_hook_error_log(store);
+    let recent_shim_errors = read_shim_error_log(store);
     let crypto_status = assess_crypto(store);
 
     Ok(DoctorReport {
@@ -174,6 +185,7 @@ pub fn run(repo: &Repo, store: &Store) -> Result<DoctorReport> {
         shim_status: crate::shim::observe().into(),
         canary_roundtrip,
         recent_hook_errors,
+        recent_shim_errors,
         crypto_status,
     })
 }
@@ -208,7 +220,14 @@ fn read_hook_error_log(store: &Store) -> Vec<String> {
             .to_string_lossy()
             .into_owned()
     });
-    let p = std::path::Path::new(&log);
+    read_recent_lines(std::path::Path::new(&log))
+}
+
+fn read_shim_error_log(store: &Store) -> Vec<String> {
+    read_recent_lines(&store.root.join("shim-errors.log"))
+}
+
+fn read_recent_lines(p: &std::path::Path) -> Vec<String> {
     if !p.exists() {
         return Vec::new();
     }
@@ -249,6 +268,9 @@ impl DoctorReport {
         if !self.recent_hook_errors.is_empty() {
             return Some("recent hook errors logged");
         }
+        if !self.recent_shim_errors.is_empty() {
+            return Some("recent shim errors logged");
+        }
         match &self.crypto_status {
             CryptoStatus::NotProvisioned => {}
             CryptoStatus::Healthy {
@@ -265,6 +287,7 @@ impl DoctorReport {
             ShimStatus::Off | ShimStatus::On { .. } => {}
             ShimStatus::Shadowed { .. } => return Some("shim shadowed by another git"),
             ShimStatus::Foreign { .. } => return Some("shim path holds a foreign file"),
+            ShimStatus::Unreadable { .. } => return Some("shim file is unreadable"),
             ShimStatus::Stale { .. } => return Some("shim points at stale reflogless binary"),
         }
         None
@@ -321,6 +344,12 @@ impl DoctorReport {
                 let _ = writeln!(s, "    {line}");
             }
         }
+        if !self.recent_shim_errors.is_empty() {
+            let _ = writeln!(s, "  recent shim errors  :");
+            for line in &self.recent_shim_errors {
+                let _ = writeln!(s, "    {line}");
+            }
+        }
         let crypto_label = match &self.crypto_status {
             CryptoStatus::NotProvisioned => "not provisioned".into(),
             CryptoStatus::Healthy {
@@ -360,6 +389,9 @@ fn render_shim(s: &ShimStatus) -> String {
                 "FOREIGN ({} exists but is not reflogless-managed)",
                 path.display()
             )
+        }
+        ShimStatus::Unreadable { path, error } => {
+            format!("UNREADABLE ({}: {error})", path.display())
         }
         ShimStatus::Stale {
             path,
