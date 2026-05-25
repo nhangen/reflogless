@@ -90,8 +90,7 @@ impl KeyStore for FileStore {
 #[cfg(unix)]
 fn set_file_perms(p: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(p, fs::Permissions::from_mode(0o600))
-        .map_err(|e| Error::io(p, e))
+    fs::set_permissions(p, fs::Permissions::from_mode(0o600)).map_err(|e| Error::io(p, e))
 }
 
 #[cfg(not(unix))]

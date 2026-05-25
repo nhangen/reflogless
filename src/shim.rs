@@ -102,8 +102,7 @@ pub fn install() -> Result<InstallReport> {
     let shim_dir = resolve_shim_dir()?;
     fs::create_dir_all(&shim_dir).map_err(|e| Error::io(&shim_dir, e))?;
     let shim_path = shim_dir.join("git");
-    let reflogless_bin =
-        std::env::current_exe().map_err(|e| Error::io("<current_exe>", e))?;
+    let reflogless_bin = std::env::current_exe().map_err(|e| Error::io("<current_exe>", e))?;
 
     if shim_path.exists() {
         let body = fs::read_to_string(&shim_path).map_err(|e| Error::io(&shim_path, e))?;
@@ -164,9 +163,9 @@ pub fn resolve_shim_dir() -> Result<PathBuf> {
         return Ok(home.join(".local").join("bin"));
     }
     let exe = std::env::current_exe().map_err(|e| Error::io("<current_exe>", e))?;
-    exe.parent().map(PathBuf::from).ok_or_else(|| {
-        Error::Config("could not resolve shim install directory".into())
-    })
+    exe.parent()
+        .map(PathBuf::from)
+        .ok_or_else(|| Error::Config("could not resolve shim install directory".into()))
 }
 
 /// Detects a reflogless-managed shim by line-anchored marker match.
@@ -212,10 +211,7 @@ pub enum ShimStatus {
     On { path: PathBuf },
     /// Shim present but PATH resolves `git` to a different binary that
     /// precedes it — the shim won't run.
-    Shadowed {
-        ours: PathBuf,
-        precedes: PathBuf,
-    },
+    Shadowed { ours: PathBuf, precedes: PathBuf },
     /// A file at the shim path exists but is not reflogless-managed.
     Foreign { path: PathBuf },
     /// Shim is reflogless-managed but its hardcoded reflogless binary
@@ -347,7 +343,10 @@ mod tests {
     #[test]
     fn destructive_event_clean_any_form() {
         assert_eq!(destructive_event(&args(&["clean"])), Some("shim-clean"));
-        assert_eq!(destructive_event(&args(&["clean", "-fdx"])), Some("shim-clean"));
+        assert_eq!(
+            destructive_event(&args(&["clean", "-fdx"])),
+            Some("shim-clean")
+        );
         assert_eq!(
             destructive_event(&args(&["clean", "--force", "-d"])),
             Some("shim-clean")
@@ -463,9 +462,9 @@ mod tests {
         std::env::set_var("PATH", "/usr/bin:/tmp/shim:/usr/local/bin");
         let pruned = path_without_shim_dir(Path::new("/tmp/shim"));
         let dirs: Vec<&str> = pruned.split(':').collect();
-        assert!(!dirs.iter().any(|d| *d == "/tmp/shim"));
-        assert!(dirs.iter().any(|d| *d == "/usr/bin"));
-        assert!(dirs.iter().any(|d| *d == "/usr/local/bin"));
+        assert!(!dirs.contains(&"/tmp/shim"));
+        assert!(dirs.contains(&"/usr/bin"));
+        assert!(dirs.contains(&"/usr/local/bin"));
     }
 
     #[test]
@@ -479,7 +478,8 @@ mod tests {
         let managed = format!("#!/bin/sh\n{MARKER}\nexec foo\n");
         assert!(is_managed_shim_body(&managed));
 
-        let mention_in_comment = "#!/bin/sh\n# DO NOT use the reflogless-managed shim wrapper\nexec foo\n";
+        let mention_in_comment =
+            "#!/bin/sh\n# DO NOT use the reflogless-managed shim wrapper\nexec foo\n";
         assert!(
             !is_managed_shim_body(mention_in_comment),
             "substring mention of MARKER must not match"
@@ -600,7 +600,10 @@ mod tests {
     fn resolve_shim_dir_env_var_wins() {
         let _g = ENV_LOCK.lock().unwrap();
         std::env::set_var("REFLOGLESS_SHIM_DIR", "/tmp/reflogless-test-dir");
-        assert_eq!(resolve_shim_dir().unwrap(), PathBuf::from("/tmp/reflogless-test-dir"));
+        assert_eq!(
+            resolve_shim_dir().unwrap(),
+            PathBuf::from("/tmp/reflogless-test-dir")
+        );
     }
 
     #[test]

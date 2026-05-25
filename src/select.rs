@@ -65,7 +65,9 @@ pub fn collect_with_cap(
             continue;
         }
         let abs_canon = std::fs::canonicalize(&abs).unwrap_or_else(|_| abs.clone());
-        if excludes_canon.iter().any(|root| abs_canon.starts_with(root))
+        if excludes_canon
+            .iter()
+            .any(|root| abs_canon.starts_with(root))
             || exclude_abs.iter().any(|root| abs.starts_with(root))
         {
             skipped.push(Skipped::DenyMatch { rel: e.path });
@@ -143,7 +145,9 @@ mod tests {
         let td = TempDir::new().unwrap();
         let g = build_default_deny(td.path()).unwrap();
         assert!(g.matched("foo.log", false).is_ignore());
-        assert!(g.matched_path_or_any_parents("node_modules/x.js", false).is_ignore());
+        assert!(g
+            .matched_path_or_any_parents("node_modules/x.js", false)
+            .is_ignore());
         assert!(!g.matched("src/main.rs", false).is_ignore());
     }
 

@@ -107,12 +107,7 @@ pub fn uninstall(repo: &Repo) -> Result<UninstallReport> {
     Ok(report)
 }
 
-fn write_hook(
-    path: &Path,
-    hook: &str,
-    hook_log_path: &Path,
-    prior: Option<&Path>,
-) -> Result<()> {
+fn write_hook(path: &Path, hook: &str, hook_log_path: &Path, prior: Option<&Path>) -> Result<()> {
     let body = build_hook_body(hook, hook_log_path, prior);
     fs::write(path, &body).map_err(|e| Error::io(path, e))?;
     make_executable(path)?;
@@ -140,9 +135,7 @@ fn build_hook_body(hook: &str, hook_log_path: &Path, prior: Option<&Path>) -> St
     ));
     if let Some(p) = prior {
         let q = sh_squote(p);
-        s.push_str(&format!(
-            "if [ -x {q} ]; then\n  exec {q} \"$@\"\nfi\n"
-        ));
+        s.push_str(&format!("if [ -x {q} ]; then\n  exec {q} \"$@\"\nfi\n"));
     }
     s.push_str("exit 0\n");
     s
@@ -167,7 +160,9 @@ fn sh_squote(p: &Path) -> String {
 #[cfg(unix)]
 fn make_executable(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let mut perms = fs::metadata(path).map_err(|e| Error::io(path, e))?.permissions();
+    let mut perms = fs::metadata(path)
+        .map_err(|e| Error::io(path, e))?
+        .permissions();
     perms.set_mode(0o755);
     fs::set_permissions(path, perms).map_err(|e| Error::io(path, e))?;
     Ok(())
@@ -185,7 +180,12 @@ mod tests {
     use tempfile::TempDir;
 
     fn init_repo(td: &Path) -> Repo {
-        Command::new("git").arg("init").arg("-q").arg(td).status().unwrap();
+        Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(td)
+            .status()
+            .unwrap();
         Command::new("git")
             .args(["-C", td.to_str().unwrap(), "config", "user.email", "t@t"])
             .status()
@@ -282,18 +282,14 @@ mod tests {
         let td = TempDir::new().unwrap();
         let repo = init_repo(td.path());
         install(&repo, &repo.root.join("hook-errors.log")).unwrap();
-        let body_v1 = fs::read_to_string(
-            repo.root.join(".git").join("hooks").join("post-checkout"),
-        )
-        .unwrap();
+        let body_v1 =
+            fs::read_to_string(repo.root.join(".git").join("hooks").join("post-checkout")).unwrap();
         let log = repo.root.join("hook-errors.log");
         let report = install(&repo, &log).unwrap();
         // Second install should refresh, not chain.
         assert!(report.chained.is_empty());
-        let body_v2 = fs::read_to_string(
-            repo.root.join(".git").join("hooks").join("post-checkout"),
-        )
-        .unwrap();
+        let body_v2 =
+            fs::read_to_string(repo.root.join(".git").join("hooks").join("post-checkout")).unwrap();
         assert_eq!(body_v1, body_v2);
     }
 
@@ -350,10 +346,7 @@ mod tests {
         for h in HOOKS {
             let p = repo.root.join(".git").join("hooks").join(h);
             let mode = fs::metadata(&p).unwrap().permissions().mode();
-            assert!(
-                mode & 0o111 != 0,
-                "{h} not executable: mode={mode:o}"
-            );
+            assert!(mode & 0o111 != 0, "{h} not executable: mode={mode:o}");
         }
     }
 

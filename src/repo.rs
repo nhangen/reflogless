@@ -54,7 +54,9 @@ impl Repo {
             .output()
             .map_err(|e| Error::Git(format!("invoking git status: {e}")))?;
         if !out.status.success() {
-            return Err(Error::Git(String::from_utf8_lossy(&out.stderr).into_owned()));
+            return Err(Error::Git(
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            ));
         }
         Ok(parse_porcelain_z(&out.stdout))
     }
