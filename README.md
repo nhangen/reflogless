@@ -278,11 +278,15 @@ Conservative v0.1.x allowlist (passthrough on anything else):
 
 | git invocation | shim action |
 |---|---|
-| `git clean ...` (any flags) | snapshot, then exec git |
+| `git clean ...` (any flags except `--dry-run`/`-n`) | snapshot, then exec git |
 | `git reset --hard ...` (`--hard` anywhere in args) | snapshot, then exec git |
+| `git restore ...` (except `--staged`-only, which is index-only) | snapshot, then exec git |
+| `git switch -f ...` / `git switch --discard-changes ...` | snapshot, then exec git |
+| `git checkout -f ...` / `git checkout --force ...` | snapshot, then exec git |
+| `git checkout <ref> -- <pathspec>` (overwrites pathspec from ref) | snapshot, then exec git |
 | anything else | exec git directly (no snapshot) |
 
-`git restore`, `git switch -f`, `git checkout -f` are deliberately *not* in v0.1.x — tracked as follow-ups so each new arg-parsing surface gets its own evaluation.
+`git clean --dry-run` / `-n` (including short clusters like `-nd`, `-ndx`) is touch-free and short-circuits without snapshotting. Same for `git restore --staged` (index-only). Clean `git switch <branch>` / `git checkout <branch>` are passthrough because git itself refuses to clobber unsaved changes — the force forms above are what need snapshotting.
 
 Shim errors (snapshot failure, repo discovery failure outside a git tree) never abort the underlying `git` command. They're logged to `<store>/shim-errors.log`.
 
@@ -417,7 +421,8 @@ v0.1.0 shipped the first four phases; v0.1.1 restored prebuilt arm64 Linux; v0.1
 
 - [#3](https://github.com/nhangen/reflogless/issues/3) — v1.0 release criteria.
 - [#4](https://github.com/nhangen/reflogless/issues/4) — v2 backlog (filesystem-watcher daemon, remote backend, multi-repo `list --all`, Authenticode signing).
-- Windows shim, expanded shim allowlist (`restore` / `switch -f` / `checkout -f`), and shim `--dry-run` detection are tracked as follow-ups filed during the Phase 5 PR.
+- [#8](https://github.com/nhangen/reflogless/issues/8) — Windows shim support.
+- [#12](https://github.com/nhangen/reflogless/issues/12) — per-repo shim opt-out via `.reflogless.toml`.
 
 ## History
 
