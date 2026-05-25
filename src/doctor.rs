@@ -59,6 +59,13 @@ pub enum ShimStatus {
     },
     /// A file at the shim path exists but is not reflogless-managed.
     Foreign { path: std::path::PathBuf },
+    /// Shim is reflogless-managed but its baked-in reflogless binary
+    /// path is stale. Fix with `reflogless init --shim`.
+    Stale {
+        path: std::path::PathBuf,
+        script_points_at: std::path::PathBuf,
+        current_binary_at: Option<std::path::PathBuf>,
+    },
 }
 
 impl From<crate::shim::ShimStatus> for ShimStatus {
@@ -70,6 +77,15 @@ impl From<crate::shim::ShimStatus> for ShimStatus {
                 ShimStatus::Shadowed { ours, precedes }
             }
             crate::shim::ShimStatus::Foreign { path } => ShimStatus::Foreign { path },
+            crate::shim::ShimStatus::Stale {
+                path,
+                script_points_at,
+                current_binary_at,
+            } => ShimStatus::Stale {
+                path,
+                script_points_at,
+                current_binary_at,
+            },
         }
     }
 }
@@ -249,6 +265,7 @@ impl DoctorReport {
             ShimStatus::Off | ShimStatus::On { .. } => {}
             ShimStatus::Shadowed { .. } => return Some("shim shadowed by another git"),
             ShimStatus::Foreign { .. } => return Some("shim path holds a foreign file"),
+            ShimStatus::Stale { .. } => return Some("shim points at stale reflogless binary"),
         }
         None
     }
@@ -330,6 +347,22 @@ fn render_shim(s: &ShimStatus) -> String {
         ),
         ShimStatus::Foreign { path } => {
             format!("FOREIGN ({} exists but is not reflogless-managed)", path.display())
+        }
+        ShimStatus::Stale {
+            path,
+            script_points_at,
+            current_binary_at,
+        } => {
+            let current = match current_binary_at {
+                Some(p) => p.display().to_string(),
+                None => "<current_exe unavailable>".into(),
+            };
+            format!(
+                "STALE ({} points at {} but reflogless is at {}; run `reflogless init --shim` to refresh)",
+                path.display(),
+                script_points_at.display(),
+                current,
+            )
         }
     }
 }
