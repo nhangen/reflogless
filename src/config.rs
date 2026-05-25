@@ -21,10 +21,21 @@ pub enum EncryptPolicy {
     Off,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub encrypt: EncryptPolicy,
+    #[serde(default = "default_shim")]
+    pub shim: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            encrypt: EncryptPolicy::default(),
+            shim: default_shim(),
+        }
+    }
 }
 
 impl Config {
@@ -38,6 +49,10 @@ impl Config {
         let body = fs::read_to_string(&path).map_err(|e| Error::io(&path, e))?;
         toml::from_str(&body).map_err(|e| Error::Config(format!("{}: {e}", path.display())))
     }
+}
+
+fn default_shim() -> bool {
+    true
 }
 
 /// Filename patterns that are always encrypted regardless of `encrypt` setting.
@@ -105,6 +120,7 @@ mod tests {
         let td = TempDir::new().unwrap();
         let cfg = Config::load_or_default(td.path()).unwrap();
         assert_eq!(cfg.encrypt, EncryptPolicy::Secrets);
+        assert!(cfg.shim);
     }
 
     #[test]
@@ -131,6 +147,24 @@ mod tests {
             Config::load_or_default(td.path()),
             Err(Error::Config(_))
         ));
+    }
+
+    #[test]
+    fn load_parses_shim_false() {
+        let td = TempDir::new().unwrap();
+        fs::write(td.path().join(CONFIG_FILENAME), "shim = false\n").unwrap();
+        let cfg = Config::load_or_default(td.path()).unwrap();
+        assert!(!cfg.shim);
+        assert_eq!(cfg.encrypt, EncryptPolicy::Secrets);
+    }
+
+    #[test]
+    fn load_defaults_shim_true_when_only_encrypt_is_set() {
+        let td = TempDir::new().unwrap();
+        fs::write(td.path().join(CONFIG_FILENAME), "encrypt = \"all\"\n").unwrap();
+        let cfg = Config::load_or_default(td.path()).unwrap();
+        assert!(cfg.shim);
+        assert_eq!(cfg.encrypt, EncryptPolicy::All);
     }
 
     #[test]

@@ -435,6 +435,9 @@ fn snapshot_for_shim(event: &str) -> reflogless::Result<()> {
     repo.assert_safe_ownership()?;
     let raw_store = Store::for_repo(&repo)?;
     let cfg = Config::load_or_default(&repo.root)?;
+    if !cfg.shim {
+        return Ok(());
+    }
     let store = attach_identity_if_provisioned(&repo, raw_store)?;
     snap_with_policy(&repo, &store, event, None, cfg.encrypt)?;
     Ok(())
@@ -482,4 +485,53 @@ fn shim_fallback_log_path() -> Option<PathBuf> {
             .join("reflogless")
             .join("shim-errors.log")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn git(repo: &TempDir, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed with {status}");
+    }
+
+    #[test]
+    fn snapshot_for_shim_respects_repo_opt_out() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let repo = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let old_data_dir = std::env::var_os("REFLOGLESS_DATA_DIR");
+        std::env::set_var("REFLOGLESS_DATA_DIR", data.path());
+
+        git(&repo, &["init", "-q"]);
+        std::fs::write(repo.path().join(".reflogless.toml"), "shim = false\n").unwrap();
+        std::fs::write(repo.path().join("untracked.txt"), "save me\n").unwrap();
+
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(repo.path()).unwrap();
+        let result = snapshot_for_shim("shim-clean");
+        std::env::set_current_dir(cwd).unwrap();
+        match old_data_dir {
+            Some(v) => std::env::set_var("REFLOGLESS_DATA_DIR", v),
+            None => std::env::remove_var("REFLOGLESS_DATA_DIR"),
+        }
+
+        result.unwrap();
+        let discovered = Repo::discover(repo.path()).unwrap();
+        let store = Store::for_repo(&discovered).unwrap();
+        let (manifests, warnings) = store.list_manifests_lenient().unwrap();
+        assert!(warnings.is_empty());
+        assert!(manifests.is_empty());
+    }
 }
