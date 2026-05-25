@@ -1,6 +1,6 @@
 [package]
 name = "reflogless"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Local untracked-file safety net for git"
 license = "MIT"
