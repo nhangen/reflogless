@@ -306,11 +306,20 @@ jobs:
       - name: Dispatch publish-scoop
         # GitHub release events created by GITHUB_TOKEN do not trigger follow-on
         # workflows, so dispatch the Scoop publisher explicitly. Requires
-        # `actions: write` on this job.
+        # `actions: write` on this job. Non-blocking: the release is already
+        # published by this point, so a dispatch failure should not fail the
+        # whole host job. Manual recovery:
+        #   gh workflow run publish-scoop.yml -f tag=vX.Y.Z
+        if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
+        shell: bash
+        continue-on-error: true
         env:
           TAG: ${{ needs.plan.outputs.tag }}
         run: |
+          set -euo pipefail
+          : "${TAG:?TAG must be set}"
           gh workflow run publish-scoop.yml --ref main -f tag="$TAG"
+          echo "Dispatched publish-scoop for $TAG; manual recovery: gh workflow run publish-scoop.yml -f tag=$TAG"
 
   publish-homebrew-formula:
     needs:
