@@ -374,14 +374,20 @@ jobs:
             git add "Formula/${filename}"
             git commit -m "${name} ${version}"
           done
+          pushed=0
           for attempt in 1 2 3; do
             if git push; then
+              pushed=1
               break
             fi
             echo "::warning::git push to homebrew-tap failed (attempt $attempt); rebasing and retrying"
             git pull --rebase origin HEAD
             sleep $((attempt * 2))
           done
+          if [ "$pushed" -ne 1 ]; then
+            echo "::error::git push to homebrew-tap failed after 3 attempts"
+            exit 1
+          fi
 
   announce:
     needs:
