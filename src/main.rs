@@ -191,7 +191,7 @@ fn run() -> reflogless::Result<()> {
                 println!("  chained (preserved existing hook): {h}");
             }
             provision_identity(&repo, &store, insecure_file_key)?;
-            
+
             let store_with_crypto = attach_identity_if_provisioned(&repo, Store::for_repo(&repo)?)?;
             let snap = snap_with_policy(&repo, &store_with_crypto, "init", None, cfg.encrypt)?;
             println!(
