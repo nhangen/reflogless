@@ -105,7 +105,7 @@ cargo install --path .
 
 ### Linux prerequisite for encryption
 
-`reflogless init` provisions an age identity into the OS keychain via the [`keyring`](https://crates.io/crates/keyring) crate. On Linux that requires a running Secret Service provider (gnome-keyring or KWallet) and an active D-Bus session — headless servers, Docker containers, CI runners, and ssh-only boxes have none.
+`reflogless init` provisions an age identity into the OS keychain via the [`keyring`](https://crates.io/crates/keyring) crate. On Linux that requires a running Secret Service provider (gnome-keyring or KWallet) and an active D-Bus session — headless servers, WSL environments, Docker containers, CI runners, and ssh-only boxes have none.
 
 On those hosts:
 
@@ -390,9 +390,18 @@ Enterprise Windows policies such as Smart App Control or AppLocker may block uns
 
 `reflogless gc` evicts corrupt snapshots automatically (`snapshots_corrupt_evicted` count in the gc summary). If `reflogless list` is producing UNREADABLE warnings, run `reflogless gc` and they'll drop. If the store itself is unreadable (permissions, disk corruption), the nuclear option is `reflogless uninstall --purge --yes` followed by `reflogless init` — you'll lose snapshot history but the install will be clean.
 
-### Headless Linux / CI / Docker
+### WSL / Headless Linux / CI / Docker
 
-No D-Bus session → no Secret Service → no keychain. Use `reflogless init --insecure-file-key`. For CI specifically, snapshots are usually pointless (the runner is ephemeral) — consider skipping reflogless entirely on CI and only running it on developer workstations.
+No D-Bus session → no Secret Service → no keychain. Use `reflogless init --insecure-file-key`. 
+
+For CI specifically, snapshots are usually pointless (the runner is ephemeral) — consider skipping reflogless entirely on CI and only running it on developer workstations.
+
+**Dev Containers / Ephemeral Docker:**
+If you run Git from inside an ephemeral container, your global `~/.local/share/reflogless` directory will be wiped when the container is rebuilt. To preserve snapshots, set your container's environment (e.g., in `.bashrc` or `devcontainer.json`'s `remoteEnv`) to use a relative path inside your bind-mounted repository:
+```bash
+export REFLOGLESS_DATA_DIR=".git/reflogless-data"
+```
+Because Git always fires hooks from the repository root, this reliably stores safety snapshots alongside the code itself, ensuring they survive container rebuilds and are accessible to WSL.
 
 ## FAQ
 
