@@ -12,7 +12,8 @@ tap = "nhangen/homebrew-tap"
 publish-jobs = ["homebrew"]
 install-updater = false
 # Preserve hand edits in .github/workflows/release.yml (per-job permissions,
-# concurrency group, artifacts-existence guard) across `dist generate`.
+# concurrency group, artifacts-existence guard, publish-scoop dispatch) across
+# `dist generate`.
 allow-dirty = ["ci"]
 
 # libdbus-1-dev + pkg-config are required for keyring's secret-service backend
