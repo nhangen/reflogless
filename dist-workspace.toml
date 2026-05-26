@@ -4,10 +4,12 @@ members = ["cargo:."]
 [dist]
 cargo-dist-version = "0.32.0"
 ci = "github"
-installers = ["shell", "powershell"]
+installers = ["shell", "powershell", "homebrew"]
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 install-path = "CARGO_HOME"
 hosting = "github"
+tap = "nhangen/homebrew-tap"
+publish-jobs = ["homebrew"]
 install-updater = false
 # Preserve hand edits in .github/workflows/release.yml (per-job permissions,
 # concurrency group, artifacts-existence guard) across `dist generate`.

@@ -6,7 +6,7 @@ Local safety net for the working-tree state git refuses to track. Snapshots untr
 
 Blobs and snapshot manifests are encrypted at rest with [age](https://github.com/FiloSottile/age), keyed to the OS keychain (macOS Keychain / Linux Secret Service / Windows DPAPI via the [`keyring`](https://crates.io/crates/keyring) crate). Hooks run automatically around `post-checkout`, `pre-rebase`, `post-rewrite`, and `reference-transaction`. No cloud, no network, no telemetry.
 
-> **Status:** v0.1.2 — adds the optional `--shim` for `git clean` / `git reset --hard` coverage. Homebrew tap, Scoop manifest, and Windows shim support remain tracked in [open issues](https://github.com/nhangen/reflogless/issues).
+> **Status:** v1.0.0 — stable release candidate with hook coverage, encrypted snapshots, optional destructive-git shim coverage, and package-manager distribution.
 
 ## Wedge
 
@@ -41,9 +41,24 @@ Full install paths (Windows, source builds, headless Linux) below.
 
 ## Install
 
+### Package managers
+
+**Homebrew (macOS / Linux):**
+
+```sh
+brew install nhangen/tap/reflogless
+```
+
+**Scoop (Windows):**
+
+```powershell
+scoop bucket add nhangen https://github.com/nhangen/scoop-bucket
+scoop install reflogless
+```
+
 ### Prebuilt binaries
 
-The installer URLs below resolve to the latest published release. Until `v0.1.1` is published, arm64 Linux users should build from source.
+The installer URLs below resolve to the latest published release.
 
 **macOS / Linux:**
 
@@ -70,14 +85,14 @@ Or download a per-platform archive from the [releases page](https://github.com/n
 
 ARM64 Linux covers Graviton, Raspberry Pi, and Ampere hosts.
 
-> **Windows users:** v0.1.x binaries are unsigned. SmartScreen will warn on first run ("Windows protected your PC") — choose *More info* → *Run anyway*. On enterprise machines with Smart App Control or AppLocker in enforcement mode the binary may be blocked silently with no warning dialog — use `cargo install` from source or wait for signed builds. Authenticode EV signing is deferred to v2 (cert is $300–600/year + HSM).
+> **Windows users:** v1.0 binaries are unsigned. SmartScreen will warn on first run ("Windows protected your PC") — choose *More info* → *Run anyway*. On enterprise machines with Smart App Control or AppLocker in enforcement mode the binary may be blocked silently with no warning dialog — use `cargo install` from source or wait for signed builds. Authenticode EV signing is deferred to v2 (cert is $300–600/year + HSM).
 
 ### From source
 
 Requires a Rust toolchain (install via [rustup.rs](https://rustup.rs)). Transitive deps (`keyring 3`, `age 0.11`) currently pull in a recent compiler — if `cargo install` complains about an MSRV, `rustup update stable` fixes it.
 
 ```sh
-cargo install --git https://github.com/nhangen/reflogless --tag v0.1.1
+cargo install --git https://github.com/nhangen/reflogless --tag v1.0.0
 ```
 
 Or clone and build:
@@ -428,12 +443,9 @@ Conventions:
 
 Phases: Core (`snap` / `restore` / CAS store) → Hooks + `init` + `doctor` → Encryption → Packaging → optional `--shim` (covers `git clean -fdx` / `git reset --hard`) → v1.0 → v2.
 
-v0.1.0 shipped the first four phases; v0.1.1 restored prebuilt arm64 Linux; v0.1.2 lands the optional `--shim` for `git clean` / `git reset --hard` coverage. Open follow-ups:
+v0.1.0 shipped the first four phases; v0.1.1 restored prebuilt arm64 Linux; v0.1.2 landed the optional `--shim` for `git clean` / `git reset --hard` coverage. v1.0.0 adds Windows shim support, per-repo shim opt-out, expanded destructive-command coverage, and Homebrew/Scoop distribution. Open follow-up:
 
-- [#3](https://github.com/nhangen/reflogless/issues/3) — v1.0 release criteria.
 - [#4](https://github.com/nhangen/reflogless/issues/4) — v2 backlog (filesystem-watcher daemon, remote backend, multi-repo `list --all`, Authenticode signing).
-- [#8](https://github.com/nhangen/reflogless/issues/8) — Windows shim support.
-- [#12](https://github.com/nhangen/reflogless/issues/12) — per-repo shim opt-out via `.reflogless.toml`.
 
 ## History
 
