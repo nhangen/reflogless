@@ -324,6 +324,15 @@ jobs:
       GITHUB_EMAIL: "admin+bot@axo.dev"
     if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
     steps:
+      - name: Verify HOMEBREW_TAP_TOKEN is configured
+        env:
+          TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TOKEN:-}" ]; then
+            echo "::error::HOMEBREW_TAP_TOKEN secret is not set. Add a PAT with write access to nhangen/homebrew-tap."
+            exit 1
+          fi
       - uses: actions/checkout@v6
         with:
           persist-credentials: true
