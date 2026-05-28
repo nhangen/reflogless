@@ -112,9 +112,17 @@ pub fn collect_with_cap(
     // .refloglessignore because the user has opted them in explicitly.
     // Missing paths are skipped silently — a tracked .env that doesn't exist
     // yet is normal, not an error.
+    // track entries are pre-validated at Config::load_or_default; direct
+    // callers (tests) that bypass config validation get a defensive re-check
+    // before any filesystem work so a stray absolute/.. doesn't escape into
+    // canonicalize() with surprising semantics.
     for t in track {
         let rel = PathBuf::from(t);
-        if rel.is_absolute() || rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        if rel.is_absolute()
+            || rel
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
             return Err(Error::Config(format!(
                 "track entry {t:?} must be a repo-relative path without `..`"
             )));

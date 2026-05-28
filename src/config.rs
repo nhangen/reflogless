@@ -53,8 +53,41 @@ impl Config {
             return Ok(Self::default());
         }
         let body = fs::read_to_string(&path).map_err(|e| Error::io(&path, e))?;
-        toml::from_str(&body).map_err(|e| Error::Config(format!("{}: {e}", path.display())))
+        let cfg: Self = toml::from_str(&body)
+            .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+        validate_track(&cfg.track).map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+        Ok(cfg)
     }
+}
+
+/// Validate `track` entries at config-load time. Catches typos that would
+/// otherwise poison every hook snapshot (a malformed entry surfaces only
+/// inside `collect_with_cap`, and hooks redirect stderr — see PR #28 review).
+fn validate_track(track: &[String]) -> std::result::Result<(), String> {
+    use std::path::{Component, PathBuf};
+    for t in track {
+        if t.trim().is_empty() {
+            return Err(format!(
+                "track entry {t:?} is empty or whitespace-only"
+            ));
+        }
+        if t.ends_with('/') || t.ends_with('\\') {
+            return Err(format!(
+                "track entry {t:?} looks like a directory; track only accepts file paths"
+            ));
+        }
+        let rel = PathBuf::from(t);
+        if rel.is_absolute()
+            || rel
+                .components()
+                .any(|c| matches!(c, Component::ParentDir))
+        {
+            return Err(format!(
+                "track entry {t:?} must be a repo-relative path without `..`"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn default_shim() -> bool {
@@ -162,6 +195,67 @@ mod tests {
         let cfg = Config::load_or_default(td.path()).unwrap();
         assert!(!cfg.shim);
         assert_eq!(cfg.encrypt, EncryptPolicy::Secrets);
+    }
+
+    #[test]
+    fn load_rejects_absolute_track_entry() {
+        let td = TempDir::new().unwrap();
+        fs::write(
+            td.path().join(CONFIG_FILENAME),
+            "track = [\"/etc/passwd\"]\n",
+        )
+        .unwrap();
+        let err = Config::load_or_default(td.path()).unwrap_err();
+        match err {
+            Error::Config(msg) => assert!(msg.contains("repo-relative"), "msg={msg}"),
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_rejects_parent_dir_track_entry() {
+        let td = TempDir::new().unwrap();
+        fs::write(
+            td.path().join(CONFIG_FILENAME),
+            "track = [\"../escape.txt\"]\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            Config::load_or_default(td.path()),
+            Err(Error::Config(_))
+        ));
+    }
+
+    #[test]
+    fn load_rejects_empty_track_entry() {
+        let td = TempDir::new().unwrap();
+        fs::write(td.path().join(CONFIG_FILENAME), "track = [\"\"]\n").unwrap();
+        let err = Config::load_or_default(td.path()).unwrap_err();
+        match err {
+            Error::Config(msg) => assert!(msg.contains("empty"), "msg={msg}"),
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_rejects_whitespace_only_track_entry() {
+        let td = TempDir::new().unwrap();
+        fs::write(td.path().join(CONFIG_FILENAME), "track = [\"   \"]\n").unwrap();
+        assert!(matches!(
+            Config::load_or_default(td.path()),
+            Err(Error::Config(_))
+        ));
+    }
+
+    #[test]
+    fn load_rejects_trailing_slash_track_entry() {
+        let td = TempDir::new().unwrap();
+        fs::write(td.path().join(CONFIG_FILENAME), "track = [\"scratch/\"]\n").unwrap();
+        let err = Config::load_or_default(td.path()).unwrap_err();
+        match err {
+            Error::Config(msg) => assert!(msg.contains("directory"), "msg={msg}"),
+            other => panic!("expected Config error, got {other:?}"),
+        }
     }
 
     #[test]
