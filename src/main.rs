@@ -280,9 +280,7 @@ fn run_init(
             eprintln!(
                 "reflogless: baseline snapshot failed after hooks + identity were installed."
             );
-            eprintln!(
-                "reflogless:   re-run `reflogless init` to retry the baseline (identity"
-            );
+            eprintln!("reflogless:   re-run `reflogless init` to retry the baseline (identity");
             eprintln!(
                 "reflogless:   provisioning will be skipped), or `reflogless uninstall --purge"
             );
