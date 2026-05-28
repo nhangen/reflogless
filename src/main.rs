@@ -10,7 +10,7 @@ use reflogless::keystore::{FileStore, KeyStore, KeychainStore};
 use reflogless::manifest::Manifest;
 use reflogless::repo::Repo;
 use reflogless::shim;
-use reflogless::snapshot::{restore, snap_with_policy};
+use reflogless::snapshot::{restore, snap_with_policy, SnapshotResult};
 use reflogless::store::{CryptoCtx, Store, DEFAULT_MAX_AGE_DAYS, DEFAULT_MAX_STORE_BYTES};
 
 #[derive(Parser)]
@@ -123,10 +123,7 @@ fn run() -> reflogless::Result<()> {
         Cmd::Shim { .. } => unreachable!("handled above"),
         Cmd::Snap { message, event } => {
             let r = snap_with_policy(&repo, &store, &event, message, cfg.encrypt)?;
-            println!(
-                "{}\nfiles: {}  bytes: {}  skipped: {}",
-                r.manifest_id, r.files_written, r.bytes_written, r.skipped
-            );
+            print_snap_result(None, &r);
         }
         Cmd::List => {
             let (mut ms, warnings) = store.list_manifests_lenient()?;
@@ -181,39 +178,7 @@ fn run() -> reflogless::Result<()> {
             shim: install_shim,
             insecure_file_key,
         } => {
-            let log = store.root.join("hook-errors.log");
-            let report = hooks::install(&repo, &log)?;
-            println!("installed into {}", report.hooks_dir.display());
-            for h in &report.installed {
-                println!("  + {h}");
-            }
-            for h in &report.chained {
-                println!("  chained (preserved existing hook): {h}");
-            }
-            provision_identity(&repo, &store, insecure_file_key)?;
-
-            let store_with_crypto = attach_identity_if_provisioned(&repo, Store::for_repo(&repo)?)?;
-            let snap = snap_with_policy(&repo, &store_with_crypto, "init", None, cfg.encrypt)?;
-            println!(
-                "captured baseline snapshot {} (files: {} bytes: {} skipped: {})",
-                snap.manifest_id, snap.files_written, snap.bytes_written, snap.skipped
-            );
-
-            if install_shim {
-                let r = shim::install()?;
-                println!(
-                    "installed shim at {} (delegates to {})",
-                    r.shim_path.display(),
-                    r.reflogless_bin.display()
-                );
-                println!(
-                    "  ensure {} is earlier on PATH than your system git",
-                    r.shim_path
-                        .parent()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default()
-                );
-            }
+            run_init(&repo, &store, &cfg, install_shim, insecure_file_key)?;
         }
         Cmd::Uninstall { purge, yes } => {
             if purge && !yes {
@@ -284,6 +249,74 @@ fn run() -> reflogless::Result<()> {
         }
     }
     Ok(())
+}
+
+fn run_init(
+    repo: &Repo,
+    store: &Store,
+    cfg: &Config,
+    install_shim: bool,
+    insecure_file_key: bool,
+) -> reflogless::Result<()> {
+    let log = store.root.join("hook-errors.log");
+    let report = hooks::install(repo, &log)?;
+    println!("installed into {}", report.hooks_dir.display());
+    for h in &report.installed {
+        println!("  + {h}");
+    }
+    for h in &report.chained {
+        println!("  chained (preserved existing hook): {h}");
+    }
+    provision_identity(repo, store, insecure_file_key)?;
+
+    // Re-read store: provision_identity just wrote recipient.txt, so the
+    // outer store's `provisioned_for_encryption()` is stale and cannot attach
+    // crypto. Simplifying to reuse `store` here would silently produce an
+    // unencrypted baseline when cfg.encrypt is set.
+    let store_with_crypto = attach_identity_if_provisioned(repo, Store::for_repo(repo)?)?;
+    let snap = match snap_with_policy(repo, &store_with_crypto, "init", None, cfg.encrypt) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "reflogless: baseline snapshot failed after hooks + identity were installed."
+            );
+            eprintln!("reflogless:   re-run `reflogless init` to retry the baseline (identity");
+            eprintln!(
+                "reflogless:   provisioning will be skipped), or `reflogless uninstall --purge"
+            );
+            eprintln!("reflogless:   --yes` to fully reset.");
+            return Err(e);
+        }
+    };
+    print_snap_result(Some("captured baseline snapshot"), &snap);
+
+    if install_shim {
+        let r = shim::install()?;
+        println!(
+            "installed shim at {} (delegates to {})",
+            r.shim_path.display(),
+            r.reflogless_bin.display()
+        );
+        println!(
+            "  ensure {} is earlier on PATH than your system git",
+            r.shim_path
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+fn print_snap_result(label: Option<&str>, r: &SnapshotResult) {
+    match label {
+        Some(l) => println!("{l} {}", r.manifest_id),
+        None => println!("{}", r.manifest_id),
+    }
+    println!(
+        "files: {}  bytes: {}  skipped: {}",
+        r.files_written, r.bytes_written, r.skipped
+    );
 }
 
 fn provision_identity(repo: &Repo, store: &Store, insecure: bool) -> reflogless::Result<()> {
@@ -512,6 +545,53 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?} failed with {status}");
+    }
+
+    #[test]
+    fn run_init_creates_baseline_manifest() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let repo = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let old_data_dir = std::env::var_os("REFLOGLESS_DATA_DIR");
+        std::env::set_var("REFLOGLESS_DATA_DIR", data.path());
+
+        git(&repo, &["init", "-q"]);
+        std::fs::write(repo.path().join("untracked.txt"), "baseline\n").unwrap();
+
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(repo.path()).unwrap();
+
+        let discovered = Repo::discover(repo.path()).unwrap();
+        let raw_store = Store::for_repo(&discovered).unwrap();
+        let cfg = Config::load_or_default(&discovered.root).unwrap();
+        let store = attach_identity_if_provisioned(&discovered, raw_store).unwrap();
+        let result = run_init(&discovered, &store, &cfg, false, true);
+        let post_store =
+            attach_identity_if_provisioned(&discovered, Store::for_repo(&discovered).unwrap())
+                .unwrap();
+        let listing = post_store.list_manifests_lenient();
+
+        std::env::set_current_dir(cwd).unwrap();
+        match old_data_dir {
+            Some(v) => std::env::set_var("REFLOGLESS_DATA_DIR", v),
+            None => std::env::remove_var("REFLOGLESS_DATA_DIR"),
+        }
+        result.unwrap();
+        let (manifests, warnings) = listing.unwrap();
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(
+            manifests.len(),
+            1,
+            "init must leave exactly one baseline manifest"
+        );
+        assert_eq!(manifests[0].event, "init");
+        assert!(
+            manifests[0]
+                .entries
+                .iter()
+                .any(|e| e.path == std::path::Path::new("untracked.txt")),
+            "baseline must include untracked file"
+        );
     }
 
     #[test]
