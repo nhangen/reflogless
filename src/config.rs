@@ -27,6 +27,11 @@ pub struct Config {
     pub encrypt: EncryptPolicy,
     #[serde(default = "default_shim")]
     pub shim: bool,
+    /// Explicit allowlist of repo-relative paths to snapshot even when git
+    /// would not report them (gitignored files, files under default-deny dirs).
+    /// Each entry is a literal repo-relative path (no glob expansion in v1).
+    #[serde(default)]
+    pub track: Vec<String>,
 }
 
 impl Default for Config {
@@ -34,6 +39,7 @@ impl Default for Config {
         Self {
             encrypt: EncryptPolicy::default(),
             shim: default_shim(),
+            track: Vec::new(),
         }
     }
 }
@@ -156,6 +162,26 @@ mod tests {
         let cfg = Config::load_or_default(td.path()).unwrap();
         assert!(!cfg.shim);
         assert_eq!(cfg.encrypt, EncryptPolicy::Secrets);
+    }
+
+    #[test]
+    fn load_parses_track_list() {
+        let td = TempDir::new().unwrap();
+        fs::write(
+            td.path().join(CONFIG_FILENAME),
+            "track = [\".env\", \".env.local\"]\n",
+        )
+        .unwrap();
+        let cfg = Config::load_or_default(td.path()).unwrap();
+        assert_eq!(cfg.track, vec![".env".to_string(), ".env.local".to_string()]);
+    }
+
+    #[test]
+    fn load_track_defaults_to_empty() {
+        let td = TempDir::new().unwrap();
+        fs::write(td.path().join(CONFIG_FILENAME), "encrypt = \"all\"\n").unwrap();
+        let cfg = Config::load_or_default(td.path()).unwrap();
+        assert!(cfg.track.is_empty());
     }
 
     #[test]

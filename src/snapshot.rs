@@ -1,4 +1,4 @@
-use crate::config::{should_encrypt, EncryptPolicy};
+use crate::config::{should_encrypt, Config, EncryptPolicy};
 use crate::error::{Error, Result};
 use crate::manifest::{Manifest, ManifestEntry};
 use crate::repo::Repo;
@@ -26,15 +26,33 @@ pub fn snap(
     snap_with_policy(repo, store, event, message, EncryptPolicy::Secrets)
 }
 
-/// Take a snapshot using an explicit encryption policy. Per-entry decision is:
-/// secret-shaped paths are always encrypted; the policy controls everything
-/// else. Encryption is only applied when the store has a crypto context.
+/// Convenience wrapper that builds a Config carrying just the encryption
+/// policy (no track allowlist). Retained for callers that don't load
+/// `.reflogless.toml` themselves (init's baseline snapshot, tests).
 pub fn snap_with_policy(
     repo: &Repo,
     store: &Store,
     event: &str,
     message: Option<String>,
     policy: EncryptPolicy,
+) -> Result<SnapshotResult> {
+    let cfg = Config {
+        encrypt: policy,
+        ..Config::default()
+    };
+    snap_with_config(repo, store, event, message, &cfg)
+}
+
+/// Take a snapshot using full repo config (encryption policy + track
+/// allowlist). Per-entry encryption decision: secret-shaped paths are always
+/// encrypted; the policy controls everything else. Encryption is only applied
+/// when the store has a crypto context.
+pub fn snap_with_config(
+    repo: &Repo,
+    store: &Store,
+    event: &str,
+    message: Option<String>,
+    cfg: &Config,
 ) -> Result<SnapshotResult> {
     if event == "latest" {
         return Err(Error::Config(
@@ -46,7 +64,7 @@ pub fn snap_with_policy(
     // when the user puts $REFLOGLESS_DATA_DIR inside the repo (tests, sandboxes).
     let exclude = vec![store.root.clone()];
     let Selection { files, skipped } =
-        select::collect_with_cap(repo, select::PER_FILE_CAP_BYTES, &exclude)?;
+        select::collect_with_cap(repo, select::PER_FILE_CAP_BYTES, &exclude, &cfg.track)?;
     let id = make_id(event);
     let mut manifest = Manifest::new(
         id.clone(),
@@ -58,7 +76,7 @@ pub fn snap_with_policy(
     for f in &files {
         let data = fs::read(&f.abs).map_err(|e| Error::io(&f.abs, e))?;
         let encrypt_this = match store.crypto() {
-            Some(_) => should_encrypt(&f.rel, policy),
+            Some(_) => should_encrypt(&f.rel, cfg.encrypt),
             None => false,
         };
         let (digest, encrypted) = if encrypt_this {

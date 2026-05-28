@@ -29,19 +29,21 @@ pub enum Skipped {
     Missing { rel: PathBuf },
 }
 
+#[derive(Debug)]
 pub struct Selection {
     pub files: Vec<SelectedFile>,
     pub skipped: Vec<Skipped>,
 }
 
 pub fn collect(repo: &Repo) -> Result<Selection> {
-    collect_with_cap(repo, PER_FILE_CAP_BYTES, &[])
+    collect_with_cap(repo, PER_FILE_CAP_BYTES, &[], &[])
 }
 
 pub fn collect_with_cap(
     repo: &Repo,
     per_file_cap: u64,
     exclude_abs: &[PathBuf],
+    track: &[String],
 ) -> Result<Selection> {
     let entries = repo.status_porcelain()?;
     let deny = build_default_deny(&repo.root)?;
@@ -54,6 +56,7 @@ pub fn collect_with_cap(
 
     let mut files = Vec::new();
     let mut skipped = Vec::new();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     for e in entries {
         if !e.snapshottable() {
@@ -94,8 +97,57 @@ pub fn collect_with_cap(
             continue;
         }
         let mode = mode_of(&md);
+        seen.insert(e.path.clone());
         files.push(SelectedFile {
             rel: e.path,
+            abs,
+            size,
+            mode,
+        });
+    }
+
+    // Explicit allowlist: include repo-relative paths the user opted in via
+    // `track = [...]` in .reflogless.toml. These bypass default-deny and
+    // .refloglessignore because the user has opted them in explicitly.
+    // Missing paths are skipped silently — a tracked .env that doesn't exist
+    // yet is normal, not an error.
+    for t in track {
+        let rel = PathBuf::from(t);
+        if rel.is_absolute() || rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            return Err(Error::Config(format!(
+                "track entry {t:?} must be a repo-relative path without `..`"
+            )));
+        }
+        if seen.contains(&rel) {
+            continue;
+        }
+        let abs = repo.root.join(&rel);
+        let md = match std::fs::metadata(&abs) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !md.is_file() {
+            continue;
+        }
+        let abs_canon = std::fs::canonicalize(&abs).unwrap_or_else(|_| abs.clone());
+        if excludes_canon
+            .iter()
+            .any(|root| abs_canon.starts_with(root))
+            || exclude_abs.iter().any(|root| abs.starts_with(root))
+        {
+            // Store-internal paths still excluded — never snapshot the store.
+            skipped.push(Skipped::DenyMatch { rel: rel.clone() });
+            continue;
+        }
+        let size = md.len();
+        if size > per_file_cap {
+            skipped.push(Skipped::TooLarge { rel, size });
+            continue;
+        }
+        let mode = mode_of(&md);
+        seen.insert(rel.clone());
+        files.push(SelectedFile {
+            rel,
             abs,
             size,
             mode,
@@ -138,7 +190,120 @@ fn build_default_deny(root: &Path) -> Result<Gitignore> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use tempfile::TempDir;
+
+    fn make_repo(td: &Path) -> Repo {
+        Command::new("git").arg("init").arg("-q").arg(td).status().unwrap();
+        Command::new("git")
+            .args(["-C", td.to_str().unwrap(), "config", "user.email", "t@example.com"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["-C", td.to_str().unwrap(), "config", "user.name", "t"])
+            .status()
+            .unwrap();
+        Repo::discover(td).unwrap()
+    }
+
+    #[test]
+    fn track_captures_gitignored_file() {
+        let td = TempDir::new().unwrap();
+        let repo = make_repo(td.path());
+        std::fs::write(td.path().join(".gitignore"), b".env\n").unwrap();
+        std::fs::write(td.path().join(".env"), b"SECRET=1\n").unwrap();
+
+        let no_track = collect_with_cap(&repo, PER_FILE_CAP_BYTES, &[], &[]).unwrap();
+        assert!(
+            !no_track.files.iter().any(|f| f.rel == Path::new(".env")),
+            "without track, gitignored .env must not be captured"
+        );
+
+        let with_track =
+            collect_with_cap(&repo, PER_FILE_CAP_BYTES, &[], &[".env".to_string()]).unwrap();
+        assert!(
+            with_track.files.iter().any(|f| f.rel == Path::new(".env")),
+            "with track, .env must be captured even though gitignored"
+        );
+    }
+
+    #[test]
+    fn track_missing_file_is_silent_skip() {
+        let td = TempDir::new().unwrap();
+        let repo = make_repo(td.path());
+        let sel =
+            collect_with_cap(&repo, PER_FILE_CAP_BYTES, &[], &[".env".to_string()]).unwrap();
+        assert!(sel.files.is_empty());
+        assert!(
+            sel.skipped.is_empty(),
+            "missing track entry must not produce a Skipped record"
+        );
+    }
+
+    #[test]
+    fn track_entry_already_in_git_status_is_deduped() {
+        let td = TempDir::new().unwrap();
+        let repo = make_repo(td.path());
+        std::fs::write(td.path().join("notes.txt"), b"hi\n").unwrap();
+        let sel =
+            collect_with_cap(&repo, PER_FILE_CAP_BYTES, &[], &["notes.txt".to_string()]).unwrap();
+        let count = sel
+            .files
+            .iter()
+            .filter(|f| f.rel == Path::new("notes.txt"))
+            .count();
+        assert_eq!(count, 1, "notes.txt should appear exactly once, not duplicated");
+    }
+
+    #[test]
+    fn track_overrides_default_deny() {
+        let td = TempDir::new().unwrap();
+        let repo = make_repo(td.path());
+        std::fs::write(td.path().join(".gitignore"), b"*.log\n").unwrap();
+        std::fs::write(td.path().join("important.log"), b"keep me\n").unwrap();
+        let sel = collect_with_cap(
+            &repo,
+            PER_FILE_CAP_BYTES,
+            &[],
+            &["important.log".to_string()],
+        )
+        .unwrap();
+        assert!(
+            sel.files.iter().any(|f| f.rel == Path::new("important.log")),
+            "track must override *.log default-deny"
+        );
+    }
+
+    #[test]
+    fn track_rejects_absolute_path() {
+        let td = TempDir::new().unwrap();
+        let repo = make_repo(td.path());
+        let err = collect_with_cap(
+            &repo,
+            PER_FILE_CAP_BYTES,
+            &[],
+            &["/etc/passwd".to_string()],
+        )
+        .unwrap_err();
+        match err {
+            Error::Config(msg) => assert!(msg.contains("repo-relative"), "msg={msg}"),
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn track_rejects_parent_dir_traversal() {
+        let td = TempDir::new().unwrap();
+        let repo = make_repo(td.path());
+        let err = collect_with_cap(
+            &repo,
+            PER_FILE_CAP_BYTES,
+            &[],
+            &["../escape.txt".to_string()],
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Config(_)));
+    }
 
     #[test]
     fn default_deny_blocks_logs_and_node_modules() {

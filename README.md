@@ -229,6 +229,24 @@ restored 0 from 20260524T193045123Z-manual (refused 2)
 - Default-deny: `node_modules/`, `vendor/`, `.venv/`, `target/`, `dist/`, `*.log`.
 - Per-file cap: 10 MB. Larger files are skipped with a note on stderr.
 
+### Tracking gitignored files (`.env`, local config, scratch)
+
+Because enumeration starts from `git status`, files git ignores are invisible to reflogless by default. Negation in `.refloglessignore` can't re-include them — git never reported them in the first place. To opt specific paths in, list them under `track` in `.reflogless.toml`:
+
+```toml
+# .reflogless.toml
+encrypt = "secrets"
+track = [
+  ".env",
+  ".env.local",
+  "scratch/notes.md",
+]
+```
+
+Each entry is a literal repo-relative path (no glob expansion). Tracked paths bypass both the default-deny list and `.refloglessignore` — the user opted them in explicitly. Missing entries are skipped silently (a tracked `.env` that doesn't exist yet is normal). Absolute paths and `..` traversal are rejected at parse time.
+
+Secret-shaped paths (`.env*`, `*.pem`, `*.key`, etc.) are still encrypted in the store regardless of the `encrypt` policy — see [Encryption](#encryption) for the auto-encrypted list.
+
 ## Hook coverage
 
 After `reflogless init`:
