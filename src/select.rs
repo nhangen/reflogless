@@ -1,7 +1,8 @@
 use crate::error::{Error, Result};
 use crate::repo::Repo;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use std::path::{Path, PathBuf};
+use std::collections::HashSet;
+use std::path::{Component, Path, PathBuf};
 
 pub const PER_FILE_CAP_BYTES: u64 = 10 * 1024 * 1024;
 
@@ -57,7 +58,7 @@ pub fn collect_with_cap(
 
     let mut files = Vec::new();
     let mut skipped = Vec::new();
-    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
 
     for e in entries {
         if !e.snapshottable() {
@@ -112,17 +113,12 @@ pub fn collect_with_cap(
     // .refloglessignore because the user has opted them in explicitly.
     // Missing paths are skipped silently — a tracked .env that doesn't exist
     // yet is normal, not an error.
-    // track entries are pre-validated at Config::load_or_default; direct
-    // callers (tests) that bypass config validation get a defensive re-check
-    // before any filesystem work so a stray absolute/.. doesn't escape into
-    // canonicalize() with surprising semantics.
+    // Defensive re-check of absolute/`..` for direct callers that bypass
+    // Config::load_or_default validation (in-tree tests). Production callers
+    // hit the rejection at parse time.
     for t in track {
         let rel = PathBuf::from(t);
-        if rel.is_absolute()
-            || rel
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
+        if rel.is_absolute() || rel.components().any(|c| matches!(c, Component::ParentDir)) {
             return Err(Error::Config(format!(
                 "track entry {t:?} must be a repo-relative path without `..`"
             )));
@@ -151,7 +147,6 @@ pub fn collect_with_cap(
             .any(|root| abs_canon.starts_with(root))
             || exclude_abs.iter().any(|root| abs.starts_with(root))
         {
-            // Store-internal paths still excluded — never snapshot the store.
             skipped.push(Skipped::DenyMatch { rel: rel.clone() });
             continue;
         }

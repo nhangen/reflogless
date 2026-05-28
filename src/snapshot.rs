@@ -27,8 +27,8 @@ pub fn snap(
 }
 
 /// Convenience wrapper that builds a Config carrying just the encryption
-/// policy (no track allowlist). Retained for callers that don't load
-/// `.reflogless.toml` themselves (init's baseline snapshot, tests).
+/// policy (no track allowlist). Retained for tests that only need to pass
+/// an encryption policy without loading `.reflogless.toml`.
 pub fn snap_with_policy(
     repo: &Repo,
     store: &Store,
