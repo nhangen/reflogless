@@ -1,4 +1,4 @@
-use crate::config::{should_encrypt, Config, EncryptPolicy};
+use crate::config::{is_secret_shaped, should_encrypt, Config, EncryptPolicy};
 use crate::error::{Error, Result};
 use crate::manifest::{Manifest, ManifestEntry};
 use crate::repo::Repo;
@@ -58,6 +58,17 @@ pub fn snap_with_config(
         return Err(Error::Config(
             "event name 'latest' would collide with the restore-latest alias".into(),
         ));
+    }
+    if store.crypto().is_none() {
+        for t in &cfg.track {
+            let rel = Path::new(t);
+            if is_secret_shaped(rel) {
+                return Err(Error::Config(format!(
+                    "track entry {t:?} is secret-shaped; provision an encryption identity \
+                     with `reflogless init` before snapshotting (refusing to write plaintext secret)"
+                )));
+            }
+        }
     }
     repo.assert_safe_ownership()?;
     // Defensively exclude the store itself — prevents recursive snapshotting
@@ -648,6 +659,75 @@ mod tests {
             Err(Error::Decryption(_)) => {}
             other => panic!("expected Decryption error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn snap_refuses_secret_shaped_track_entry_without_crypto() {
+        let workdir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let repo = make_repo(workdir.path());
+        let store = Store::for_repo_with_base(&repo, data_dir.path().to_path_buf()).unwrap();
+        assert!(store.crypto().is_none());
+        fs::write(repo.root.join(".gitignore"), b".env\n").unwrap();
+        fs::write(repo.root.join(".env"), b"SECRET=1\n").unwrap();
+        let cfg = Config {
+            track: vec![".env".to_string()],
+            ..Config::default()
+        };
+        let err = snap_with_config(&repo, &store, "manual", None, &cfg).unwrap_err();
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("secret-shaped") && msg.contains(".env"),
+                "msg={msg}"
+            ),
+            other => panic!("expected Config error, got {other:?}"),
+        }
+        // Crucially: nothing landed in the store.
+        let manifests = store.list_manifests_lenient().unwrap().0;
+        assert!(
+            manifests.is_empty(),
+            "no manifest should be written when secret refusal fires"
+        );
+    }
+
+    #[test]
+    fn snap_with_config_captures_and_encrypts_tracked_env() {
+        let workdir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let repo = make_repo(workdir.path());
+        let (store, _id) = encrypted_store(&repo, data_dir.path());
+        fs::write(repo.root.join(".gitignore"), b".env\n").unwrap();
+        fs::write(repo.root.join(".env"), b"SECRET=1\n").unwrap();
+        let cfg = Config {
+            track: vec![".env".to_string()],
+            ..Config::default()
+        };
+        let r = snap_with_config(&repo, &store, "manual", None, &cfg).unwrap();
+        let manifest = store.load_manifest(&r.manifest_id).unwrap();
+        let env_entry = manifest
+            .entries
+            .iter()
+            .find(|e| e.path == Path::new(".env"))
+            .expect("manifest must contain .env entry");
+        assert!(env_entry.encrypted, ".env must be encrypted (secret-shaped)");
+    }
+
+    #[test]
+    fn snap_with_config_restores_tracked_env() {
+        let workdir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let repo = make_repo(workdir.path());
+        let (store, _id) = encrypted_store(&repo, data_dir.path());
+        fs::write(repo.root.join(".gitignore"), b".env\n").unwrap();
+        fs::write(repo.root.join(".env"), b"SECRET=1\n").unwrap();
+        let cfg = Config {
+            track: vec![".env".to_string()],
+            ..Config::default()
+        };
+        let r = snap_with_config(&repo, &store, "manual", None, &cfg).unwrap();
+        fs::remove_file(repo.root.join(".env")).unwrap();
+        restore(&repo, &store, &r.manifest_id, &[], false).unwrap();
+        assert_eq!(fs::read(repo.root.join(".env")).unwrap(), b"SECRET=1\n");
     }
 
     #[test]

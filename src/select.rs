@@ -27,6 +27,7 @@ pub enum Skipped {
     TooLarge { rel: PathBuf, size: u64 },
     DenyMatch { rel: PathBuf },
     Missing { rel: PathBuf },
+    Unreadable { rel: PathBuf, err: String },
 }
 
 #[derive(Debug)]
@@ -124,7 +125,14 @@ pub fn collect_with_cap(
         let abs = repo.root.join(&rel);
         let md = match std::fs::metadata(&abs) {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                skipped.push(Skipped::Unreadable {
+                    rel: rel.clone(),
+                    err: e.to_string(),
+                });
+                continue;
+            }
         };
         if !md.is_file() {
             continue;

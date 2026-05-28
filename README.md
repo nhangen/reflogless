@@ -245,7 +245,7 @@ track = [
 
 Each entry is a literal repo-relative path (no glob expansion). Tracked paths bypass both the default-deny list and `.refloglessignore` — the user opted them in explicitly. Missing entries are skipped silently (a tracked `.env` that doesn't exist yet is normal). Absolute paths and `..` traversal are rejected at parse time.
 
-Secret-shaped paths (`.env*`, `*.pem`, `*.key`, etc.) are still encrypted in the store regardless of the `encrypt` policy — see [Encryption](#encryption) for the auto-encrypted list.
+Secret-shaped paths (`.env*`, `*.pem`, `*.key`, etc.) are auto-encrypted when an encryption identity has been provisioned via `reflogless init` — see [Encryption](#encryption) for the auto-encrypted list. If you list a secret-shaped path in `track` on a store with no provisioned identity, `reflogless snap` refuses rather than write plaintext.
 
 ## Hook coverage
 
