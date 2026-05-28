@@ -1,8 +1,8 @@
-use crate::config::{should_encrypt, EncryptPolicy};
+use crate::config::{is_secret_shaped, should_encrypt, Config, EncryptPolicy};
 use crate::error::{Error, Result};
 use crate::manifest::{Manifest, ManifestEntry};
 use crate::repo::Repo;
-use crate::select::{self, Selection};
+use crate::select::{self, Selection, Skipped};
 use crate::store::{atomic_write, Store};
 use chrono::Utc;
 use std::fs;
@@ -14,7 +14,7 @@ pub struct SnapshotResult {
     pub manifest_path: PathBuf,
     pub files_written: usize,
     pub bytes_written: u64,
-    pub skipped: usize,
+    pub skipped: Vec<Skipped>,
 }
 
 pub fn snap(
@@ -26,15 +26,33 @@ pub fn snap(
     snap_with_policy(repo, store, event, message, EncryptPolicy::Secrets)
 }
 
-/// Take a snapshot using an explicit encryption policy. Per-entry decision is:
-/// secret-shaped paths are always encrypted; the policy controls everything
-/// else. Encryption is only applied when the store has a crypto context.
+/// Convenience wrapper that builds a Config carrying just the encryption
+/// policy (no track allowlist). Retained for tests that only need to pass
+/// an encryption policy without loading `.reflogless.toml`.
 pub fn snap_with_policy(
     repo: &Repo,
     store: &Store,
     event: &str,
     message: Option<String>,
     policy: EncryptPolicy,
+) -> Result<SnapshotResult> {
+    let cfg = Config {
+        encrypt: policy,
+        ..Config::default()
+    };
+    snap_with_config(repo, store, event, message, &cfg)
+}
+
+/// Take a snapshot using full repo config (encryption policy + track
+/// allowlist). Per-entry encryption decision: secret-shaped paths are always
+/// encrypted; the policy controls everything else. Encryption is only applied
+/// when the store has a crypto context.
+pub fn snap_with_config(
+    repo: &Repo,
+    store: &Store,
+    event: &str,
+    message: Option<String>,
+    cfg: &Config,
 ) -> Result<SnapshotResult> {
     if event == "latest" {
         return Err(Error::Config(
@@ -46,7 +64,22 @@ pub fn snap_with_policy(
     // when the user puts $REFLOGLESS_DATA_DIR inside the repo (tests, sandboxes).
     let exclude = vec![store.root.clone()];
     let Selection { files, skipped } =
-        select::collect_with_cap(repo, select::PER_FILE_CAP_BYTES, &exclude)?;
+        select::collect_with_cap(repo, select::PER_FILE_CAP_BYTES, &exclude, &cfg.track)?;
+    // Invariant: secret-shaped paths are never written plaintext. Pre-flight
+    // BEFORE any blob write so refusal is atomic — covers both `cfg.track`
+    // opt-ins and any git-status path resolving a secret-shaped name on a
+    // store with no provisioned identity. Per
+    // ~/.claude/rules/safety-invariant-scope.md (gate at the function, not
+    // each caller).
+    if store.crypto().is_none() {
+        if let Some(secret) = files.iter().find(|f| is_secret_shaped(&f.rel)) {
+            return Err(Error::Config(format!(
+                "{} is secret-shaped; provision an encryption identity \
+                 with `reflogless init` before snapshotting (refusing to write plaintext secret)",
+                secret.rel.display()
+            )));
+        }
+    }
     let id = make_id(event);
     let mut manifest = Manifest::new(
         id.clone(),
@@ -58,7 +91,7 @@ pub fn snap_with_policy(
     for f in &files {
         let data = fs::read(&f.abs).map_err(|e| Error::io(&f.abs, e))?;
         let encrypt_this = match store.crypto() {
-            Some(_) => should_encrypt(&f.rel, policy),
+            Some(_) => should_encrypt(&f.rel, cfg.encrypt),
             None => false,
         };
         let (digest, encrypted) = if encrypt_this {
@@ -82,7 +115,7 @@ pub fn snap_with_policy(
         manifest_path,
         files_written: files.len(),
         bytes_written: bytes,
-        skipped: skipped.len(),
+        skipped,
     })
 }
 
@@ -630,6 +663,120 @@ mod tests {
             Err(Error::Decryption(_)) => {}
             other => panic!("expected Decryption error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn snap_refuses_secret_shaped_track_entry_without_crypto() {
+        let workdir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let repo = make_repo(workdir.path());
+        let store = Store::for_repo_with_base(&repo, data_dir.path().to_path_buf()).unwrap();
+        assert!(store.crypto().is_none());
+        fs::write(repo.root.join(".gitignore"), b".env\n").unwrap();
+        fs::write(repo.root.join(".env"), b"SECRET=1\n").unwrap();
+        let cfg = Config {
+            track: vec![".env".to_string()],
+            ..Config::default()
+        };
+        let err = snap_with_config(&repo, &store, "manual", None, &cfg).unwrap_err();
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("secret-shaped") && msg.contains(".env"),
+                "msg={msg}"
+            ),
+            other => panic!("expected Config error, got {other:?}"),
+        }
+        // Crucially: nothing landed in the store.
+        let manifests = store.list_manifests_lenient().unwrap().0;
+        assert!(
+            manifests.is_empty(),
+            "no manifest should be written when secret refusal fires"
+        );
+    }
+
+    #[test]
+    fn snap_refuses_git_status_secret_shaped_without_crypto() {
+        // Broader scope: even a non-tracked, git-status-reported secret-shaped
+        // path must not land plaintext. This is the invariant-scope expansion
+        // (per safety-invariant-scope.md): gate at the write site, not just
+        // cfg.track callers.
+        let workdir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let repo = make_repo(workdir.path());
+        let store = Store::for_repo_with_base(&repo, data_dir.path().to_path_buf()).unwrap();
+        assert!(store.crypto().is_none());
+        // No .gitignore, no `track` — git status will report .env as untracked.
+        fs::write(repo.root.join(".env"), b"SECRET=2\n").unwrap();
+        let err = snap(&repo, &store, "manual", None).unwrap_err();
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("secret-shaped") && msg.contains(".env"),
+                "msg={msg}"
+            ),
+            other => panic!("expected Config error, got {other:?}"),
+        }
+        let manifests = store.list_manifests_lenient().unwrap().0;
+        assert!(manifests.is_empty(), "no manifest should land on refusal");
+    }
+
+    #[test]
+    fn snap_with_config_captures_and_encrypts_tracked_env() {
+        let workdir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let repo = make_repo(workdir.path());
+        let (store, _id) = encrypted_store(&repo, data_dir.path());
+        fs::write(repo.root.join(".gitignore"), b".env\n").unwrap();
+        fs::write(repo.root.join(".env"), b"SECRET=1\n").unwrap();
+        let cfg = Config {
+            track: vec![".env".to_string()],
+            ..Config::default()
+        };
+        let r = snap_with_config(&repo, &store, "manual", None, &cfg).unwrap();
+        let manifest = store.load_manifest(&r.manifest_id).unwrap();
+        let env_entry = manifest
+            .entries
+            .iter()
+            .find(|e| e.path == Path::new(".env"))
+            .expect("manifest must contain .env entry");
+        assert!(env_entry.encrypted, ".env must be encrypted (secret-shaped)");
+    }
+
+    #[test]
+    fn snap_with_config_restores_tracked_env() {
+        let workdir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let repo = make_repo(workdir.path());
+        let (store, _id) = encrypted_store(&repo, data_dir.path());
+        fs::write(repo.root.join(".gitignore"), b".env\n").unwrap();
+        fs::write(repo.root.join(".env"), b"SECRET=1\n").unwrap();
+        let cfg = Config {
+            track: vec![".env".to_string()],
+            ..Config::default()
+        };
+        let r = snap_with_config(&repo, &store, "manual", None, &cfg).unwrap();
+        fs::remove_file(repo.root.join(".env")).unwrap();
+        restore(&repo, &store, &r.manifest_id, &[], false).unwrap();
+        assert_eq!(fs::read(repo.root.join(".env")).unwrap(), b"SECRET=1\n");
+    }
+
+    #[test]
+    fn snap_result_surfaces_per_path_skipped() {
+        // Reach into select via collect_with_cap directly, then verify
+        // SnapshotResult.skipped carries those entries by name (not a count).
+        let workdir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let repo = make_repo(workdir.path());
+        let store = Store::for_repo_with_base(&repo, data_dir.path().to_path_buf()).unwrap();
+        // Create a `.log` file (default-denied by *.log rule).
+        fs::write(repo.root.join("big.log"), b"noise\n").unwrap();
+        let r = snap(&repo, &store, "manual", None).unwrap();
+        assert!(
+            r.skipped
+                .iter()
+                .any(|s| matches!(s, select::Skipped::DenyMatch { rel } if rel.ends_with("big.log"))),
+            "expected DenyMatch for big.log in SnapshotResult.skipped, got {:?}",
+            r.skipped
+        );
     }
 
     #[test]

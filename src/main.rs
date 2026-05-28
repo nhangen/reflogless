@@ -10,7 +10,7 @@ use reflogless::keystore::{FileStore, KeyStore, KeychainStore};
 use reflogless::manifest::Manifest;
 use reflogless::repo::Repo;
 use reflogless::shim;
-use reflogless::snapshot::{restore, snap_with_policy, SnapshotResult};
+use reflogless::snapshot::{restore, snap_with_config, SnapshotResult};
 use reflogless::store::{CryptoCtx, Store, DEFAULT_MAX_AGE_DAYS, DEFAULT_MAX_STORE_BYTES};
 
 #[derive(Parser)]
@@ -122,7 +122,7 @@ fn run() -> reflogless::Result<()> {
     match cli.cmd {
         Cmd::Shim { .. } => unreachable!("handled above"),
         Cmd::Snap { message, event } => {
-            let r = snap_with_policy(&repo, &store, &event, message, cfg.encrypt)?;
+            let r = snap_with_config(&repo, &store, &event, message, &cfg)?;
             print_snap_result(None, &r);
         }
         Cmd::List => {
@@ -274,7 +274,7 @@ fn run_init(
     // crypto. Simplifying to reuse `store` here would silently produce an
     // unencrypted baseline when cfg.encrypt is set.
     let store_with_crypto = attach_identity_if_provisioned(repo, Store::for_repo(repo)?)?;
-    let snap = match snap_with_policy(repo, &store_with_crypto, "init", None, cfg.encrypt) {
+    let snap = match snap_with_config(repo, &store_with_crypto, "init", None, cfg) {
         Ok(s) => s,
         Err(e) => {
             eprintln!(
@@ -315,8 +315,25 @@ fn print_snap_result(label: Option<&str>, r: &SnapshotResult) {
     }
     println!(
         "files: {}  bytes: {}  skipped: {}",
-        r.files_written, r.bytes_written, r.skipped
+        r.files_written,
+        r.bytes_written,
+        r.skipped.len()
     );
+    for s in &r.skipped {
+        eprintln!("reflogless: skipped {}", format_skipped(s));
+    }
+}
+
+fn format_skipped(s: &reflogless::select::Skipped) -> String {
+    use reflogless::select::Skipped;
+    match s {
+        Skipped::TooLarge { rel, size } => {
+            format!("{} (too large: {} bytes > 10 MB cap)", rel.display(), size)
+        }
+        Skipped::DenyMatch { rel } => format!("{} (matched deny rule)", rel.display()),
+        Skipped::Missing { rel } => format!("{} (missing)", rel.display()),
+        Skipped::Unreadable { rel, err } => format!("{} (unreadable: {})", rel.display(), err),
+    }
 }
 
 fn provision_identity(repo: &Repo, store: &Store, insecure: bool) -> reflogless::Result<()> {
@@ -480,7 +497,7 @@ fn snapshot_for_shim(event: &str) -> reflogless::Result<()> {
         return Ok(());
     }
     let store = attach_identity_if_provisioned(&repo, raw_store)?;
-    snap_with_policy(&repo, &store, event, None, cfg.encrypt)?;
+    snap_with_config(&repo, &store, event, None, &cfg)?;
     Ok(())
 }
 
