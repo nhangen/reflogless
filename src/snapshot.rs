@@ -2,7 +2,7 @@ use crate::config::{is_secret_shaped, should_encrypt, Config, EncryptPolicy};
 use crate::error::{Error, Result};
 use crate::manifest::{Manifest, ManifestEntry};
 use crate::repo::Repo;
-use crate::select::{self, Selection};
+use crate::select::{self, Selection, Skipped};
 use crate::store::{atomic_write, Store};
 use chrono::Utc;
 use std::fs;
@@ -14,7 +14,7 @@ pub struct SnapshotResult {
     pub manifest_path: PathBuf,
     pub files_written: usize,
     pub bytes_written: u64,
-    pub skipped: usize,
+    pub skipped: Vec<Skipped>,
 }
 
 pub fn snap(
@@ -111,7 +111,7 @@ pub fn snap_with_config(
         manifest_path,
         files_written: files.len(),
         bytes_written: bytes,
-        skipped: skipped.len(),
+        skipped,
     })
 }
 
@@ -728,6 +728,26 @@ mod tests {
         fs::remove_file(repo.root.join(".env")).unwrap();
         restore(&repo, &store, &r.manifest_id, &[], false).unwrap();
         assert_eq!(fs::read(repo.root.join(".env")).unwrap(), b"SECRET=1\n");
+    }
+
+    #[test]
+    fn snap_result_surfaces_per_path_skipped() {
+        // Reach into select via collect_with_cap directly, then verify
+        // SnapshotResult.skipped carries those entries by name (not a count).
+        let workdir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let repo = make_repo(workdir.path());
+        let store = Store::for_repo_with_base(&repo, data_dir.path().to_path_buf()).unwrap();
+        // Create a `.log` file (default-denied by *.log rule).
+        fs::write(repo.root.join("big.log"), b"noise\n").unwrap();
+        let r = snap(&repo, &store, "manual", None).unwrap();
+        assert!(
+            r.skipped
+                .iter()
+                .any(|s| matches!(s, select::Skipped::DenyMatch { rel } if rel.ends_with("big.log"))),
+            "expected DenyMatch for big.log in SnapshotResult.skipped, got {:?}",
+            r.skipped
+        );
     }
 
     #[test]

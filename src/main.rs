@@ -315,8 +315,25 @@ fn print_snap_result(label: Option<&str>, r: &SnapshotResult) {
     }
     println!(
         "files: {}  bytes: {}  skipped: {}",
-        r.files_written, r.bytes_written, r.skipped
+        r.files_written,
+        r.bytes_written,
+        r.skipped.len()
     );
+    for s in &r.skipped {
+        eprintln!("reflogless: skipped {}", format_skipped(s));
+    }
+}
+
+fn format_skipped(s: &reflogless::select::Skipped) -> String {
+    use reflogless::select::Skipped;
+    match s {
+        Skipped::TooLarge { rel, size } => {
+            format!("{} (too large: {} bytes > 10 MB cap)", rel.display(), size)
+        }
+        Skipped::DenyMatch { rel } => format!("{} (matched deny rule)", rel.display()),
+        Skipped::Missing { rel } => format!("{} (missing)", rel.display()),
+        Skipped::Unreadable { rel, err } => format!("{} (unreadable: {})", rel.display(), err),
+    }
 }
 
 fn provision_identity(repo: &Repo, store: &Store, insecure: bool) -> reflogless::Result<()> {
