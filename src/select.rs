@@ -108,11 +108,6 @@ pub fn collect_with_cap(
         });
     }
 
-    // Explicit allowlist: include repo-relative paths the user opted in via
-    // `track = [...]` in .reflogless.toml. These bypass default-deny and
-    // .refloglessignore because the user has opted them in explicitly.
-    // Missing paths are skipped silently — a tracked .env that doesn't exist
-    // yet is normal, not an error.
     // Defensive re-check of absolute/`..` for direct callers that bypass
     // Config::load_or_default validation (in-tree tests). Production callers
     // hit the rejection at parse time.

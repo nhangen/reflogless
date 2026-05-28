@@ -59,23 +59,27 @@ pub fn snap_with_config(
             "event name 'latest' would collide with the restore-latest alias".into(),
         ));
     }
-    if store.crypto().is_none() {
-        for t in &cfg.track {
-            let rel = Path::new(t);
-            if is_secret_shaped(rel) {
-                return Err(Error::Config(format!(
-                    "track entry {t:?} is secret-shaped; provision an encryption identity \
-                     with `reflogless init` before snapshotting (refusing to write plaintext secret)"
-                )));
-            }
-        }
-    }
     repo.assert_safe_ownership()?;
     // Defensively exclude the store itself — prevents recursive snapshotting
     // when the user puts $REFLOGLESS_DATA_DIR inside the repo (tests, sandboxes).
     let exclude = vec![store.root.clone()];
     let Selection { files, skipped } =
         select::collect_with_cap(repo, select::PER_FILE_CAP_BYTES, &exclude, &cfg.track)?;
+    // Invariant: secret-shaped paths are never written plaintext. Pre-flight
+    // BEFORE any blob write so refusal is atomic — covers both `cfg.track`
+    // opt-ins and any git-status path resolving a secret-shaped name on a
+    // store with no provisioned identity. Per
+    // ~/.claude/rules/safety-invariant-scope.md (gate at the function, not
+    // each caller).
+    if store.crypto().is_none() {
+        if let Some(secret) = files.iter().find(|f| is_secret_shaped(&f.rel)) {
+            return Err(Error::Config(format!(
+                "{} is secret-shaped; provision an encryption identity \
+                 with `reflogless init` before snapshotting (refusing to write plaintext secret)",
+                secret.rel.display()
+            )));
+        }
+    }
     let id = make_id(event);
     let mut manifest = Manifest::new(
         id.clone(),
@@ -688,6 +692,31 @@ mod tests {
             manifests.is_empty(),
             "no manifest should be written when secret refusal fires"
         );
+    }
+
+    #[test]
+    fn snap_refuses_git_status_secret_shaped_without_crypto() {
+        // Broader scope: even a non-tracked, git-status-reported secret-shaped
+        // path must not land plaintext. This is the invariant-scope expansion
+        // (per safety-invariant-scope.md): gate at the write site, not just
+        // cfg.track callers.
+        let workdir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let repo = make_repo(workdir.path());
+        let store = Store::for_repo_with_base(&repo, data_dir.path().to_path_buf()).unwrap();
+        assert!(store.crypto().is_none());
+        // No .gitignore, no `track` — git status will report .env as untracked.
+        fs::write(repo.root.join(".env"), b"SECRET=2\n").unwrap();
+        let err = snap(&repo, &store, "manual", None).unwrap_err();
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("secret-shaped") && msg.contains(".env"),
+                "msg={msg}"
+            ),
+            other => panic!("expected Config error, got {other:?}"),
+        }
+        let manifests = store.list_manifests_lenient().unwrap().0;
+        assert!(manifests.is_empty(), "no manifest should land on refusal");
     }
 
     #[test]
