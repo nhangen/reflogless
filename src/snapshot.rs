@@ -738,7 +738,10 @@ mod tests {
             .iter()
             .find(|e| e.path == Path::new(".env"))
             .expect("manifest must contain .env entry");
-        assert!(env_entry.encrypted, ".env must be encrypted (secret-shaped)");
+        assert!(
+            env_entry.encrypted,
+            ".env must be encrypted (secret-shaped)"
+        );
     }
 
     #[test]
@@ -771,9 +774,9 @@ mod tests {
         fs::write(repo.root.join("big.log"), b"noise\n").unwrap();
         let r = snap(&repo, &store, "manual", None).unwrap();
         assert!(
-            r.skipped
-                .iter()
-                .any(|s| matches!(s, select::Skipped::DenyMatch { rel } if rel.ends_with("big.log"))),
+            r.skipped.iter().any(
+                |s| matches!(s, select::Skipped::DenyMatch { rel } if rel.ends_with("big.log"))
+            ),
             "expected DenyMatch for big.log in SnapshotResult.skipped, got {:?}",
             r.skipped
         );

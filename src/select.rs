@@ -200,9 +200,20 @@ mod tests {
     use tempfile::TempDir;
 
     fn make_repo(td: &Path) -> Repo {
-        Command::new("git").arg("init").arg("-q").arg(td).status().unwrap();
         Command::new("git")
-            .args(["-C", td.to_str().unwrap(), "config", "user.email", "t@example.com"])
+            .arg("init")
+            .arg("-q")
+            .arg(td)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args([
+                "-C",
+                td.to_str().unwrap(),
+                "config",
+                "user.email",
+                "t@example.com",
+            ])
             .status()
             .unwrap();
         Command::new("git")
@@ -237,8 +248,7 @@ mod tests {
     fn track_missing_file_is_silent_skip() {
         let td = TempDir::new().unwrap();
         let repo = make_repo(td.path());
-        let sel =
-            collect_with_cap(&repo, PER_FILE_CAP_BYTES, &[], &[".env".to_string()]).unwrap();
+        let sel = collect_with_cap(&repo, PER_FILE_CAP_BYTES, &[], &[".env".to_string()]).unwrap();
         assert!(sel.files.is_empty());
         assert!(
             sel.skipped.is_empty(),
@@ -258,7 +268,10 @@ mod tests {
             .iter()
             .filter(|f| f.rel == Path::new("notes.txt"))
             .count();
-        assert_eq!(count, 1, "notes.txt should appear exactly once, not duplicated");
+        assert_eq!(
+            count, 1,
+            "notes.txt should appear exactly once, not duplicated"
+        );
     }
 
     #[test]
@@ -275,7 +288,9 @@ mod tests {
         )
         .unwrap();
         assert!(
-            sel.files.iter().any(|f| f.rel == Path::new("important.log")),
+            sel.files
+                .iter()
+                .any(|f| f.rel == Path::new("important.log")),
             "track must override *.log default-deny"
         );
     }
@@ -284,13 +299,8 @@ mod tests {
     fn track_rejects_absolute_path() {
         let td = TempDir::new().unwrap();
         let repo = make_repo(td.path());
-        let err = collect_with_cap(
-            &repo,
-            PER_FILE_CAP_BYTES,
-            &[],
-            &["/etc/passwd".to_string()],
-        )
-        .unwrap_err();
+        let err = collect_with_cap(&repo, PER_FILE_CAP_BYTES, &[], &["/etc/passwd".to_string()])
+            .unwrap_err();
         match err {
             Error::Config(msg) => assert!(msg.contains("repo-relative"), "msg={msg}"),
             other => panic!("expected Config error, got {other:?}"),
