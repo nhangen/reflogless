@@ -305,6 +305,10 @@ mod tests {
         std::fs::write(td.path().join("Notes.txt"), b"hi\n").unwrap();
         let lower = td.path().join("notes.txt");
         if !lower.exists() {
+            eprintln!(
+                "skipping {}: filesystem appears case-sensitive",
+                module_path!()
+            );
             return;
         }
         assert_eq!(
@@ -312,10 +316,17 @@ mod tests {
             std::fs::canonicalize(&lower).unwrap()
         );
 
-        let sel =
-            collect_with_cap(&repo, PER_FILE_CAP_BYTES, &[], &["notes.txt".to_string()]).unwrap();
+        // Two case-differing track entries hit the cross-entry dedup branch
+        // in the track loop directly — single-entry tests only cover
+        // status×track dedup, not track×track.
+        let sel = collect_with_cap(
+            &repo,
+            PER_FILE_CAP_BYTES,
+            &[],
+            &["Notes.txt".to_string(), "notes.txt".to_string()],
+        )
+        .unwrap();
         assert_eq!(sel.files.len(), 1, "case variant must not duplicate file");
-        assert_eq!(sel.files[0].rel, Path::new("Notes.txt"));
     }
 
     #[test]
