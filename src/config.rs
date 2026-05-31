@@ -85,15 +85,27 @@ fn validate_track(track: &[String]) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// Returns true for any track entry that isn't a strict repo-relative path.
+///
+/// Catches: Unix-absolute (`/etc/...`), Windows drive-letter (`C:\...`,
+/// `C:foo`, `C:/foo`), UNC and long-path prefixes (`\\server\share`,
+/// `\\?\C:\...`), rooted backslash (`\foo`), and any embedded `:` that
+/// could resolve to an NTFS Alternate Data Stream (`notes.txt:hidden`)
+/// — POSIX-relative paths have no legitimate use for `:`, so rejecting
+/// it outright closes the ADS vector at the same chokepoint as the
+/// drive-letter check.
 pub(crate) fn is_absolute_track_path(path: &Path) -> bool {
     if path.is_absolute() {
         return true;
     }
     let s = path.to_string_lossy();
-    let bytes = s.as_bytes();
-    s.starts_with('\\') || matches!(bytes, [drive, b':', ..] if drive.is_ascii_alphabetic())
+    s.starts_with('\\') || s.contains(':')
 }
 
+/// Returns true if any path component (using either `/` or `\` as a
+/// separator) is literally `..`. The string-split fallback handles
+/// Unix-platform paths containing a literal `\` — `Path::components`
+/// alone treats `..\foo` as a single filename on Unix.
 pub(crate) fn has_parent_dir_component(path: &Path) -> bool {
     path.components()
         .any(|c| matches!(c, std::path::Component::ParentDir))
@@ -243,8 +255,12 @@ mod tests {
     fn load_rejects_windows_absolute_track_entries() {
         for entry in [
             r"C:\Users\me\secret.txt",
+            r"C:/Users/me/secret.txt",
+            r"C:secret.txt",
             r"\\server\share\secret.txt",
+            r"\\?\C:\Users\me\secret.txt",
             r"\Users\me\secret.txt",
+            r"notes.txt:hidden",
         ] {
             let td = TempDir::new().unwrap();
             fs::write(
