@@ -99,7 +99,7 @@ pub fn collect_with_cap(
             continue;
         }
         let mode = mode_of(&md);
-        seen.insert(e.path.clone());
+        seen.insert(abs_canon);
         files.push(SelectedFile {
             rel: e.path,
             abs,
@@ -118,10 +118,11 @@ pub fn collect_with_cap(
                 "track entry {t:?} must be a repo-relative path without `..`"
             )));
         }
-        if seen.contains(&rel) {
+        let abs = repo.root.join(&rel);
+        let abs_canon = std::fs::canonicalize(&abs).unwrap_or_else(|_| abs.clone());
+        if seen.contains(&abs_canon) {
             continue;
         }
-        let abs = repo.root.join(&rel);
         let md = match std::fs::metadata(&abs) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -136,7 +137,6 @@ pub fn collect_with_cap(
         if !md.is_file() {
             continue;
         }
-        let abs_canon = std::fs::canonicalize(&abs).unwrap_or_else(|_| abs.clone());
         if excludes_canon
             .iter()
             .any(|root| abs_canon.starts_with(root))
@@ -151,7 +151,7 @@ pub fn collect_with_cap(
             continue;
         }
         let mode = mode_of(&md);
-        seen.insert(rel.clone());
+        seen.insert(abs_canon);
         files.push(SelectedFile {
             rel,
             abs,
@@ -272,6 +272,27 @@ mod tests {
             count, 1,
             "notes.txt should appear exactly once, not duplicated"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn track_entry_case_variant_is_deduped_on_case_insensitive_filesystem() {
+        let td = TempDir::new().unwrap();
+        let repo = make_repo(td.path());
+        std::fs::write(td.path().join("Notes.txt"), b"hi\n").unwrap();
+        let lower = td.path().join("notes.txt");
+        if !lower.exists() {
+            return;
+        }
+        assert_eq!(
+            std::fs::canonicalize(td.path().join("Notes.txt")).unwrap(),
+            std::fs::canonicalize(&lower).unwrap()
+        );
+
+        let sel =
+            collect_with_cap(&repo, PER_FILE_CAP_BYTES, &[], &["notes.txt".to_string()]).unwrap();
+        assert_eq!(sel.files.len(), 1, "case variant must not duplicate file");
+        assert_eq!(sel.files[0].rel, Path::new("Notes.txt"));
     }
 
     #[test]
