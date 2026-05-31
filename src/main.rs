@@ -116,12 +116,12 @@ fn run() -> reflogless::Result<()> {
     let repo = Repo::discover(&cwd)?;
     repo.assert_safe_ownership()?;
     let raw_store = Store::for_repo(&repo)?;
-    let cfg = Config::load_or_default(&repo.root)?;
     let store = attach_identity_if_provisioned(&repo, raw_store)?;
 
     match cli.cmd {
         Cmd::Shim { .. } => unreachable!("handled above"),
         Cmd::Snap { message, event } => {
+            let cfg = Config::load_or_default(&repo.root)?;
             let r = snap_with_config(&repo, &store, &event, message, &cfg)?;
             print_snap_result(None, &r);
         }
@@ -178,6 +178,7 @@ fn run() -> reflogless::Result<()> {
             shim: install_shim,
             insecure_file_key,
         } => {
+            let cfg = Config::load_or_default(&repo.root)?;
             run_init(&repo, &store, &cfg, install_shim, insecure_file_key)?;
         }
         Cmd::Uninstall { purge, yes } => {
