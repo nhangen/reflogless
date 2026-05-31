@@ -2,7 +2,7 @@ use crate::error::{Error, Result};
 use crate::repo::Repo;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::collections::HashSet;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 pub const PER_FILE_CAP_BYTES: u64 = 10 * 1024 * 1024;
 
@@ -113,7 +113,9 @@ pub fn collect_with_cap(
     // hit the rejection at parse time.
     for t in track {
         let rel = PathBuf::from(t);
-        if rel.is_absolute() || rel.components().any(|c| matches!(c, Component::ParentDir)) {
+        if crate::config::is_absolute_track_path(&rel)
+            || crate::config::has_parent_dir_component(&rel)
+        {
             return Err(Error::Config(format!(
                 "track entry {t:?} must be a repo-relative path without `..`"
             )));

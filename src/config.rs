@@ -65,7 +65,7 @@ impl Config {
 /// otherwise poison every hook snapshot (a malformed entry surfaces only
 /// inside `collect_with_cap`, and hooks redirect stderr — see PR #28 review).
 fn validate_track(track: &[String]) -> std::result::Result<(), String> {
-    use std::path::{Component, PathBuf};
+    use std::path::Path;
     for t in track {
         if t.trim().is_empty() {
             return Err(format!("track entry {t:?} is empty or whitespace-only"));
@@ -75,14 +75,32 @@ fn validate_track(track: &[String]) -> std::result::Result<(), String> {
                 "track entry {t:?} looks like a directory; track only accepts file paths"
             ));
         }
-        let rel = PathBuf::from(t);
-        if rel.is_absolute() || rel.components().any(|c| matches!(c, Component::ParentDir)) {
+        let rel = Path::new(t);
+        if is_absolute_track_path(rel) || has_parent_dir_component(rel) {
             return Err(format!(
                 "track entry {t:?} must be a repo-relative path without `..`"
             ));
         }
     }
     Ok(())
+}
+
+pub(crate) fn is_absolute_track_path(path: &Path) -> bool {
+    if path.is_absolute() {
+        return true;
+    }
+    let s = path.to_string_lossy();
+    let bytes = s.as_bytes();
+    s.starts_with('\\') || matches!(bytes, [drive, b':', ..] if drive.is_ascii_alphabetic())
+}
+
+pub(crate) fn has_parent_dir_component(path: &Path) -> bool {
+    path.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+        || path
+            .to_string_lossy()
+            .split(['/', '\\'])
+            .any(|part| part == "..")
 }
 
 fn default_shim() -> bool {
@@ -213,6 +231,53 @@ mod tests {
         fs::write(
             td.path().join(CONFIG_FILENAME),
             "track = [\"../escape.txt\"]\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            Config::load_or_default(td.path()),
+            Err(Error::Config(_))
+        ));
+    }
+
+    #[test]
+    fn load_rejects_windows_absolute_track_entries() {
+        for entry in [
+            r"C:\Users\me\secret.txt",
+            r"\\server\share\secret.txt",
+            r"\Users\me\secret.txt",
+        ] {
+            let td = TempDir::new().unwrap();
+            fs::write(
+                td.path().join(CONFIG_FILENAME),
+                format!("track = [{entry:?}]\n"),
+            )
+            .unwrap();
+            let err = Config::load_or_default(td.path()).unwrap_err();
+            match err {
+                Error::Config(msg) => assert!(msg.contains("repo-relative"), "msg={msg}"),
+                other => panic!("expected Config error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn load_accepts_windows_relative_track_entry() {
+        let td = TempDir::new().unwrap();
+        fs::write(
+            td.path().join(CONFIG_FILENAME),
+            r#"track = ['config\local.env']"#,
+        )
+        .unwrap();
+        let cfg = Config::load_or_default(td.path()).unwrap();
+        assert_eq!(cfg.track, vec![r"config\local.env"]);
+    }
+
+    #[test]
+    fn load_rejects_windows_parent_dir_track_entry() {
+        let td = TempDir::new().unwrap();
+        fs::write(
+            td.path().join(CONFIG_FILENAME),
+            r#"track = ['..\escape.txt']"#,
         )
         .unwrap();
         assert!(matches!(
