@@ -69,7 +69,16 @@ pub fn collect_with_cap(
             skipped.push(Skipped::Missing { rel: e.path });
             continue;
         }
-        let abs_canon = std::fs::canonicalize(&abs).unwrap_or_else(|_| abs.clone());
+        let abs_canon = match std::fs::canonicalize(&abs) {
+            Ok(p) => p,
+            Err(err) => {
+                skipped.push(Skipped::Unreadable {
+                    rel: e.path,
+                    err: err.to_string(),
+                });
+                continue;
+            }
+        };
         if excludes_canon
             .iter()
             .any(|root| abs_canon.starts_with(root))
@@ -108,9 +117,11 @@ pub fn collect_with_cap(
         });
     }
 
-    // Defensive re-check of absolute/`..` for direct callers that bypass
-    // Config::load_or_default validation (in-tree tests). Production callers
-    // hit the rejection at parse time.
+    // Structural validation point: every caller passing track entries must
+    // hit this. Config::load_or_default re-validates earlier so config errors
+    // point at the file, but removing this check would expose any non-config
+    // caller (CLI flag, env var, IPC) to attacker-controlled paths reaching
+    // repo.root.join(rel) below.
     for t in track {
         let rel = PathBuf::from(t);
         if crate::config::is_absolute_track_path(&rel)
@@ -121,7 +132,17 @@ pub fn collect_with_cap(
             )));
         }
         let abs = repo.root.join(&rel);
-        let abs_canon = std::fs::canonicalize(&abs).unwrap_or_else(|_| abs.clone());
+        let abs_canon = match std::fs::canonicalize(&abs) {
+            Ok(p) => p,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                skipped.push(Skipped::Unreadable {
+                    rel: rel.clone(),
+                    err: err.to_string(),
+                });
+                continue;
+            }
+        };
         if seen.contains(&abs_canon) {
             continue;
         }
