@@ -2,7 +2,7 @@ use crate::error::{Error, Result};
 use crate::repo::Repo;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::collections::HashSet;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 pub const PER_FILE_CAP_BYTES: u64 = 10 * 1024 * 1024;
 
@@ -69,7 +69,16 @@ pub fn collect_with_cap(
             skipped.push(Skipped::Missing { rel: e.path });
             continue;
         }
-        let abs_canon = std::fs::canonicalize(&abs).unwrap_or_else(|_| abs.clone());
+        let abs_canon = match std::fs::canonicalize(&abs) {
+            Ok(p) => p,
+            Err(err) => {
+                skipped.push(Skipped::Unreadable {
+                    rel: e.path,
+                    err: err.to_string(),
+                });
+                continue;
+            }
+        };
         if excludes_canon
             .iter()
             .any(|root| abs_canon.starts_with(root))
@@ -99,7 +108,7 @@ pub fn collect_with_cap(
             continue;
         }
         let mode = mode_of(&md);
-        seen.insert(e.path.clone());
+        seen.insert(abs_canon);
         files.push(SelectedFile {
             rel: e.path,
             abs,
@@ -108,20 +117,35 @@ pub fn collect_with_cap(
         });
     }
 
-    // Defensive re-check of absolute/`..` for direct callers that bypass
-    // Config::load_or_default validation (in-tree tests). Production callers
-    // hit the rejection at parse time.
+    // Structural validation point: every caller passing track entries must
+    // hit this. Config::load_or_default re-validates earlier so config errors
+    // point at the file, but removing this check would expose any non-config
+    // caller (CLI flag, env var, IPC) to attacker-controlled paths reaching
+    // repo.root.join(rel) below.
     for t in track {
         let rel = PathBuf::from(t);
-        if rel.is_absolute() || rel.components().any(|c| matches!(c, Component::ParentDir)) {
+        if crate::config::is_absolute_track_path(&rel)
+            || crate::config::has_parent_dir_component(&rel)
+        {
             return Err(Error::Config(format!(
                 "track entry {t:?} must be a repo-relative path without `..`"
             )));
         }
-        if seen.contains(&rel) {
+        let abs = repo.root.join(&rel);
+        let abs_canon = match std::fs::canonicalize(&abs) {
+            Ok(p) => p,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                skipped.push(Skipped::Unreadable {
+                    rel: rel.clone(),
+                    err: err.to_string(),
+                });
+                continue;
+            }
+        };
+        if seen.contains(&abs_canon) {
             continue;
         }
-        let abs = repo.root.join(&rel);
         let md = match std::fs::metadata(&abs) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -136,7 +160,6 @@ pub fn collect_with_cap(
         if !md.is_file() {
             continue;
         }
-        let abs_canon = std::fs::canonicalize(&abs).unwrap_or_else(|_| abs.clone());
         if excludes_canon
             .iter()
             .any(|root| abs_canon.starts_with(root))
@@ -151,7 +174,7 @@ pub fn collect_with_cap(
             continue;
         }
         let mode = mode_of(&md);
-        seen.insert(rel.clone());
+        seen.insert(abs_canon);
         files.push(SelectedFile {
             rel,
             abs,
@@ -272,6 +295,38 @@ mod tests {
             count, 1,
             "notes.txt should appear exactly once, not duplicated"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn track_entry_case_variant_is_deduped_on_case_insensitive_filesystem() {
+        let td = TempDir::new().unwrap();
+        let repo = make_repo(td.path());
+        std::fs::write(td.path().join("Notes.txt"), b"hi\n").unwrap();
+        let lower = td.path().join("notes.txt");
+        if !lower.exists() {
+            eprintln!(
+                "skipping {}: filesystem appears case-sensitive",
+                module_path!()
+            );
+            return;
+        }
+        assert_eq!(
+            std::fs::canonicalize(td.path().join("Notes.txt")).unwrap(),
+            std::fs::canonicalize(&lower).unwrap()
+        );
+
+        // Two case-differing track entries hit the cross-entry dedup branch
+        // in the track loop directly — single-entry tests only cover
+        // status×track dedup, not track×track.
+        let sel = collect_with_cap(
+            &repo,
+            PER_FILE_CAP_BYTES,
+            &[],
+            &["Notes.txt".to_string(), "notes.txt".to_string()],
+        )
+        .unwrap();
+        assert_eq!(sel.files.len(), 1, "case variant must not duplicate file");
     }
 
     #[test]

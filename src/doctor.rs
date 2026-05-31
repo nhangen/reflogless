@@ -492,6 +492,47 @@ mod tests {
         assert_eq!(report.first_failure(), None);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn doctor_surfaces_hook_snapshot_config_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let bin = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        hooks::install(&repo, &store.root.join("hook-errors.log")).unwrap();
+
+        let fake = bin.path().join("reflogless");
+        fs::write(
+            &fake,
+            "#!/bin/sh\necho 'reflogless: .reflogless.toml: track entry \"../escape\" must be a repo-relative path without `..`' >&2\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let hook = repo.root.join(".git").join("hooks").join("post-checkout");
+        let path = format!(
+            "{}:{}",
+            bin.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let status = Command::new(&hook).env("PATH", path).status().unwrap();
+        assert!(status.success(), "hook must remain best-effort");
+
+        let report = run(&repo, &store).unwrap();
+        assert_eq!(report.first_failure(), Some("recent hook errors logged"));
+        assert!(
+            report
+                .recent_hook_errors
+                .iter()
+                .any(|line| line.contains("track entry") && line.contains("repo-relative")),
+            "report={report:#?}"
+        );
+        assert!(report.render().contains("recent hook errors"));
+    }
+
     #[test]
     fn doctor_reports_tampered_when_marker_stripped() {
         let td = TempDir::new().unwrap();
