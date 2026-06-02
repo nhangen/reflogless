@@ -17,6 +17,7 @@ pub struct DoctorReport {
     pub recent_hook_errors: Vec<String>,
     pub recent_shim_errors: Vec<String>,
     pub recent_gate_skips: Vec<String>,
+    pub watcher: crate::watch::WatcherLiveness,
     pub crypto_status: CryptoStatus,
 }
 
@@ -177,6 +178,7 @@ pub fn run(repo: &Repo, store: &Store) -> Result<DoctorReport> {
     let recent_hook_errors = read_hook_error_log(store);
     let recent_shim_errors = read_shim_error_log(store);
     let recent_gate_skips = read_gate_skip_log(store);
+    let watcher = crate::watch::liveness(store);
     let crypto_status = assess_crypto(store);
 
     Ok(DoctorReport {
@@ -189,6 +191,7 @@ pub fn run(repo: &Repo, store: &Store) -> Result<DoctorReport> {
         recent_hook_errors,
         recent_shim_errors,
         recent_gate_skips,
+        watcher,
         crypto_status,
     })
 }
@@ -303,6 +306,9 @@ impl DoctorReport {
         if !self.recent_shim_errors.is_empty() {
             return Some("recent shim errors logged");
         }
+        if matches!(self.watcher, crate::watch::WatcherLiveness::StateUnreadable) {
+            return Some("watcher state file unreadable");
+        }
         match &self.crypto_status {
             CryptoStatus::NotProvisioned => {}
             CryptoStatus::Healthy {
@@ -388,6 +394,18 @@ impl DoctorReport {
                 let _ = writeln!(s, "    {line}");
             }
         }
+        let watcher_label = match &self.watcher {
+            crate::watch::WatcherLiveness::NeverInstalled => "never installed".to_string(),
+            crate::watch::WatcherLiveness::StateUnreadable => "STATE UNREADABLE".to_string(),
+            crate::watch::WatcherLiveness::Running { pid } => format!("running (pid {pid})"),
+            crate::watch::WatcherLiveness::Stale { pid } => {
+                format!("STALE (pid {pid} from earlier boot; daemon not restarted)")
+            }
+            crate::watch::WatcherLiveness::Stopped { pid } => {
+                format!("stopped (last pid {pid} no longer alive)")
+            }
+        };
+        let _ = writeln!(s, "  watcher             : {watcher_label}");
         let crypto_label = match &self.crypto_status {
             CryptoStatus::NotProvisioned => "not provisioned".into(),
             CryptoStatus::Healthy {
@@ -773,6 +791,57 @@ mod tests {
         );
         assert!(rendered.contains("post-commit"));
         assert!(rendered.contains("interactive rebase in progress"));
+    }
+
+    #[test]
+    fn doctor_reports_watcher_never_installed_by_default() {
+        let td = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(td.path())
+            .status()
+            .unwrap();
+        let repo = Repo::discover(td.path()).unwrap();
+        let store = Store::for_repo_with_base(&repo, data_dir.path().to_path_buf()).unwrap();
+        let report = run(&repo, &store).unwrap();
+        assert_eq!(
+            report.watcher,
+            crate::watch::WatcherLiveness::NeverInstalled
+        );
+        let rendered = report.render();
+        assert!(rendered.contains("watcher             : never installed"));
+    }
+
+    #[test]
+    fn doctor_reports_watcher_running_for_self_pid() {
+        let td = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(td.path())
+            .status()
+            .unwrap();
+        let repo = Repo::discover(td.path()).unwrap();
+        let store = Store::for_repo_with_base(&repo, data_dir.path().to_path_buf()).unwrap();
+        // Plant a state file pointing at this process.
+        let mut s = crate::watch::WatchState::new();
+        s.pid = std::process::id();
+        crate::watch::write_state(&store, &s).unwrap();
+        let report = run(&repo, &store).unwrap();
+        match report.watcher {
+            crate::watch::WatcherLiveness::Running { pid } => {
+                assert_eq!(pid, std::process::id())
+            }
+            other => panic!("expected Running, got {other:?}"),
+        }
+        let rendered = report.render();
+        assert!(rendered.contains(&format!(
+            "watcher             : running (pid {}",
+            std::process::id()
+        )));
     }
 
     #[test]
