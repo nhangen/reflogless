@@ -32,7 +32,8 @@ enum WatchAction {
     /// Install the watcher into the per-user supervisor (launchd on macOS,
     /// systemd --user on Linux). Daemon starts immediately + persists across
     /// reboots. macOS: writes ~/Library/LaunchAgents/com.nhangen.reflogless.<repo>.plist
-    /// + launchctl bootstrap. Linux: not yet implemented (#30 slice 6).
+    /// + launchctl bootstrap. Linux: writes ~/.config/systemd/user/reflogless-<repo>.service
+    /// + systemctl --user enable --now.
     Install,
     /// Remove the watcher from the supervisor + delete the unit/plist file.
     Uninstall,
@@ -101,9 +102,9 @@ enum Cmd {
     },
     /// Verify install + store + canary.
     Doctor,
-    /// Filesystem-watcher daemon (#30). macOS launchd installer ships;
-    /// Linux systemd installer is #30 slice 6. Use `install` for auto-start;
-    /// `run` for foreground; `status` for the heartbeat state file.
+    /// Filesystem-watcher daemon (#30). macOS launchd + Linux systemd --user
+    /// installers ship. Use `install` for auto-start; `run` for foreground;
+    /// `status` for the heartbeat state file.
     Watch {
         #[command(subcommand)]
         action: WatchAction,

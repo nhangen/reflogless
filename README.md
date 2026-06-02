@@ -331,11 +331,16 @@ Remove the shim with `reflogless uninstall` (also restores any chained third-par
 Hooks fire on git operations. The shim wraps git binaries. Neither catches changes made *between* git operations — editor saves, `sed -i` runs, build artifacts the user wants snapshotted. The watcher daemon closes that gap by tailing filesystem events under `repo.root` and snapshotting on debounced windows.
 
 ```sh
-reflogless watch run     # foreground loop (for launchd/systemd, or manual smoke test)
-reflogless watch status  # print the last-written heartbeat state file
+reflogless watch install    # macOS: writes ~/Library/LaunchAgents/com.nhangen.reflogless.<repo>.plist
+                            #        + launchctl bootstrap gui/<uid>
+                            # Linux: writes ~/.config/systemd/user/reflogless-<repo>.service
+                            #        + systemctl --user enable --now
+reflogless watch uninstall  # remove the unit/plist + tear down the running daemon
+reflogless watch run        # foreground loop (used by the supervisor; can run manually too)
+reflogless watch status     # print the last-written heartbeat state file
 ```
 
-Status today: **daemon core ships, installers (launchd/systemd) do not.** Run it manually from a long-lived shell or wire it into your own supervisor. Doctor reports `watcher: running (pid N)` / `stale (pid reused after reboot)` / `stopped` / `never installed`.
+Doctor reports `watcher: running (pid N)` / `stale (pid reused after reboot)` / `stopped` / `never installed`.
 
 Tunables in `.reflogless.toml`:
 
@@ -358,7 +363,7 @@ Safety properties (vs. hooks/shim):
 
 Tradeoffs vs. hooks/shim: opt-in daemon residency (~few MB resident), event volume on heavy build directories needs the `ignore_extra` config, fsevent backend differs per OS (kqueue, inotify, fanotify) so coverage subtly varies. The hooks + shim baseline is unchanged when `watch` isn't installed.
 
-Tracking: nhangen/reflogless#30. Remaining work: launchd plist + systemd `--user` unit installers, integration smoke test.
+Tracking: nhangen/reflogless#30.
 
 ## Encryption
 
