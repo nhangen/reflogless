@@ -547,7 +547,12 @@ fn snapshot_for_shim(event: &str) -> reflogless::Result<()> {
         return Ok(());
     }
     let store = attach_identity_if_provisioned(&repo, raw_store)?;
-    snap_with_config(&repo, &store, event, None, &cfg)?;
+    let r = snap_with_config(&repo, &store, event, None, &cfg)?;
+    if let Some(reason) = r.skipped_git_busy {
+        // Shim normally runs silent; surface the gate firing so users on an
+        // interactive-rebase post-commit path don't see "no snap" with no clue.
+        eprintln!("reflogless: skipped shim snap ({event}) — {reason}");
+    }
     Ok(())
 }
 
