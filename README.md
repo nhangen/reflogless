@@ -326,6 +326,40 @@ Shim errors (snapshot failure, repo discovery failure outside a git tree) never 
 
 Remove the shim with `reflogless uninstall` (also restores any chained third-party hooks).
 
+### Optional watcher daemon (experimental)
+
+Hooks fire on git operations. The shim wraps git binaries. Neither catches changes made *between* git operations — editor saves, `sed -i` runs, build artifacts the user wants snapshotted. The watcher daemon closes that gap by tailing filesystem events under `repo.root` and snapshotting on debounced windows.
+
+```sh
+reflogless watch run     # foreground loop (for launchd/systemd, or manual smoke test)
+reflogless watch status  # print the last-written heartbeat state file
+```
+
+Status today: **daemon core ships, installers (launchd/systemd) do not.** Run it manually from a long-lived shell or wire it into your own supervisor. Doctor reports `watcher: running (pid N)` / `stale (pid reused after reboot)` / `stopped` / `never installed`.
+
+Tunables in `.reflogless.toml`:
+
+```toml
+[watch]
+debounce_ms = 2000           # coalesce fs events into 2s windows before snap
+heartbeat_seconds = 60       # how often to refresh watch-state.json while idle
+ignore_extra = [             # substring match against full path; layers on top
+  "/coverage/",              # of the built-in ignores (.git/, node_modules/,
+  "/.tox/",                  # target/, dist/, build/, .next/, __pycache__/)
+]
+```
+
+Safety properties (vs. hooks/shim):
+
+- **Never blocks git.** Daemon acquires the snap lock with `TryOnce` semantics and skips the window if hooks or shim are currently snapping.
+- **Never snapshots half-applied state.** If git is mid-rebase / merge / cherry-pick / bisect (or holds `.git/index.lock`), the gate skips the snap and emits `watcher: skipped (rebase in progress)` to the event log doctor reads.
+- **Survives reboots.** `WatchState.boot_id` captures the OS's per-boot identifier; doctor's "stale" check catches pid reuse across reboots that a bare `kill -0` would miss.
+- **Clean shutdown.** SIGTERM / SIGINT finishes the in-flight snap before exit; installer scripts (when they land) should set `ExitTimeOut=30` to give it room.
+
+Tradeoffs vs. hooks/shim: opt-in daemon residency (~few MB resident), event volume on heavy build directories needs the `ignore_extra` config, fsevent backend differs per OS (kqueue, inotify, fanotify) so coverage subtly varies. The hooks + shim baseline is unchanged when `watch` isn't installed.
+
+Tracking: nhangen/reflogless#30. Remaining work: launchd plist + systemd `--user` unit installers, integration smoke test.
+
 ## Encryption
 
 `reflogless init` provisions an [age](https://github.com/FiloSottile/age) x25519 identity:

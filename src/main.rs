@@ -280,12 +280,8 @@ fn run() -> reflogless::Result<()> {
         Cmd::Watch { action } => match action {
             WatchAction::Run => {
                 let cfg = Config::load_or_default(&repo.root)?;
-                reflogless::watch::run(
-                    &repo,
-                    &store,
-                    &cfg,
-                    &reflogless::watch::WatchConfig::default(),
-                )?;
+                let wcfg = reflogless::watch::WatchConfig::from_config(&cfg.watch);
+                reflogless::watch::run(&repo, &store, &cfg, &wcfg)?;
             }
             WatchAction::Status => match reflogless::watch::read_state_raw(&store) {
                 Some(raw) => print!("{raw}"),
