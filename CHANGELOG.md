@@ -7,6 +7,24 @@ follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Optional remote snapshot backend (#31): push the blob and manifest content
+  of an encrypted store to S3-compatible object storage so snapshots survive
+  laptop loss. Opt-in via `cargo install reflogless --features remote`; the
+  default build is unchanged. New CLI surface:
+  `reflogless remote enable --s3-url s3://<bucket>/<prefix> --region <r>`
+  (refuses unless the store has `encrypt = "all"` and an attached identity;
+  reads credentials from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
+  optional `AWS_SESSION_TOKEN`), `reflogless remote push` (drains the
+  per-store pending log, dedupes via `head_blob`, uploads new manifests),
+  `reflogless remote status`, `reflogless remote disable`. Per-machine
+  layout: a `<hostname>` segment is appended to the user's key prefix so
+  multiple laptops can share one bucket safely. `reflogless doctor` now
+  reports `remote :` and `remote.backlog :` with WARN/UNHEALTHY tiers
+  (defaults: 14 days warn, 60 days unhealthy; tunable under `[remote]` in
+  `.reflogless.toml`). Snapshots are never blocked on network — each snap
+  appends a tiny entry to `<store>/remote-pending.jsonl` (a local "waiting
+  room") via a try-once lock that yields immediately on contention, and
+  uploads happen out-of-band when `remote push` runs.
 - `reflogless list --all` (#29): cross-repo listing enumerates every store
   under the configured data directory, surfacing each store's origin path
   (active / stale / legacy), snapshot count, and snapshot IDs. Plaintext-only
@@ -14,6 +32,14 @@ follow [SemVer](https://semver.org/).
   `list` since it requires the identity. Stores now persist their origin
   path in `repo_origin.txt` at construction; pre-existing stores show as
   `legacy` until next touched.
+
+### Fixed
+- macOS lock release race in `RemoteLock` (#62): on macOS, closing a file
+  that holds a `flock` does not release the kernel-level lock fast enough
+  for a same-process re-acquire — back-to-back `TryOnce` attempts failed
+  ~45% of the time under the full test suite. Fixed by explicitly calling
+  `file.unlock()` in `Drop` before the `File` closes. Lockdown test does
+  50 sequential acquire/release cycles; removing the `Drop` impl fails it.
 
 ## [1.0.0] — 2026-05-25
 
