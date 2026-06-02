@@ -18,7 +18,9 @@ use crate::store::{atomic_write, SnapLockMode, Store};
 use chrono::Utc;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub const WATCH_STATE_FILENAME: &str = "watch-state.json";
@@ -371,8 +373,43 @@ pub fn event_is_interesting(kind: &EventKind, paths: &[&Path], store_root: &Path
     false
 }
 
-/// Run the watcher loop. Blocks; exits cleanly on channel disconnect.
+/// Install a SIGTERM + SIGINT handler that flips the returned flag. Used by
+/// `run()` to drain its current debounce window and exit cleanly when
+/// launchd / systemd / Ctrl-C asks the daemon to stop. See #47.
+pub fn install_signal_handler() -> Result<Arc<AtomicBool>> {
+    let flag = Arc::new(AtomicBool::new(false));
+    #[cfg(unix)]
+    {
+        use signal_hook::consts::{SIGINT, SIGTERM};
+        signal_hook::flag::register(SIGTERM, Arc::clone(&flag))
+            .map_err(|e| Error::Config(format!("signal-hook SIGTERM: {e}")))?;
+        signal_hook::flag::register(SIGINT, Arc::clone(&flag))
+            .map_err(|e| Error::Config(format!("signal-hook SIGINT: {e}")))?;
+    }
+    Ok(flag)
+}
+
+/// Run the watcher loop. Blocks; exits cleanly on channel disconnect or when
+/// SIGTERM/SIGINT trips the shutdown flag (#47). On shutdown the current
+/// in-flight snap is allowed to finish — `snap_with_config` is bounded by
+/// the size of the touched file set, which the daemon caps via the standard
+/// select() per-file 10 MB limit.
 pub fn run(repo: &Repo, store: &Store, cfg: &Config, wcfg: &WatchConfig) -> Result<()> {
+    let shutdown = install_signal_handler()?;
+    run_with_shutdown(repo, store, cfg, wcfg, shutdown)
+}
+
+/// Inner loop with an explicit shutdown flag so tests can simulate signal
+/// delivery without going through real signals (which would terminate the
+/// test process if our handler hasn't installed yet — fragile under cargo
+/// test parallel execution).
+pub fn run_with_shutdown(
+    repo: &Repo,
+    store: &Store,
+    cfg: &Config,
+    wcfg: &WatchConfig,
+    shutdown: Arc<AtomicBool>,
+) -> Result<()> {
     let mut state = WatchState::new();
     write_state(store, &state)?;
     let (tx, rx) = channel::<notify::Result<notify::Event>>();
@@ -383,6 +420,11 @@ pub fn run(repo: &Repo, store: &Store, cfg: &Config, wcfg: &WatchConfig) -> Resu
     let store_root = store.root.clone();
     let mut last_heartbeat = Instant::now();
     loop {
+        if shutdown.load(Ordering::Relaxed) {
+            // Final state write so doctor reflects clean exit.
+            let _ = write_state(store, &state);
+            return Ok(());
+        }
         let mut events_seen = 0usize;
         // Block until the first event or the heartbeat tick.
         let timeout = wcfg
@@ -438,6 +480,11 @@ pub fn run(repo: &Repo, store: &Store, cfg: &Config, wcfg: &WatchConfig) -> Resu
         let _ = process_batch(repo, store, cfg, events_seen, &mut state);
         let _ = write_state(store, &state);
         last_heartbeat = Instant::now();
+        // Re-check shutdown after the snap — if SIGTERM arrived mid-debounce,
+        // exit now rather than blocking on another event.
+        if shutdown.load(Ordering::Relaxed) {
+            return Ok(());
+        }
     }
 }
 
@@ -732,6 +779,70 @@ time.sleep(3)
     #[test]
     fn pid_alive_for_definitely_dead_returns_false() {
         assert!(!pid_alive(999_999));
+    }
+
+    #[test]
+    fn run_with_shutdown_exits_immediately_when_flag_preset() {
+        // Flag tripped before the loop starts → first iteration sees it and
+        // returns Ok(()). Verifies the shutdown gate is checked before any
+        // blocking recv that could otherwise pin the loop.
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = make_repo(td.path());
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        let cfg = Config::default();
+        let wcfg = WatchConfig {
+            debounce: Duration::from_millis(50),
+            heartbeat: Duration::from_millis(100),
+        };
+        let shutdown = Arc::new(AtomicBool::new(true));
+        let started = Instant::now();
+        let result = run_with_shutdown(&repo, &store, &cfg, &wcfg, Arc::clone(&shutdown));
+        assert!(result.is_ok(), "run should exit cleanly on shutdown");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "should exit fast; took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn run_with_shutdown_exits_when_flag_set_from_another_thread() {
+        // More realistic: loop starts, another thread flips the flag, loop
+        // notices on next idle-tick. Verifies the timeout-driven path picks
+        // up shutdown without an external event.
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = make_repo(td.path());
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        let cfg = Config::default();
+        let wcfg = WatchConfig {
+            debounce: Duration::from_millis(50),
+            heartbeat: Duration::from_millis(150),
+        };
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag_clone = Arc::clone(&shutdown);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            flag_clone.store(true, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        let result = run_with_shutdown(&repo, &store, &cfg, &wcfg, shutdown);
+        assert!(result.is_ok());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "should exit within ~heartbeat after flag flip; took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn install_signal_handler_returns_unset_flag() {
+        // Just verifies the registration doesn't error and we get a fresh
+        // flag back. Can't easily test signal delivery without affecting
+        // the test process itself.
+        let flag = install_signal_handler().expect("install");
+        assert!(!flag.load(Ordering::Relaxed));
     }
 
     #[test]
