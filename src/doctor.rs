@@ -16,6 +16,7 @@ pub struct DoctorReport {
     pub canary_roundtrip: bool,
     pub recent_hook_errors: Vec<String>,
     pub recent_shim_errors: Vec<String>,
+    pub recent_gate_skips: Vec<String>,
     pub crypto_status: CryptoStatus,
 }
 
@@ -175,6 +176,7 @@ pub fn run(repo: &Repo, store: &Store) -> Result<DoctorReport> {
 
     let recent_hook_errors = read_hook_error_log(store);
     let recent_shim_errors = read_shim_error_log(store);
+    let recent_gate_skips = read_gate_skip_log(store);
     let crypto_status = assess_crypto(store);
 
     Ok(DoctorReport {
@@ -186,6 +188,7 @@ pub fn run(repo: &Repo, store: &Store) -> Result<DoctorReport> {
         canary_roundtrip,
         recent_hook_errors,
         recent_shim_errors,
+        recent_gate_skips,
         crypto_status,
     })
 }
@@ -225,6 +228,35 @@ fn read_hook_error_log(store: &Store) -> Vec<String> {
 
 fn read_shim_error_log(store: &Store) -> Vec<String> {
     read_recent_lines(&store.root.join("shim-errors.log"))
+}
+
+fn read_gate_skip_log(store: &Store) -> Vec<String> {
+    let path = store.root.join("events").join("skipped_git_busy.jsonl");
+    if !path.exists() {
+        return Vec::new();
+    }
+    let body = fs::read_to_string(&path).unwrap_or_default();
+    body.lines()
+        .rev()
+        .take(5)
+        .map(format_gate_skip_line)
+        .collect()
+}
+
+/// Best-effort render of a JSONL gate-skip line. Pulls ts + event + reason
+/// without a json dep — tolerant of malformed lines (returns the raw line).
+fn format_gate_skip_line(line: &str) -> String {
+    let extract = |key: &str| -> Option<String> {
+        let needle = format!("\"{}\":\"", key);
+        let start = line.find(&needle)? + needle.len();
+        let rest = &line[start..];
+        let end = rest.find('"')?;
+        Some(rest[..end].to_string())
+    };
+    match (extract("ts"), extract("event"), extract("reason")) {
+        (Some(ts), Some(event), Some(reason)) => format!("{ts}  {event:<16}  {reason}"),
+        _ => line.to_string(),
+    }
 }
 
 fn read_recent_lines(p: &std::path::Path) -> Vec<String> {
@@ -347,6 +379,12 @@ impl DoctorReport {
         if !self.recent_shim_errors.is_empty() {
             let _ = writeln!(s, "  recent shim errors  :");
             for line in &self.recent_shim_errors {
+                let _ = writeln!(s, "    {line}");
+            }
+        }
+        if !self.recent_gate_skips.is_empty() {
+            let _ = writeln!(s, "  recent gate skips   :");
+            for line in &self.recent_gate_skips {
                 let _ = writeln!(s, "    {line}");
             }
         }
@@ -708,5 +746,49 @@ mod tests {
         let report = report.unwrap();
         // Either canary fails, or store_size returns Err — both unhealthy.
         assert!(!report.is_healthy(), "report=\n{}", report.render());
+    }
+
+    #[test]
+    fn doctor_surfaces_recent_gate_skips() {
+        use crate::snapshot::snap;
+        let td = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(td.path())
+            .status()
+            .unwrap();
+        let repo = Repo::discover(td.path()).unwrap();
+        let store = Store::for_repo_with_base(&repo, data_dir.path().to_path_buf()).unwrap();
+        fs::create_dir_all(repo.root.join(".git").join("rebase-merge")).unwrap();
+        let _ = snap(&repo, &store, "post-commit", None).unwrap();
+        let _ = snap(&repo, &store, "manual", None).unwrap();
+        let report = run(&repo, &store).unwrap();
+        assert_eq!(report.recent_gate_skips.len(), 2);
+        let rendered = report.render();
+        assert!(
+            rendered.contains("recent gate skips"),
+            "expected gate skips header, got:\n{rendered}"
+        );
+        assert!(rendered.contains("post-commit"));
+        assert!(rendered.contains("interactive rebase in progress"));
+    }
+
+    #[test]
+    fn doctor_omits_gate_skips_when_log_absent() {
+        let td = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(td.path())
+            .status()
+            .unwrap();
+        let repo = Repo::discover(td.path()).unwrap();
+        let store = Store::for_repo_with_base(&repo, data_dir.path().to_path_buf()).unwrap();
+        let report = run(&repo, &store).unwrap();
+        assert!(report.recent_gate_skips.is_empty());
+        assert!(!report.render().contains("recent gate skips"));
     }
 }
