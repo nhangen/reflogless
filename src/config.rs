@@ -36,6 +36,37 @@ pub struct Config {
     /// when `[watch]` section is missing.
     #[serde(default)]
     pub watch: WatchConfig,
+    /// Remote backend thresholds for doctor's `remote.backlog` row (#31).
+    /// Backlog older than `warn_days` is a doctor warning; older than
+    /// `unhealthy_days` is a doctor failure.
+    #[serde(default)]
+    pub remote: RemoteThresholds,
+}
+
+/// Per-repo thresholds for doctor's remote-backlog age check.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub struct RemoteThresholds {
+    #[serde(default = "default_warn_days")]
+    pub warn_days: i64,
+    #[serde(default = "default_unhealthy_days")]
+    pub unhealthy_days: i64,
+}
+
+fn default_warn_days() -> i64 {
+    14
+}
+
+fn default_unhealthy_days() -> i64 {
+    60
+}
+
+impl Default for RemoteThresholds {
+    fn default() -> Self {
+        Self {
+            warn_days: default_warn_days(),
+            unhealthy_days: default_unhealthy_days(),
+        }
+    }
 }
 
 /// User-tunable knobs for the filesystem watcher daemon.
@@ -81,6 +112,7 @@ impl Default for Config {
             shim: default_shim(),
             track: Vec::new(),
             watch: WatchConfig::default(),
+            remote: RemoteThresholds::default(),
         }
     }
 }
