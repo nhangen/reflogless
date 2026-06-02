@@ -14,6 +14,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub const RECIPIENT_FILENAME: &str = "recipient.txt";
 pub const INSECURE_KEY_MARKER: &str = "insecure-file-key";
 pub const REPO_ORIGIN_FILENAME: &str = "repo_origin.txt";
+pub const SNAP_LOCK_FILENAME: &str = ".snap.lock";
+
+/// Acquisition mode for the per-store snap lock.
+///
+/// Hooks and shim use `Block` — they're already serialized with whatever git
+/// operation invoked them, and waiting briefly is correct. A future watcher
+/// daemon (#30) uses `TryOnce` — never block git, just skip this debounce
+/// window if hooks/shim are currently snapping.
+#[derive(Debug, Clone, Copy)]
+pub enum SnapLockMode {
+    Block,
+    TryOnce,
+}
+
+/// RAII guard around an `flock`-acquired lock at `<store-root>/.snap.lock`.
+/// Releases when dropped (file close releases the OS-level lock). The path
+/// stays on disk between acquisitions — only the lock state is process-scoped.
+pub struct SnapLock {
+    _file: fs::File,
+}
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -71,6 +91,39 @@ impl Store {
             );
         }
         Ok(s)
+    }
+
+    /// Acquire the per-store snap lock. Serializes `snap_with_config` across
+    /// hooks, shim, and (future) the watcher daemon (#30). The lockfile lives
+    /// at `<root>/.snap.lock`; it is created lazily on first acquisition and
+    /// stays on disk between acquisitions — only the OS-level lock state is
+    /// process-scoped.
+    ///
+    /// Returns `Ok(Some(SnapLock))` on success, `Ok(None)` for `TryOnce` mode
+    /// when another process already holds the lock (caller skips this snap),
+    /// `Err` only on genuine IO failure opening or locking the file.
+    pub fn acquire_snap_lock(&self, mode: SnapLockMode) -> Result<Option<SnapLock>> {
+        use fs4::fs_std::FileExt;
+        let p = self.root.join(SNAP_LOCK_FILENAME);
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&p)
+            .map_err(|e| Error::io(&p, e))?;
+        set_file_perms(&p)?;
+        match mode {
+            SnapLockMode::Block => {
+                file.lock_exclusive().map_err(|e| Error::io(&p, e))?;
+                Ok(Some(SnapLock { _file: file }))
+            }
+            SnapLockMode::TryOnce => match file.try_lock_exclusive() {
+                Ok(true) => Ok(Some(SnapLock { _file: file })),
+                Ok(false) => Ok(None),
+                Err(e) => Err(Error::io(&p, e)),
+            },
+        }
     }
 
     /// Persist the origin repo path so `list --all` can show it. Idempotent —
@@ -1141,5 +1194,82 @@ mod tests {
         let base = td.path().join("data");
         let store = Store::for_repo_with_base(&repo, base).unwrap();
         assert_eq!(store.read_repo_origin(), Some(repo.root.clone()));
+    }
+
+    #[test]
+    fn snap_lock_block_releases_on_drop() {
+        let (_td, store) = ephemeral_store();
+        {
+            let g = store.acquire_snap_lock(SnapLockMode::Block).unwrap();
+            assert!(g.is_some());
+        }
+        // After drop, second acquisition must succeed.
+        let g2 = store.acquire_snap_lock(SnapLockMode::Block).unwrap();
+        assert!(g2.is_some());
+    }
+
+    #[test]
+    fn snap_lock_try_once_returns_none_when_held_by_another_process() {
+        // Inter-process semantics: spawn a child that holds the lock and
+        // sleeps; assert TryOnce in the parent returns Ok(None).
+        use std::process::{Command, Stdio};
+        let (td, store) = ephemeral_store();
+        let lockpath = store.root.join(SNAP_LOCK_FILENAME);
+        // Pre-create with right perms; child just locks it.
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lockpath)
+            .unwrap();
+        let marker = td.path().join("child-ready");
+        let helper = r#"
+import fcntl, os, sys, time
+f = open(sys.argv[1], 'r+')
+fcntl.flock(f, fcntl.LOCK_EX)
+open(sys.argv[2], 'w').close()
+time.sleep(5)
+"#;
+        let mut child = Command::new("python3")
+            .arg("-c")
+            .arg(helper)
+            .arg(&lockpath)
+            .arg(&marker)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // Wait for child to acquire (up to 2s).
+        let start = std::time::Instant::now();
+        while !marker.exists() && start.elapsed().as_secs() < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(marker.exists(), "child failed to acquire lock");
+        let result = store.acquire_snap_lock(SnapLockMode::TryOnce).unwrap();
+        assert!(result.is_none(), "TryOnce should not block; got a guard");
+        // Kill child + wait so the lock releases before the temp dir vanishes.
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn snap_lock_try_once_succeeds_when_free() {
+        let (_td, store) = ephemeral_store();
+        let g = store.acquire_snap_lock(SnapLockMode::TryOnce).unwrap();
+        assert!(g.is_some());
+    }
+
+    #[test]
+    fn snap_lock_file_has_secure_perms() {
+        let (_td, store) = ephemeral_store();
+        let _g = store.acquire_snap_lock(SnapLockMode::Block).unwrap();
+        let lockpath = store.root.join(SNAP_LOCK_FILENAME);
+        assert!(lockpath.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&lockpath).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "snap lockfile should be 0600");
+        }
     }
 }
