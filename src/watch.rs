@@ -20,7 +20,7 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 pub const WATCH_STATE_FILENAME: &str = "watch-state.json";
@@ -395,10 +395,24 @@ pub fn event_is_interesting(
     false
 }
 
+/// Process-wide shutdown flag. Lazily initialized on first
+/// `install_signal_handler()` call — subsequent calls return a clone of the
+/// same Arc instead of registering new handlers. See #52.
+static SHUTDOWN_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
 /// Install a SIGTERM + SIGINT handler that flips the returned flag. Used by
 /// `run()` to drain its current debounce window and exit cleanly when
 /// launchd / systemd / Ctrl-C asks the daemon to stop. See #47.
+///
+/// Idempotent: signal-hook's registry chains handlers (each `register` call
+/// appends rather than replacing), so naive repeated calls would stack
+/// N handlers in one process. We gate registration on a `OnceLock` so
+/// repeated calls return the same shared flag without leaking entries.
+/// See #52.
 pub fn install_signal_handler() -> Result<Arc<AtomicBool>> {
+    if let Some(existing) = SHUTDOWN_FLAG.get() {
+        return Ok(Arc::clone(existing));
+    }
     let flag = Arc::new(AtomicBool::new(false));
     #[cfg(unix)]
     {
@@ -408,7 +422,10 @@ pub fn install_signal_handler() -> Result<Arc<AtomicBool>> {
         signal_hook::flag::register(SIGINT, Arc::clone(&flag))
             .map_err(|e| Error::Config(format!("signal-hook SIGINT: {e}")))?;
     }
-    Ok(flag)
+    // OnceLock::set returns Err if another thread won the race; that's fine,
+    // we just clone whatever ended up stored.
+    let _ = SHUTDOWN_FLAG.set(Arc::clone(&flag));
+    Ok(Arc::clone(SHUTDOWN_FLAG.get().unwrap_or(&flag)))
 }
 
 /// Run the watcher loop. Blocks; exits cleanly on channel disconnect or when
@@ -900,6 +917,19 @@ time.sleep(3)
         // the test process itself.
         let flag = install_signal_handler().expect("install");
         assert!(!flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn install_signal_handler_is_idempotent_across_calls() {
+        // Repeated calls return the SAME flag, not new ones. Catches the
+        // signal-hook registration-stack leak (#52). N tests calling install
+        // in one process previously stacked N handlers; now they share one.
+        let a = install_signal_handler().expect("first install");
+        let b = install_signal_handler().expect("second install");
+        let c = install_signal_handler().expect("third install");
+        // All three Arcs point at the same AtomicBool — flipping one flips all.
+        assert!(Arc::ptr_eq(&a, &b));
+        assert!(Arc::ptr_eq(&b, &c));
     }
 
     #[test]
