@@ -103,6 +103,8 @@ cd reflogless
 cargo install --path .
 ```
 
+Add `--features remote` (or `cargo install reflogless --features remote`) to pull in the optional S3-compatible backend. See [Remote backend (optional)](#remote-backend-optional) below.
+
 ### Linux prerequisite for encryption
 
 `reflogless init` provisions an age identity into the OS keychain via the [`keyring`](https://crates.io/crates/keyring) crate. On Linux that requires a running Secret Service provider (gnome-keyring or KWallet) and an active D-Bus session — headless servers, WSL environments, Docker containers, CI runners, and ssh-only boxes have none.
@@ -396,6 +398,99 @@ Secret-shaped paths (always encrypted regardless of policy):
 When an identity is provisioned, **the manifest itself is always encrypted** (`<id>.json.age`) so filenames in entries (e.g. `.env.production`, `customers.sql`) don't leak.
 
 `reflogless doctor` runs an encrypt/decrypt canary on every invocation. It fails fast with `encryption canary roundtrip failed` if the keychain denies access or the identity is corrupt.
+
+## Remote backend (optional)
+
+`reflogless` is local-first — your snapshots live under `~/Library/Application Support/reflogless/` (macOS) or `~/.local/share/reflogless/` (Linux). For **offsite durability** (laptop loss, disk failure), you can opt into an S3-compatible remote backend.
+
+> Not a sync layer: pushes are explicit, single-writer per machine. Don't use this for collaboration.
+
+### Install with remote support
+
+The remote backend is gated behind a cargo feature so default installs stay light:
+
+```bash
+cargo install reflogless --features remote
+```
+
+### Encryption is mandatory
+
+`reflogless remote enable` refuses unless **both** are true:
+
+1. `.reflogless.toml` sets `encrypt = "all"` (default `"secrets"` is rejected — non-secret blobs would ride plaintext to S3).
+2. An identity has been provisioned via `reflogless init`.
+
+The guarantee: **the remote sees only ciphertext.** Both blobs and manifests are age-encrypted before they leave the local store.
+
+### Enable
+
+```bash
+# .reflogless.toml at repo root:
+#   encrypt = "all"
+
+# AWS S3
+reflogless remote enable s3://my-bucket --region us-east-1
+
+# MinIO / LocalStack / any non-AWS S3 server
+reflogless remote enable s3://my-bucket \
+    --region us-east-1 \
+    --endpoint http://localhost:9000 \
+    --path-style
+```
+
+Credentials come from `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (+ optional `AWS_SESSION_TOKEN`) at push time. `~/.aws/credentials` profile support is not yet wired.
+
+Object layout under the bucket:
+
+```
+<your-prefix>/<hostname>/
+    blobs/<sha256>
+    manifests/<snap-id>.json
+```
+
+The `<hostname>` segment is automatic — two laptops backing up to the same bucket share blob storage (content-addressed dedupe) but their manifests don't collide.
+
+### Push, status, disable
+
+```bash
+reflogless snap                  # local snapshot, queues a pending upload
+reflogless remote status         # shows backlog + oldest age (no network)
+reflogless remote push           # uploads pending blobs + manifests
+reflogless remote disable        # removes the remote config; pending log is retained
+```
+
+`push` is the only command that touches the network. Snaps queue work to `<store>/remote-pending.jsonl`; pushes drain it. Blob deduplication runs per-push via `HeadObject` — re-uploads are free.
+
+### Doctor
+
+`reflogless doctor` adds two rows when remote is enabled:
+
+```
+remote              : enabled (s3://my-bucket/alice)
+remote.backlog      : 12 pending uploads, oldest 18d (WARN)
+```
+
+Health states:
+
+- `ok` — empty backlog, or oldest entry younger than `warn_days` (default 14)
+- `WARN` — oldest entry between `warn_days` and `unhealthy_days` (default 60). Informational; doctor stays overall-healthy.
+- `UNHEALTHY` — oldest entry past `unhealthy_days`. Doctor exits non-zero. Investigate: network down? credentials rotated? push not scheduled?
+
+Thresholds are configurable in `.reflogless.toml`:
+
+```toml
+[remote]
+warn_days = 14
+unhealthy_days = 60
+```
+
+### Caveats
+
+- **Single-writer per repo.** Two machines pushing to the same `<bucket>/<hostname>/` path will race; the hostname segment prevents that by default.
+- **No auto-push.** A `push` only runs when you invoke it (cron / launchd / systemd timer are common, but reflogless doesn't install one).
+- **Pending is the steady state.** Offline laptops accumulate pending entries — that's expected. WARN/UNHEALTHY exists for laptops that came back online and still didn't push.
+- **No multipart for >5GB blobs.** File-sized blobs (<1MB typical) make this irrelevant for now; revisit if you need larger.
+- **The remote sees ciphertext only.** Losing your age identity = losing access to the backup. Back up the identity separately (paper / 1Password / etc.).
 
 ## Multi-user safety
 
