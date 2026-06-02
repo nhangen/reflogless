@@ -14,6 +14,11 @@ pub struct S3Config {
     pub region: Region,
     pub credentials: Credentials,
     pub key_prefix: String,
+    /// Use path-style addressing (`https://endpoint/bucket/key`) instead of
+    /// virtual-hosted-style (`https://bucket.endpoint/key`). Required for
+    /// MinIO and most other S3-compatible servers without wildcard DNS.
+    /// AWS itself works either way; leave `false` (the default) for AWS.
+    pub path_style: bool,
 }
 
 pub struct S3Backend {
@@ -25,6 +30,11 @@ impl S3Backend {
     pub fn new(cfg: S3Config) -> Result<Self> {
         let bucket = Bucket::new(&cfg.bucket, cfg.region, cfg.credentials)
             .map_err(|e| Error::Config(format!("S3 bucket: {e}")))?;
+        let bucket = if cfg.path_style {
+            bucket.with_path_style()
+        } else {
+            bucket
+        };
         Ok(Self {
             bucket,
             key_prefix: normalize_prefix(&cfg.key_prefix),
@@ -138,6 +148,7 @@ mod tests {
             credentials: Credentials::new(Some("AKIATEST"), Some("secrettest"), None, None, None)
                 .unwrap(),
             key_prefix: "host-A".to_string(),
+            path_style: true,
         }
     }
 
