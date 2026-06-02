@@ -32,6 +32,46 @@ pub struct Config {
     /// Each entry is a literal repo-relative path (no glob expansion in v1).
     #[serde(default)]
     pub track: Vec<String>,
+    /// Watcher daemon configuration (#30). All fields optional; defaults apply
+    /// when `[watch]` section is missing.
+    #[serde(default)]
+    pub watch: WatchConfig,
+}
+
+/// User-tunable knobs for the filesystem watcher daemon.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct WatchConfig {
+    /// Coalesce filesystem events into windows of this many milliseconds
+    /// before snapping. Default 2000.
+    #[serde(default = "default_debounce_ms")]
+    pub debounce_ms: u64,
+    /// Heartbeat write interval to `watch-state.json` while idle, in seconds.
+    /// Default 60.
+    #[serde(default = "default_heartbeat_seconds")]
+    pub heartbeat_seconds: u64,
+    /// Additional path-substring patterns to ignore beyond the built-in
+    /// defaults (.git/, node_modules/, target/, dist/, build/, .next/,
+    /// __pycache__/). Matching is via `path.to_string_lossy().contains(s)`.
+    #[serde(default)]
+    pub ignore_extra: Vec<String>,
+}
+
+fn default_debounce_ms() -> u64 {
+    2000
+}
+
+fn default_heartbeat_seconds() -> u64 {
+    60
+}
+
+impl Default for WatchConfig {
+    fn default() -> Self {
+        Self {
+            debounce_ms: default_debounce_ms(),
+            heartbeat_seconds: default_heartbeat_seconds(),
+            ignore_extra: Vec::new(),
+        }
+    }
 }
 
 impl Default for Config {
@@ -40,6 +80,7 @@ impl Default for Config {
             encrypt: EncryptPolicy::default(),
             shim: default_shim(),
             track: Vec::new(),
+            watch: WatchConfig::default(),
         }
     }
 }

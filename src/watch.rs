@@ -29,6 +29,7 @@ pub const WATCH_STATE_FILENAME: &str = "watch-state.json";
 pub struct WatchConfig {
     pub debounce: Duration,
     pub heartbeat: Duration,
+    pub ignore_extra: Vec<String>,
 }
 
 impl Default for WatchConfig {
@@ -36,6 +37,18 @@ impl Default for WatchConfig {
         Self {
             debounce: Duration::from_millis(2000),
             heartbeat: Duration::from_secs(60),
+            ignore_extra: Vec::new(),
+        }
+    }
+}
+
+impl WatchConfig {
+    /// Build a `WatchConfig` from the parsed `[watch]` section of `.reflogless.toml`.
+    pub fn from_config(cfg: &crate::config::WatchConfig) -> Self {
+        Self {
+            debounce: Duration::from_millis(cfg.debounce_ms),
+            heartbeat: Duration::from_secs(cfg.heartbeat_seconds),
+            ignore_extra: cfg.ignore_extra.clone(),
         }
     }
 }
@@ -342,7 +355,15 @@ pub fn process_batch(
 
 /// Filter that decides whether a notify event should count toward the debounce
 /// window. Pure — tests pass in synthetic event kinds + paths.
-pub fn event_is_interesting(kind: &EventKind, paths: &[&Path], store_root: &Path) -> bool {
+///
+/// Built-in ignores match common high-churn dirs. Users can layer additional
+/// substring patterns via the `[watch] ignore_extra` config field.
+pub fn event_is_interesting(
+    kind: &EventKind,
+    paths: &[&Path],
+    store_root: &Path,
+    ignore_extra: &[String],
+) -> bool {
     use notify::event::ModifyKind;
     match kind {
         EventKind::Create(_) | EventKind::Remove(_) => {}
@@ -355,8 +376,6 @@ pub fn event_is_interesting(kind: &EventKind, paths: &[&Path], store_root: &Path
         if p.starts_with(store_root) {
             continue;
         }
-        // Heuristic skips on noisy build dirs; users can extend via
-        // `[watch] ignore_extra` once that config slice lands.
         let s = p.to_string_lossy();
         if s.contains("/.git/")
             || s.contains("/node_modules/")
@@ -366,6 +385,9 @@ pub fn event_is_interesting(kind: &EventKind, paths: &[&Path], store_root: &Path
             || s.contains("/.next/")
             || s.contains("/__pycache__/")
         {
+            continue;
+        }
+        if ignore_extra.iter().any(|pat| s.contains(pat.as_str())) {
             continue;
         }
         return true;
@@ -437,6 +459,7 @@ pub fn run_with_shutdown(
                     &evt.kind,
                     &evt.paths.iter().map(|p| p.as_path()).collect::<Vec<_>>(),
                     &store_root,
+                    &wcfg.ignore_extra,
                 ) {
                     events_seen += 1;
                 }
@@ -464,6 +487,7 @@ pub fn run_with_shutdown(
                         &evt.kind,
                         &evt.paths.iter().map(|p| p.as_path()).collect::<Vec<_>>(),
                         &store_root,
+                        &wcfg.ignore_extra,
                     ) {
                         events_seen += 1;
                     }
@@ -635,44 +659,73 @@ time.sleep(3)
     fn event_is_interesting_skips_dotgit_and_buildirs() {
         use notify::event::{CreateKind, ModifyKind};
         let store_root = Path::new("/tmp/store");
+        let no_extra: Vec<String> = vec![];
         // .git change ignored
         assert!(!event_is_interesting(
             &EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Any)),
             &[Path::new("/repo/.git/refs/heads/main")],
             store_root,
+            &no_extra,
         ));
         // node_modules ignored
         assert!(!event_is_interesting(
             &EventKind::Create(CreateKind::File),
             &[Path::new("/repo/node_modules/pkg/index.js")],
             store_root,
+            &no_extra,
         ));
         // user file kept
         assert!(event_is_interesting(
             &EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Any)),
             &[Path::new("/repo/src/main.rs")],
             store_root,
+            &no_extra,
         ));
         // store path ignored
         assert!(!event_is_interesting(
             &EventKind::Create(CreateKind::File),
             &[Path::new("/tmp/store/objects/aa/bb")],
             store_root,
+            &no_extra,
+        ));
+    }
+
+    #[test]
+    fn event_is_interesting_honors_user_ignore_extra() {
+        use notify::event::ModifyKind;
+        let store_root = Path::new("/tmp/store");
+        let extra = vec!["/coverage/".to_string(), "/.tox/".to_string()];
+        // user-extended ignore matches
+        assert!(!event_is_interesting(
+            &EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Any)),
+            &[Path::new("/repo/coverage/lcov.info")],
+            store_root,
+            &extra,
+        ));
+        // unmatched still passes
+        assert!(event_is_interesting(
+            &EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Any)),
+            &[Path::new("/repo/src/main.rs")],
+            store_root,
+            &extra,
         ));
     }
 
     #[test]
     fn event_is_interesting_ignores_access_events() {
         use notify::event::{AccessKind, AccessMode};
+        let no_extra: Vec<String> = vec![];
         assert!(!event_is_interesting(
             &EventKind::Access(AccessKind::Read),
             &[Path::new("/repo/x")],
             Path::new("/tmp/store"),
+            &no_extra,
         ));
         assert!(!event_is_interesting(
             &EventKind::Access(AccessKind::Open(AccessMode::Read)),
             &[Path::new("/repo/x")],
             Path::new("/tmp/store"),
+            &no_extra,
         ));
     }
 
@@ -796,6 +849,7 @@ time.sleep(3)
         let wcfg = WatchConfig {
             debounce: Duration::from_millis(50),
             heartbeat: Duration::from_millis(100),
+            ignore_extra: Vec::new(),
         };
         let shutdown = Arc::new(AtomicBool::new(true));
         let started = Instant::now();
@@ -821,6 +875,7 @@ time.sleep(3)
         let wcfg = WatchConfig {
             debounce: Duration::from_millis(50),
             heartbeat: Duration::from_millis(150),
+            ignore_extra: Vec::new(),
         };
         let shutdown = Arc::new(AtomicBool::new(false));
         let flag_clone = Arc::clone(&shutdown);
