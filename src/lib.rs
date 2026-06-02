@@ -5,6 +5,7 @@ pub mod error;
 pub mod hooks;
 pub mod keystore;
 pub mod manifest;
+pub mod remote;
 pub mod repo;
 pub mod select;
 pub mod shim;
