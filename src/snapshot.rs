@@ -3,7 +3,7 @@ use crate::error::{Error, Result};
 use crate::manifest::{Manifest, ManifestEntry};
 use crate::repo::Repo;
 use crate::select::{self, Selection, Skipped};
-use crate::store::{atomic_write, Store};
+use crate::store::{atomic_write, SnapLockMode, Store};
 use chrono::Utc;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -60,6 +60,11 @@ pub fn snap_with_config(
         ));
     }
     repo.assert_safe_ownership()?;
+    // Serialize concurrent snaps against this store. Hooks/shim block; this
+    // covers the case where shim and a post-commit hook fire near-simultaneously
+    // on a long-running rebase. The future watcher daemon (#30) acquires
+    // non-blocking via TryOnce so it never blocks git. See issue #39.
+    let _lock = store.acquire_snap_lock(SnapLockMode::Block)?;
     // Defensively exclude the store itself — prevents recursive snapshotting
     // when the user puts $REFLOGLESS_DATA_DIR inside the repo (tests, sandboxes).
     let exclude = vec![store.root.clone()];
@@ -794,5 +799,58 @@ mod tests {
         fs::remove_file(repo.root.join("empty")).unwrap();
         restore(&repo, &store, &s.manifest_id, &[], false).unwrap();
         assert_eq!(fs::read(repo.root.join("empty")).unwrap(), b"");
+    }
+
+    #[test]
+    fn snap_blocks_while_external_lock_is_held() {
+        // Pins the lock-acquisition wiring inside snap_with_config (#39).
+        // External flock holder releases after ~500ms; assert snap waited
+        // at least 300ms before completing. With the lock acquisition
+        // removed, snap returns near-instantly and the assert fails.
+        use crate::store::SNAP_LOCK_FILENAME;
+        use std::process::{Command as Cmd, Stdio};
+        let workdir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let repo = make_repo(workdir.path());
+        let store = Store::for_repo_with_base(&repo, data_dir.path().to_path_buf()).unwrap();
+        fs::write(repo.root.join("a.txt"), b"hello").unwrap();
+        let lockpath = store.root.join(SNAP_LOCK_FILENAME);
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lockpath)
+            .unwrap();
+        let marker = data_dir.path().join("child-ready");
+        let helper = r#"
+import fcntl, os, sys, time
+f = open(sys.argv[1], 'r+')
+fcntl.flock(f, fcntl.LOCK_EX)
+open(sys.argv[2], 'w').close()
+time.sleep(0.5)
+"#;
+        let mut child = Cmd::new("python3")
+            .arg("-c")
+            .arg(helper)
+            .arg(&lockpath)
+            .arg(&marker)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let start = std::time::Instant::now();
+        while !marker.exists() && start.elapsed().as_secs() < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(marker.exists(), "child failed to acquire lock");
+        let t0 = std::time::Instant::now();
+        let r = snap(&repo, &store, "manual", None).unwrap();
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed.as_millis() >= 300,
+            "snap returned in {elapsed:?}; expected >= 300ms because external lock held"
+        );
+        assert_eq!(r.files_written, 1);
+        let _ = child.wait();
     }
 }
