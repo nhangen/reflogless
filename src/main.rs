@@ -28,6 +28,40 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum RemoteAction {
+    /// Enable an S3-compatible remote backend for offsite durability. Refuses
+    /// unless `encrypt = "all"` is set in `.reflogless.toml` AND an identity
+    /// has been provisioned via `reflogless init` — otherwise non-secret blobs
+    /// would ride plaintext to S3.
+    Enable {
+        /// s3://bucket[/optional/prefix]
+        url: String,
+        /// AWS region (e.g. us-east-1). Required even for non-AWS endpoints —
+        /// rust-s3 uses it for signature scoping.
+        #[arg(long)]
+        region: String,
+        /// Custom endpoint URL for non-AWS S3 (MinIO, LocalStack, B2, etc.).
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Use path-style addressing (`<host>/<bucket>/<key>`). Required for
+        /// most non-AWS endpoints. Default off so AWS S3 callers get virtual-
+        /// hosted style automatically.
+        #[arg(long)]
+        path_style: bool,
+    },
+    /// Disable the remote backend. Removes `<store>/remote.toml`; pending log
+    /// is left on disk for inspection.
+    Disable,
+    /// Upload pending blobs + manifests to the configured remote. Reads AWS
+    /// credentials from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (+
+    /// `AWS_SESSION_TOKEN` if present).
+    #[cfg(feature = "remote")]
+    Push,
+    /// Print remote configuration and pending-log status. No network access.
+    Status,
+}
+
+#[derive(Subcommand)]
 enum WatchAction {
     /// Install the watcher into the per-user supervisor (launchd on macOS,
     /// systemd --user on Linux). Daemon starts immediately + persists across
@@ -108,6 +142,13 @@ enum Cmd {
     Watch {
         #[command(subcommand)]
         action: WatchAction,
+    },
+    /// Optional offsite remote backend (#31). Pushes are explicit; no auto
+    /// network traffic. `enable` refuses unless `encrypt = "all"` is set and
+    /// an identity has been provisioned via `init`.
+    Remote {
+        #[command(subcommand)]
+        action: RemoteAction,
     },
     /// Internal: dispatched by the installed PATH shim. Not for direct use.
     #[command(hide = true)]
@@ -286,6 +327,7 @@ fn run() -> reflogless::Result<()> {
                 ));
             }
         }
+        Cmd::Remote { action } => run_remote(&repo, &store, action)?,
         Cmd::Watch { action } => match action {
             WatchAction::Install => {
                 let report = reflogless::watch_install::install(&repo, &store)?;
@@ -531,6 +573,200 @@ fn diff_snapshot(
 /// Errors inside this function never propagate to abort the user's git
 /// command — they're logged to the per-repo `<store>/shim-errors.log` (or
 /// stderr if the store can't be located).
+fn run_remote(repo: &Repo, store: &Store, action: RemoteAction) -> reflogless::Result<()> {
+    match action {
+        RemoteAction::Enable {
+            url,
+            region,
+            endpoint,
+            path_style,
+        } => run_remote_enable(repo, store, &url, &region, endpoint, path_style),
+        RemoteAction::Disable => run_remote_disable(store),
+        #[cfg(feature = "remote")]
+        RemoteAction::Push => run_remote_push(store),
+        RemoteAction::Status => run_remote_status(store),
+    }
+}
+
+fn run_remote_enable(
+    repo: &Repo,
+    store: &Store,
+    url: &str,
+    region: &str,
+    endpoint: Option<String>,
+    path_style: bool,
+) -> reflogless::Result<()> {
+    use reflogless::config::EncryptPolicy;
+
+    let cfg = Config::load_or_default(&repo.root)?;
+    if cfg.encrypt != EncryptPolicy::All {
+        eprintln!("reflogless: remote backend requires whole-store encryption.");
+        eprintln!("reflogless:   set `encrypt = \"all\"` in .reflogless.toml and re-run");
+        eprintln!("reflogless:   `reflogless init` to provision an identity if one isn't already");
+        eprintln!(
+            "reflogless:   present. Currently `encrypt = \"{:?}\"`.",
+            cfg.encrypt
+        );
+        return Err(reflogless::Error::Config(
+            "remote enable refused: encrypt policy is not \"all\"".into(),
+        ));
+    }
+    if store.crypto().is_none() {
+        eprintln!("reflogless: remote backend requires an encryption identity.");
+        eprintln!("reflogless:   run `reflogless init` to provision one before enabling remote.");
+        return Err(reflogless::Error::Config(
+            "remote enable refused: no identity attached".into(),
+        ));
+    }
+
+    let (bucket, base_prefix) = reflogless::remote_config::parse_s3_url(url)?;
+    let host = reflogless::remote_config::hostname_segment();
+    let key_prefix = reflogless::remote_config::compose_key_prefix(&base_prefix, &host);
+
+    let rc = reflogless::remote_config::RemoteConfig {
+        bucket,
+        region: region.to_string(),
+        endpoint,
+        path_style,
+        key_prefix,
+    };
+    rc.save(store)?;
+    println!(
+        "remote backend enabled at {} (region={}, key_prefix={})",
+        rc.s3_url(),
+        rc.region,
+        rc.key_prefix
+    );
+    if rc.endpoint.is_none() {
+        println!("  credentials read from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY at push time.");
+    } else {
+        println!(
+            "  endpoint override active ({}); credentials still read from AWS_* env vars.",
+            rc.endpoint.as_deref().unwrap_or("")
+        );
+    }
+    Ok(())
+}
+
+fn run_remote_disable(store: &Store) -> reflogless::Result<()> {
+    use reflogless::remote_config::RemoteConfig;
+    if RemoteConfig::remove(store)? {
+        println!("remote backend disabled.");
+        let pending = reflogless::remote::read_pending(store)?;
+        if !pending.is_empty() {
+            println!(
+                "  note: {} pending upload(s) remain in {}",
+                pending.len(),
+                store.remote_pending_path().display(),
+            );
+            println!("  re-enable to drain, or delete the file manually.");
+        }
+    } else {
+        println!("remote backend was not enabled.");
+    }
+    Ok(())
+}
+
+fn run_remote_status(store: &Store) -> reflogless::Result<()> {
+    use reflogless::remote_config::{render_status_line, RemoteConfig};
+    let cfg = RemoteConfig::load(store)?;
+    println!("remote          : {}", render_status_line(cfg.as_ref()));
+    if cfg.is_some() {
+        let pending = reflogless::remote::read_pending(store)?;
+        let oldest = pending
+            .iter()
+            .map(|e| e.created_at)
+            .min()
+            .map(format_humanish_age);
+        match (pending.len(), oldest) {
+            (0, _) => println!("remote.backlog  : 0 pending uploads"),
+            (n, Some(age)) => println!("remote.backlog  : {n} pending uploads, oldest {age}"),
+            (n, None) => println!("remote.backlog  : {n} pending uploads"),
+        }
+    }
+    Ok(())
+}
+
+fn format_humanish_age(t: chrono::DateTime<chrono::Utc>) -> String {
+    let delta = chrono::Utc::now().signed_duration_since(t);
+    let secs = delta.num_seconds().max(0);
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}
+
+#[cfg(feature = "remote")]
+fn run_remote_push(store: &Store) -> reflogless::Result<()> {
+    use reflogless::remote::{drain_pending, RemoteBackend};
+    use reflogless::remote_config::RemoteConfig;
+    use reflogless::remote_s3::{S3Backend, S3Config};
+    use s3::creds::Credentials;
+    use s3::region::Region;
+
+    let cfg = RemoteConfig::load(store)?.ok_or_else(|| {
+        reflogless::Error::Config("remote not enabled: run `reflogless remote enable` first".into())
+    })?;
+    let region = if let Some(endpoint) = &cfg.endpoint {
+        Region::Custom {
+            region: cfg.region.clone(),
+            endpoint: endpoint.clone(),
+        }
+    } else {
+        cfg.region.parse::<Region>().map_err(|e| {
+            reflogless::Error::Config(format!("invalid region {:?}: {e}", cfg.region))
+        })?
+    };
+    let credentials = Credentials::default().map_err(|e| {
+        reflogless::Error::Config(format!(
+            "AWS credentials not found: set AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY ({e})"
+        ))
+    })?;
+    let backend = S3Backend::new(S3Config {
+        bucket: cfg.bucket.clone(),
+        region,
+        credentials,
+        key_prefix: cfg.key_prefix.clone(),
+        path_style: cfg.path_style,
+    })?;
+
+    let stats = drain_pending(store, |entry| {
+        let manifest = match store.load_manifest(&entry.manifest_id) {
+            Ok(m) => m,
+            Err(reflogless::Error::SnapshotNotFound(_)) => {
+                eprintln!(
+                    "reflogless remote: manifest {} no longer in store; dropping pending entry",
+                    entry.manifest_id
+                );
+                return Ok(true);
+            }
+            Err(e) => return Err(e),
+        };
+        for digest in &entry.blob_digests {
+            if backend.head_blob(digest)? {
+                continue;
+            }
+            let bytes = store
+                .read_blob(digest)
+                .map_err(|e| reflogless::Error::Config(format!("blob {digest}: {e}")))?;
+            let mut reader = std::io::Cursor::new(&bytes);
+            backend.push_blob(digest, &mut reader, bytes.len() as u64)?;
+        }
+        backend.push_manifest(&manifest)?;
+        Ok(true)
+    })?;
+    println!(
+        "remote push: uploaded {}, deferred {}",
+        stats.uploaded, stats.deferred
+    );
+    Ok(())
+}
+
 fn run_list_all() -> reflogless::Result<()> {
     let base = base_data_dir()?;
     let stores = list_all_stores(&base)?;
