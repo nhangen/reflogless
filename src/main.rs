@@ -28,6 +28,14 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum WatchAction {
+    /// Run the watcher loop in the foreground until SIGTERM / SIGINT.
+    Run,
+    /// Print the last-written heartbeat state file (raw JSON).
+    Status,
+}
+
+#[derive(Subcommand)]
 enum Cmd {
     /// Take a manual snapshot of untracked + modified-unstaged files.
     Snap {
@@ -85,6 +93,13 @@ enum Cmd {
     },
     /// Verify install + store + canary.
     Doctor,
+    /// Filesystem-watcher daemon (slice 3 of #30). No installer yet —
+    /// invoke `watch run` directly to start the loop in the foreground;
+    /// `watch status` reads the heartbeat state file.
+    Watch {
+        #[command(subcommand)]
+        action: WatchAction,
+    },
     /// Internal: dispatched by the installed PATH shim. Not for direct use.
     #[command(hide = true)]
     #[command(name = "_shim")]
@@ -262,6 +277,27 @@ fn run() -> reflogless::Result<()> {
                 ));
             }
         }
+        Cmd::Watch { action } => match action {
+            WatchAction::Run => {
+                let cfg = Config::load_or_default(&repo.root)?;
+                reflogless::watch::run(
+                    &repo,
+                    &store,
+                    &cfg,
+                    &reflogless::watch::WatchConfig::default(),
+                )?;
+            }
+            WatchAction::Status => match reflogless::watch::read_state_raw(&store) {
+                Some(raw) => print!("{raw}"),
+                None => {
+                    println!(
+                        "reflogless watch: no state file at {}",
+                        reflogless::watch::state_path(&store).display()
+                    );
+                    println!("  start the daemon with `reflogless watch run`.");
+                }
+            },
+        },
     }
     Ok(())
 }

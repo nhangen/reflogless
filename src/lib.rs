@@ -10,5 +10,6 @@ pub mod select;
 pub mod shim;
 pub mod snapshot;
 pub mod store;
+pub mod watch;
 
 pub use error::{Error, Result};
