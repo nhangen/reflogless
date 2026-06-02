@@ -41,8 +41,21 @@ pub struct SnapLock {
 /// remote-pending log against the pusher's read-and-rewrite cycle so
 /// concurrent snap-time appends don't write into a stale offset of a file
 /// the pusher is rewriting (issue #31 audit HIGH-2).
+///
+/// `Drop` calls `flock(LOCK_UN)` explicitly before closing the file. On macOS,
+/// relying on close-to-release leaves the kernel lock state in flight long
+/// enough that sequential same-process re-acquisitions intermittently see
+/// `WouldBlock` (the symptom: `TryOnce` returning false with no other holder).
 pub struct RemoteLock {
-    _file: fs::File,
+    file: Option<fs::File>,
+}
+
+impl Drop for RemoteLock {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            let _ = file.unlock();
+        }
+    }
 }
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -155,10 +168,10 @@ impl Store {
         match mode {
             SnapLockMode::Block => {
                 file.lock_exclusive().map_err(|e| Error::io(&p, e))?;
-                Ok(Some(RemoteLock { _file: file }))
+                Ok(Some(RemoteLock { file: Some(file) }))
             }
             SnapLockMode::TryOnce => match file.try_lock_exclusive() {
-                Ok(true) => Ok(Some(RemoteLock { _file: file })),
+                Ok(true) => Ok(Some(RemoteLock { file: Some(file) })),
                 Ok(false) => Ok(None),
                 Err(e) => Err(Error::io(&p, e)),
             },

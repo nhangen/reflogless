@@ -6,6 +6,8 @@ pub mod hooks;
 pub mod keystore;
 pub mod manifest;
 pub mod remote;
+#[cfg(feature = "remote")]
+pub mod remote_s3;
 pub mod repo;
 pub mod select;
 pub mod shim;
