@@ -43,6 +43,11 @@ impl Default for WatchConfig {
 pub struct WatchState {
     pub pid: u32,
     pub start_at_unix: i64,
+    /// Opaque identifier that changes on every boot. Doctor uses this to
+    /// detect pid reuse across reboots — a `kill -0 pid` reporting "alive"
+    /// for a pid whose stored boot_id differs from the current boot_id is
+    /// a reused pid, not our daemon. See #46.
+    pub boot_id: String,
     pub last_event_at: Option<i64>,
     pub last_snap_at: Option<i64>,
     pub snap_count: u64,
@@ -62,6 +67,7 @@ impl WatchState {
         Self {
             pid: std::process::id(),
             start_at_unix: Utc::now().timestamp(),
+            boot_id: current_boot_id(),
             last_event_at: None,
             last_snap_at: None,
             snap_count: 0,
@@ -85,9 +91,10 @@ impl WatchState {
             None => "null".to_string(),
         };
         format!(
-            "{{\"pid\":{},\"start_at_unix\":{},\"last_event_at\":{},\"last_snap_at\":{},\"snap_count\":{},\"skip_count\":{},\"error_count\":{},\"last_error\":{}}}\n",
+            "{{\"pid\":{},\"start_at_unix\":{},\"boot_id\":\"{}\",\"last_event_at\":{},\"last_snap_at\":{},\"snap_count\":{},\"skip_count\":{},\"error_count\":{},\"last_error\":{}}}\n",
             self.pid,
             self.start_at_unix,
+            json_escape(&self.boot_id),
             last_event,
             last_snap,
             self.snap_count,
@@ -96,6 +103,121 @@ impl WatchState {
             last_err,
         )
     }
+
+    /// Best-effort parse of a `to_json` line back into a WatchState. Used by
+    /// doctor to derive liveness. Returns None on any malformed input — doctor
+    /// renders that as "stopped" since we can't trust the file.
+    pub fn from_json(s: &str) -> Option<ParsedWatchState> {
+        let pid = extract_number(s, "pid")?;
+        let start_at_unix = extract_number(s, "start_at_unix")?;
+        let boot_id = extract_string(s, "boot_id").unwrap_or_default();
+        let last_event_at = extract_number(s, "last_event_at");
+        let last_snap_at = extract_number(s, "last_snap_at");
+        let snap_count = extract_number(s, "snap_count").unwrap_or(0);
+        let skip_count = extract_number(s, "skip_count").unwrap_or(0);
+        let error_count = extract_number(s, "error_count").unwrap_or(0);
+        Some(ParsedWatchState {
+            pid: pid as u32,
+            start_at_unix,
+            boot_id,
+            last_event_at,
+            last_snap_at,
+            snap_count: snap_count as u64,
+            skip_count: skip_count as u64,
+            error_count: error_count as u64,
+        })
+    }
+}
+
+/// Lightweight read-side view of WatchState — same fields minus `last_error`
+/// (doctor doesn't need it for liveness; the raw `watch status` command shows
+/// the full state file).
+#[derive(Debug, Clone)]
+pub struct ParsedWatchState {
+    pub pid: u32,
+    pub start_at_unix: i64,
+    pub boot_id: String,
+    pub last_event_at: Option<i64>,
+    pub last_snap_at: Option<i64>,
+    pub snap_count: u64,
+    pub skip_count: u64,
+    pub error_count: u64,
+}
+
+fn extract_number(s: &str, key: &str) -> Option<i64> {
+    let needle = format!("\"{}\":", key);
+    let start = s.find(&needle)? + needle.len();
+    let rest = &s[start..];
+    let end = rest.find(|c: char| !(c.is_ascii_digit() || c == '-'))?;
+    rest[..end].parse().ok()
+}
+
+fn extract_string(s: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{}\":\"", key);
+    let start = s.find(&needle)? + needle.len();
+    let rest = &s[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// OS-specific opaque boot identifier. Stored in WatchState to detect pid
+/// reuse across reboots.
+///
+/// - Linux: contents of `/proc/sys/kernel/random/boot_id`.
+/// - macOS: `hostname + ":" + kern.boottime` via sysctl (read from `uname` +
+///   `sysctl -n kern.boottime` shell-out; cheap enough for once-per-daemon-
+///   start + once-per-doctor-call).
+/// - Fallback: hostname only (better than nothing; doctor flag still detects
+///   a different host's state file).
+pub fn current_boot_id() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(s) = std::fs::read_to_string("/proc/sys/kernel/random/boot_id") {
+            return s.trim().to_string();
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        let hostname = Command::new("hostname")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let boot = Command::new("sysctl")
+            .args(["-n", "kern.boottime"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        if !hostname.is_empty() || !boot.is_empty() {
+            return format!("{hostname}|{boot}");
+        }
+    }
+    // Last-resort fallback: hostname env var.
+    std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string())
+}
+
+/// Cheap pid-alive probe using `kill(pid, 0)`. Returns true if signal 0 is
+/// deliverable, which means the process exists. On Windows this returns
+/// `true` unconditionally — Windows pid liveness needs a different syscall
+/// path that the watcher slice doesn't cover yet (#30 deferred Windows).
+#[cfg(unix)]
+pub fn pid_alive(pid: u32) -> bool {
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    // `kill(pid, 0)` returns 0 if signal would be deliverable (process exists
+    // and we have permission). Avoids subprocess spawn which was flaky under
+    // parallel test execution.
+    unsafe { kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+pub fn pid_alive(_pid: u32) -> bool {
+    true
 }
 
 fn json_escape(s: &str) -> String {
@@ -125,6 +247,39 @@ pub fn write_state(store: &Store, state: &WatchState) -> Result<()> {
 /// Read the daemon's last-written state file. Returns `None` if absent.
 pub fn read_state_raw(store: &Store) -> Option<String> {
     std::fs::read_to_string(state_path(store)).ok()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum WatcherLiveness {
+    /// No state file present — daemon never ran here.
+    NeverInstalled,
+    /// State file unreadable or malformed.
+    StateUnreadable,
+    /// pid is alive and boot_id matches → daemon is our daemon.
+    Running { pid: u32 },
+    /// pid is alive but boot_id differs → the pid is reused from before a
+    /// reboot, the daemon process from the state file is gone.
+    Stale { pid: u32 },
+    /// pid is dead.
+    Stopped { pid: u32 },
+}
+
+pub fn liveness(store: &Store) -> WatcherLiveness {
+    let raw = match read_state_raw(store) {
+        Some(s) => s,
+        None => return WatcherLiveness::NeverInstalled,
+    };
+    let parsed = match WatchState::from_json(&raw) {
+        Some(p) => p,
+        None => return WatcherLiveness::StateUnreadable,
+    };
+    if !pid_alive(parsed.pid) {
+        return WatcherLiveness::Stopped { pid: parsed.pid };
+    }
+    if parsed.boot_id != current_boot_id() {
+        return WatcherLiveness::Stale { pid: parsed.pid };
+    }
+    WatcherLiveness::Running { pid: parsed.pid }
 }
 
 /// Decide what the daemon does with a debounced batch. Pure (no IO) so tests
@@ -470,6 +625,113 @@ time.sleep(3)
             &[Path::new("/repo/x")],
             Path::new("/tmp/store"),
         ));
+    }
+
+    #[test]
+    fn watch_state_json_now_includes_boot_id() {
+        let s = WatchState::new();
+        let j = s.to_json();
+        assert!(j.contains("\"boot_id\":\""));
+        assert!(!s.boot_id.is_empty(), "boot_id should not be empty");
+    }
+
+    #[test]
+    fn from_json_parses_back_to_basic_fields() {
+        let mut s = WatchState::new();
+        s.snap_count = 7;
+        s.skip_count = 2;
+        s.last_event_at = Some(1_700_000_000);
+        let j = s.to_json();
+        let p = WatchState::from_json(&j).expect("parse");
+        assert_eq!(p.pid, s.pid);
+        assert_eq!(p.start_at_unix, s.start_at_unix);
+        assert_eq!(p.boot_id, s.boot_id);
+        assert_eq!(p.snap_count, 7);
+        assert_eq!(p.skip_count, 2);
+        assert_eq!(p.last_event_at, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn from_json_returns_none_on_garbage() {
+        assert!(WatchState::from_json("not json at all").is_none());
+        assert!(WatchState::from_json("{\"snap_count\":5}").is_none());
+    }
+
+    #[test]
+    fn liveness_never_installed_when_no_state_file() {
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = make_repo(td.path());
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        assert_eq!(liveness(&store), WatcherLiveness::NeverInstalled);
+    }
+
+    #[test]
+    fn liveness_stopped_when_pid_dead() {
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = make_repo(td.path());
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        let mut s = WatchState::new();
+        s.pid = 1; // pid 1 likely alive — pick a definitely-dead one.
+                   // pid 999999 is well above the typical pid_max range.
+        s.pid = 999_999;
+        write_state(&store, &s).unwrap();
+        match liveness(&store) {
+            WatcherLiveness::Stopped { pid } => assert_eq!(pid, 999_999),
+            other => panic!("expected Stopped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn liveness_stale_when_boot_id_differs() {
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = make_repo(td.path());
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        let mut s = WatchState::new();
+        s.pid = std::process::id(); // alive (we are it)
+        s.boot_id = "synthetic-different-boot-id".to_string();
+        write_state(&store, &s).unwrap();
+        match liveness(&store) {
+            WatcherLiveness::Stale { pid } => assert_eq!(pid, std::process::id()),
+            other => panic!("expected Stale, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn liveness_running_when_pid_and_boot_id_match() {
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = make_repo(td.path());
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        // Use this process's own pid + boot_id — both must match.
+        let mut s = WatchState::new();
+        s.pid = std::process::id();
+        // boot_id already set to current via WatchState::new()
+        write_state(&store, &s).unwrap();
+        match liveness(&store) {
+            WatcherLiveness::Running { pid } => assert_eq!(pid, std::process::id()),
+            other => panic!("expected Running, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn current_boot_id_is_stable_within_run() {
+        let a = current_boot_id();
+        let b = current_boot_id();
+        assert_eq!(a, b, "boot_id must be stable within a single process");
+        assert!(!a.is_empty());
+    }
+
+    #[test]
+    fn pid_alive_for_self_returns_true() {
+        assert!(pid_alive(std::process::id()));
+    }
+
+    #[test]
+    fn pid_alive_for_definitely_dead_returns_false() {
+        assert!(!pid_alive(999_999));
     }
 
     #[test]
