@@ -272,6 +272,26 @@ mod tests {
         assert_eq!(pending[1].blob_digests, vec!["sha:3"]);
     }
 
+    // Lockdown test for the macOS flock close-to-release lag: without explicit
+    // `unlock()` in `RemoteLock::drop`, sequential same-process TryOnce
+    // re-acquisitions intermittently return `Ok(false)` even with no other
+    // holder. Mutation pin: removing the `Drop for RemoteLock` impl fails this
+    // ~50% of the time on macOS (single run is enough most of the time;
+    // iterating 50x makes it deterministic on slow runners too).
+    #[test]
+    fn sequential_tryonce_reacquisition_is_deterministic() {
+        let (_td, store) = make_store();
+        for i in 0..50 {
+            let acquired = append_pending(&store, &entry(&format!("snap_{i}"), &["sha:x"]))
+                .unwrap_or_else(|e| panic!("iteration {i}: {e}"));
+            assert!(
+                acquired,
+                "iteration {i} hit TryOnce contention with no other holder"
+            );
+        }
+        assert_eq!(read_pending(&store).unwrap().len(), 50);
+    }
+
     #[test]
     fn read_pending_empty_when_log_missing() {
         let (_td, store) = make_store();
