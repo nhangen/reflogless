@@ -171,8 +171,37 @@ fn extract_string(s: &str, key: &str) -> Option<String> {
     let needle = format!("\"{}\":\"", key);
     let start = s.find(&needle)? + needle.len();
     let rest = &s[start..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
+    // Walk char-by-char honoring `\` escapes so the closing `"` of a
+    // value like `"has\"quote"` doesn't truncate at the embedded quote.
+    // Mirrors the `json_escape` writer above. See #50.
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                '/' => out.push('/'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'u' => {
+                    // 4-hex-digit codepoint; surrogate pairs not handled (boot_id
+                    // sources don't produce them). Bail on malformed.
+                    let mut hex = String::with_capacity(4);
+                    for _ in 0..4 {
+                        hex.push(chars.next()?);
+                    }
+                    let cp = u32::from_str_radix(&hex, 16).ok()?;
+                    out.push(char::from_u32(cp)?);
+                }
+                _ => return None, // unknown escape → malformed
+            },
+            c => out.push(c),
+        }
+    }
+    None // no closing quote
 }
 
 /// OS-specific opaque boot identifier. Stored in WatchState to detect pid
@@ -768,6 +797,46 @@ time.sleep(3)
         assert_eq!(p.snap_count, 7);
         assert_eq!(p.skip_count, 2);
         assert_eq!(p.last_event_at, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn from_json_roundtrips_escaped_boot_id() {
+        // Boot id can contain `"` or `\` in pathological setups (custom
+        // hostnames, sysctl output corner cases). Verify the writer's
+        // json_escape + reader's extract_string round-trip cleanly. See #50.
+        let mut s = WatchState::new();
+        s.boot_id = r#"host-with-"quote"-and-\backslash-and-newline\nliteral"#.to_string();
+        let j = s.to_json();
+        let p = WatchState::from_json(&j).expect("parse");
+        assert_eq!(p.boot_id, s.boot_id);
+    }
+
+    #[test]
+    fn extract_string_unescapes_basic_escapes() {
+        // \" → ", \\ → \, \n → \n (actual newline), \uXXXX → codepoint
+        assert_eq!(
+            extract_string(r#"{"k":"a\"b"}"#, "k").as_deref(),
+            Some("a\"b")
+        );
+        assert_eq!(
+            extract_string(r#"{"k":"a\\b"}"#, "k").as_deref(),
+            Some("a\\b")
+        );
+        assert_eq!(
+            extract_string(r#"{"k":"a\nb"}"#, "k").as_deref(),
+            Some("a\nb")
+        );
+        assert_eq!(
+            extract_string(r#"{"k":"aéb"}"#, "k").as_deref(),
+            Some("a\u{e9}b")
+        );
+    }
+
+    #[test]
+    fn extract_string_returns_none_on_malformed_escape() {
+        // Unknown escape sequence + unterminated string → None
+        assert!(extract_string(r#"{"k":"a\xb"}"#, "k").is_none());
+        assert!(extract_string(r#"{"k":"unterminated"#, "k").is_none());
     }
 
     #[test]
