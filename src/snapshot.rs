@@ -19,6 +19,10 @@ pub struct SnapshotResult {
     /// (rebase, merge, cherry-pick, etc.). `files_written` is 0 and
     /// `manifest_id`/`manifest_path` are empty in this case. See #40.
     pub skipped_git_busy: Option<String>,
+    /// True when snap was skipped because the per-store `.snap.lock` was held
+    /// by another process and the caller asked for `SnapLockMode::TryOnce`
+    /// (i.e. the future watcher daemon #30, which must never block git).
+    pub skipped_lock_held: bool,
 }
 
 pub fn snap(
@@ -58,6 +62,21 @@ pub fn snap_with_config(
     message: Option<String>,
     cfg: &Config,
 ) -> Result<SnapshotResult> {
+    snap_with_config_lock_mode(repo, store, event, message, cfg, SnapLockMode::Block)
+}
+
+/// Same as `snap_with_config` but with explicit lock acquisition mode. The
+/// watcher daemon (#30) calls this with `SnapLockMode::TryOnce` so it skips
+/// the snap window instead of blocking git when hooks/shim are mid-snap.
+/// On skip the result carries `skipped_lock_held: true`; manifest_id is empty.
+pub fn snap_with_config_lock_mode(
+    repo: &Repo,
+    store: &Store,
+    event: &str,
+    message: Option<String>,
+    cfg: &Config,
+    lock_mode: SnapLockMode,
+) -> Result<SnapshotResult> {
     if event == "latest" {
         return Err(Error::Config(
             "event name 'latest' would collide with the restore-latest alias".into(),
@@ -76,13 +95,26 @@ pub fn snap_with_config(
             bytes_written: 0,
             skipped: Vec::new(),
             skipped_git_busy: Some(reason),
+            skipped_lock_held: false,
         });
     }
-    // Serialize concurrent snaps against this store. Hooks/shim block; this
-    // covers the case where shim and a post-commit hook fire near-simultaneously
-    // on a long-running rebase. The future watcher daemon (#30) acquires
-    // non-blocking via TryOnce so it never blocks git. See issue #39.
-    let _lock = store.acquire_snap_lock(SnapLockMode::Block)?;
+    // Serialize concurrent snaps against this store. Hooks/shim Block; the
+    // watcher daemon (#30) passes TryOnce so it skips this window instead of
+    // blocking git when hooks/shim are mid-snap. See issue #39.
+    let _lock = match store.acquire_snap_lock(lock_mode)? {
+        Some(g) => g,
+        None => {
+            return Ok(SnapshotResult {
+                manifest_id: String::new(),
+                manifest_path: PathBuf::new(),
+                files_written: 0,
+                bytes_written: 0,
+                skipped: Vec::new(),
+                skipped_git_busy: None,
+                skipped_lock_held: true,
+            });
+        }
+    };
     // Defensively exclude the store itself — prevents recursive snapshotting
     // when the user puts $REFLOGLESS_DATA_DIR inside the repo (tests, sandboxes).
     let exclude = vec![store.root.clone()];
@@ -140,6 +172,7 @@ pub fn snap_with_config(
         bytes_written: bytes,
         skipped,
         skipped_git_busy: None,
+        skipped_lock_held: false,
     })
 }
 

@@ -13,7 +13,7 @@
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::repo::Repo;
-use crate::snapshot::{snap_with_config, SnapshotResult};
+use crate::snapshot::{snap_with_config_lock_mode, SnapshotResult};
 use crate::store::{atomic_write, SnapLockMode, Store};
 use chrono::Utc;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -151,24 +151,17 @@ pub fn process_batch(
         return BatchOutcome::NoEvents;
     }
     state.last_event_at = Some(Utc::now().timestamp());
-    // Daemon never blocks git; if hooks/shim are mid-snap, skip this window.
-    let lock = match store.acquire_snap_lock(SnapLockMode::TryOnce) {
-        Ok(Some(l)) => l,
-        Ok(None) => {
+    // Single acquisition via snap path with TryOnce — never blocks git. If the
+    // lock is held by a hook/shim this returns skipped_lock_held=true without
+    // re-entering or sleeping.
+    match snap_with_config_lock_mode(repo, store, "watcher", None, cfg, SnapLockMode::TryOnce) {
+        Ok(SnapshotResult {
+            skipped_lock_held: true,
+            ..
+        }) => {
             state.skip_count += 1;
-            return BatchOutcome::SkippedByLockHeld;
+            BatchOutcome::SkippedByLockHeld
         }
-        Err(e) => {
-            state.error_count += 1;
-            state.last_error = Some(format!("snap lock: {e}"));
-            return BatchOutcome::SnapFailed(format!("snap lock: {e}"));
-        }
-    };
-    // snap_with_config also re-checks the lock at its own entry — that's the
-    // same lock we just acquired in this process, and fs4's flock is per-OFD,
-    // so re-entering blocks. Drop ours before calling.
-    drop(lock);
-    match snap_with_config(repo, store, "watcher", None, cfg) {
         Ok(SnapshotResult {
             skipped_git_busy: Some(reason),
             ..
@@ -259,7 +252,11 @@ pub fn run(repo: &Repo, store: &Store, cfg: &Config, wcfg: &WatchConfig) -> Resu
                 }
                 continue;
             }
-            Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(Error::Config(
+                    "notify watcher channel disconnected — supervisor should restart".into(),
+                ));
+            }
         }
         // Open debounce window: drain quickly for `debounce_ms`.
         let window_start = Instant::now();
@@ -276,7 +273,11 @@ pub fn run(repo: &Repo, store: &Store, cfg: &Config, wcfg: &WatchConfig) -> Resu
                 }
                 Ok(Err(_)) => continue,
                 Err(RecvTimeoutError::Timeout) => break,
-                Err(RecvTimeoutError::Disconnected) => return Ok(()),
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(Error::Config(
+                        "notify watcher channel disconnected — supervisor should restart".into(),
+                    ));
+                }
             }
         }
         let _ = process_batch(repo, store, cfg, events_seen, &mut state);
