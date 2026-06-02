@@ -6,6 +6,15 @@ follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- `reflogless list --all` (#29): cross-repo listing enumerates every store
+  under the configured data directory, surfacing each store's origin path
+  (active / stale / legacy), snapshot count, and snapshot IDs. Plaintext-only
+  — per-manifest detail (event/message/files) stays in the single-repo
+  `list` since it requires the identity. Stores now persist their origin
+  path in `repo_origin.txt` at construction; pre-existing stores show as
+  `legacy` until next touched.
+
 ## [1.0.0] — 2026-05-25
 
 ### Added
