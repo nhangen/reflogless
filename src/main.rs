@@ -11,7 +11,10 @@ use reflogless::manifest::Manifest;
 use reflogless::repo::Repo;
 use reflogless::shim;
 use reflogless::snapshot::{restore, snap_with_config, SnapshotResult};
-use reflogless::store::{CryptoCtx, Store, DEFAULT_MAX_AGE_DAYS, DEFAULT_MAX_STORE_BYTES};
+use reflogless::store::{
+    base_data_dir, list_all_stores, CryptoCtx, Store, StoreOriginState, DEFAULT_MAX_AGE_DAYS,
+    DEFAULT_MAX_STORE_BYTES,
+};
 
 #[derive(Parser)]
 #[command(
@@ -34,8 +37,12 @@ enum Cmd {
         #[arg(long, default_value = "manual")]
         event: String,
     },
-    /// List snapshots for the current repo.
-    List,
+    /// List snapshots for the current repo, or with --all enumerate every
+    /// store under the reflogless data directory (scan-friendly, no decryption).
+    List {
+        #[arg(long)]
+        all: bool,
+    },
     /// Show files in a snapshot.
     Show { id: String },
     /// Restore a snapshot (refuses overwrites without --force).
@@ -112,6 +119,12 @@ fn run() -> reflogless::Result<()> {
         return run_shim(shim_dir, args);
     }
 
+    // `list --all` operates across stores, not inside a repo. Skip the
+    // repo-discovery prelude so the user can run it from anywhere.
+    if let Cmd::List { all: true } = cli.cmd {
+        return run_list_all();
+    }
+
     let cwd = std::env::current_dir().map_err(|e| reflogless::Error::io(".", e))?;
     let repo = Repo::discover(&cwd)?;
     repo.assert_safe_ownership()?;
@@ -125,7 +138,8 @@ fn run() -> reflogless::Result<()> {
             let r = snap_with_config(&repo, &store, &event, message, &cfg)?;
             print_snap_result(None, &r);
         }
-        Cmd::List => {
+        Cmd::List { all: true } => unreachable!("handled above"),
+        Cmd::List { all: false } => {
             let (mut ms, warnings) = store.list_manifests_lenient()?;
             ms.sort_by_key(|m| m.created_at);
             for m in ms {
@@ -456,6 +470,33 @@ fn diff_snapshot(
 /// Errors inside this function never propagate to abort the user's git
 /// command — they're logged to the per-repo `<store>/shim-errors.log` (or
 /// stderr if the store can't be located).
+fn run_list_all() -> reflogless::Result<()> {
+    let base = base_data_dir()?;
+    let stores = list_all_stores(&base)?;
+    if stores.is_empty() {
+        println!(
+            "no reflogless stores under {}",
+            base.join("reflogless").display()
+        );
+        return Ok(());
+    }
+    for s in &stores {
+        let (state_label, origin_label) = match &s.state {
+            StoreOriginState::Active(p) => ("active", p.display().to_string()),
+            StoreOriginState::Stale(p) => ("stale", p.display().to_string()),
+            StoreOriginState::Legacy => ("legacy", s.store_id.clone()),
+        };
+        println!(
+            "{}  {}  {} snapshots",
+            origin_label, state_label, s.snapshot_count,
+        );
+        for id in &s.snapshot_ids {
+            println!("  {}", id);
+        }
+    }
+    Ok(())
+}
+
 fn run_shim(shim_dir: PathBuf, args: Vec<String>) -> reflogless::Result<()> {
     if let Some(event) = shim::destructive_event(&args) {
         if let Err(e) = snapshot_for_shim(event) {

@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const RECIPIENT_FILENAME: &str = "recipient.txt";
 pub const INSECURE_KEY_MARKER: &str = "insecure-file-key";
+pub const REPO_ORIGIN_FILENAME: &str = "repo_origin.txt";
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -60,7 +61,36 @@ impl Store {
         set_dir_perms(&root)?;
         set_dir_perms(&objects)?;
         set_dir_perms(&snapshots)?;
-        Ok(Self { root, crypto: None })
+        let s = Self { root, crypto: None };
+        s.save_repo_origin(&repo.root)?;
+        Ok(s)
+    }
+
+    /// Persist the origin repo path so `list --all` can show it. Idempotent —
+    /// skips the rewrite if the on-disk content already matches.
+    pub fn save_repo_origin(&self, path: &Path) -> Result<()> {
+        let p = self.root.join(REPO_ORIGIN_FILENAME);
+        let target = path.to_string_lossy();
+        if let Ok(existing) = fs::read_to_string(&p) {
+            if existing == target {
+                return Ok(());
+            }
+        }
+        atomic_write(&p, target.as_bytes())?;
+        set_file_perms(&p)
+    }
+
+    /// Read the persisted origin path. Returns `None` for legacy stores that
+    /// predate `save_repo_origin`, or on any read error.
+    pub fn read_repo_origin(&self) -> Option<PathBuf> {
+        let p = self.root.join(REPO_ORIGIN_FILENAME);
+        let s = fs::read_to_string(&p).ok()?;
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(trimmed))
+        }
     }
 
     /// Attach a crypto context. Subsequent manifest writes/reads will encrypt
@@ -470,7 +500,107 @@ fn is_encrypted_manifest_path(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn base_data_dir() -> Result<PathBuf> {
+/// State a store can be in when discovered via cross-repo listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreOriginState {
+    /// `repo_origin.txt` present and the path still exists on disk.
+    Active(PathBuf),
+    /// `repo_origin.txt` present but the path is gone.
+    Stale(PathBuf),
+    /// No `repo_origin.txt` — store predates the feature or was hand-created.
+    Legacy,
+}
+
+/// Per-store summary surfaced by `list_all_stores`. Metadata is plaintext-only;
+/// per-manifest detail (event/message/files) requires the originating repo's
+/// identity and stays in single-repo `reflogless list`.
+#[derive(Debug, Clone)]
+pub struct StoreSummary {
+    pub store_id: String,
+    pub state: StoreOriginState,
+    pub snapshot_count: usize,
+    pub snapshot_ids: Vec<String>,
+}
+
+/// Walk `<base>/reflogless/<16-hex>/` and summarize each store. Skips entries
+/// whose directory name isn't a 16-hex `Repo::id()` value (avoids confusion
+/// with hand-placed files/dirs). Stale/legacy stores are surfaced, not skipped.
+pub fn list_all_stores(base: &Path) -> Result<Vec<StoreSummary>> {
+    let root = base.join("reflogless");
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<StoreSummary> = Vec::new();
+    let entries = match fs::read_dir(&root) {
+        Ok(it) => it,
+        Err(e) => return Err(Error::io(&root, e)),
+    };
+    for ent in entries {
+        let ent = match ent {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = ent.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        if !is_repo_id_dirname(&name) {
+            continue;
+        }
+
+        let origin_path = fs::read_to_string(path.join(REPO_ORIGIN_FILENAME))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+
+        let state = match origin_path {
+            Some(p) if p.exists() => StoreOriginState::Active(p),
+            Some(p) => StoreOriginState::Stale(p),
+            None => StoreOriginState::Legacy,
+        };
+
+        let snapshots_dir = path.join("snapshots");
+        let mut ids: Vec<String> = Vec::new();
+        if let Ok(dirit) = fs::read_dir(&snapshots_dir) {
+            for f in dirit.flatten() {
+                if let Some(id) = manifest_id_from_path(&f.path()) {
+                    ids.push(id);
+                }
+            }
+        }
+        ids.sort();
+
+        out.push(StoreSummary {
+            store_id: name,
+            state,
+            snapshot_count: ids.len(),
+            snapshot_ids: ids,
+        });
+    }
+
+    out.sort_by(|a, b| match (&a.state, &b.state) {
+        (StoreOriginState::Active(pa), StoreOriginState::Active(pb)) => pa.cmp(pb),
+        (StoreOriginState::Active(_), _) => std::cmp::Ordering::Less,
+        (_, StoreOriginState::Active(_)) => std::cmp::Ordering::Greater,
+        (StoreOriginState::Stale(pa), StoreOriginState::Stale(pb)) => pa.cmp(pb),
+        (StoreOriginState::Stale(_), _) => std::cmp::Ordering::Less,
+        (_, StoreOriginState::Stale(_)) => std::cmp::Ordering::Greater,
+        (StoreOriginState::Legacy, StoreOriginState::Legacy) => a.store_id.cmp(&b.store_id),
+    });
+
+    Ok(out)
+}
+
+fn is_repo_id_dirname(name: &str) -> bool {
+    name.len() == 16 && name.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+pub fn base_data_dir() -> Result<PathBuf> {
     // Explicit override beats platform default.
     if let Ok(p) = std::env::var("REFLOGLESS_DATA_DIR") {
         if !p.is_empty() {
@@ -827,5 +957,146 @@ mod tests {
         let report = store.gc(365, u64::MAX).unwrap();
         assert_eq!(report.snapshots_corrupt_evicted, 1);
         assert!(store.load_manifest("good").is_ok());
+    }
+
+    /// Construct a minimal store dir on disk under a custom base, optionally
+    /// writing a `repo_origin.txt` and seeding N snapshot files. Avoids the
+    /// `Repo::discover` path so we don't need a real git repo.
+    fn seed_store(
+        base: &Path,
+        store_id: &str,
+        origin: Option<&Path>,
+        manifest_ids: &[&str],
+        encrypted: bool,
+    ) {
+        let root = base.join("reflogless").join(store_id);
+        fs::create_dir_all(root.join("objects")).unwrap();
+        fs::create_dir_all(root.join("snapshots")).unwrap();
+        if let Some(o) = origin {
+            atomic_write(
+                &root.join(REPO_ORIGIN_FILENAME),
+                o.to_string_lossy().as_bytes(),
+            )
+            .unwrap();
+        }
+        for id in manifest_ids {
+            let ext = if encrypted { ".json.age" } else { ".json" };
+            fs::write(root.join("snapshots").join(format!("{id}{ext}")), b"x").unwrap();
+        }
+    }
+
+    #[test]
+    fn list_all_stores_returns_multiple_active_stores() {
+        let td = TempDir::new().unwrap();
+        let repo_a = td.path().join("repo-a");
+        let repo_b = td.path().join("repo-b");
+        fs::create_dir_all(&repo_a).unwrap();
+        fs::create_dir_all(&repo_b).unwrap();
+        seed_store(
+            td.path(),
+            "aaaaaaaaaaaaaaaa",
+            Some(&repo_a),
+            &["s1", "s2"],
+            false,
+        );
+        seed_store(td.path(), "bbbbbbbbbbbbbbbb", Some(&repo_b), &["s3"], true);
+
+        let stores = list_all_stores(td.path()).unwrap();
+        assert_eq!(stores.len(), 2);
+        let by_id: std::collections::HashMap<_, _> =
+            stores.iter().map(|s| (s.store_id.as_str(), s)).collect();
+        let a = by_id.get("aaaaaaaaaaaaaaaa").unwrap();
+        assert!(matches!(&a.state, StoreOriginState::Active(p) if p == &repo_a));
+        assert_eq!(a.snapshot_count, 2);
+        assert_eq!(a.snapshot_ids, vec!["s1".to_string(), "s2".to_string()]);
+        let b = by_id.get("bbbbbbbbbbbbbbbb").unwrap();
+        assert!(matches!(&b.state, StoreOriginState::Active(p) if p == &repo_b));
+        assert_eq!(b.snapshot_count, 1);
+    }
+
+    #[test]
+    fn list_all_stores_handles_stale_origin() {
+        let td = TempDir::new().unwrap();
+        let bogus = td.path().join("repo-never-existed");
+        seed_store(td.path(), "cccccccccccccccc", Some(&bogus), &["x"], false);
+        let stores = list_all_stores(td.path()).unwrap();
+        assert_eq!(stores.len(), 1);
+        match &stores[0].state {
+            StoreOriginState::Stale(p) => assert_eq!(p, &bogus),
+            other => panic!("expected Stale, got {other:?}"),
+        }
+        assert_eq!(stores[0].snapshot_count, 1);
+    }
+
+    #[test]
+    fn list_all_stores_handles_legacy_store_without_origin_file() {
+        let td = TempDir::new().unwrap();
+        seed_store(td.path(), "dddddddddddddddd", None, &["y"], false);
+        let stores = list_all_stores(td.path()).unwrap();
+        assert_eq!(stores.len(), 1);
+        assert!(matches!(stores[0].state, StoreOriginState::Legacy));
+        assert_eq!(stores[0].snapshot_count, 1);
+    }
+
+    #[test]
+    fn list_all_stores_skips_non_repo_id_directory_names() {
+        let td = TempDir::new().unwrap();
+        fs::create_dir_all(td.path().join("reflogless").join("not-a-hex")).unwrap();
+        fs::create_dir_all(td.path().join("reflogless").join("ZZZZZZZZZZZZZZZZ")).unwrap();
+        seed_store(td.path(), "eeeeeeeeeeeeeeee", None, &[], false);
+        let stores = list_all_stores(td.path()).unwrap();
+        assert_eq!(stores.len(), 1);
+        assert_eq!(stores[0].store_id, "eeeeeeeeeeeeeeee");
+    }
+
+    #[test]
+    fn list_all_stores_returns_empty_when_root_missing() {
+        let td = TempDir::new().unwrap();
+        let stores = list_all_stores(td.path()).unwrap();
+        assert!(stores.is_empty());
+    }
+
+    #[test]
+    fn list_all_stores_sort_active_before_stale_before_legacy() {
+        let td = TempDir::new().unwrap();
+        let active = td.path().join("active-repo");
+        fs::create_dir_all(&active).unwrap();
+        let stale_path = td.path().join("missing-repo");
+        seed_store(td.path(), "1111111111111111", None, &[], false);
+        seed_store(td.path(), "2222222222222222", Some(&stale_path), &[], false);
+        seed_store(td.path(), "3333333333333333", Some(&active), &[], false);
+        let stores = list_all_stores(td.path()).unwrap();
+        let states: Vec<&str> = stores
+            .iter()
+            .map(|s| match &s.state {
+                StoreOriginState::Active(_) => "active",
+                StoreOriginState::Stale(_) => "stale",
+                StoreOriginState::Legacy => "legacy",
+            })
+            .collect();
+        assert_eq!(states, vec!["active", "stale", "legacy"]);
+    }
+
+    #[test]
+    fn save_repo_origin_is_idempotent_when_path_matches() {
+        let (td, store) = ephemeral_store();
+        let path = td.path().join("some-repo");
+        store.save_repo_origin(&path).unwrap();
+        let p = store.root.join(REPO_ORIGIN_FILENAME);
+        let mtime1 = fs::metadata(&p).unwrap().modified().unwrap();
+        // sleep just a hair so a rewrite would show different mtime
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        store.save_repo_origin(&path).unwrap();
+        let mtime2 = fs::metadata(&p).unwrap().modified().unwrap();
+        assert_eq!(mtime1, mtime2, "idempotent write should not touch mtime");
+        assert_eq!(store.read_repo_origin().unwrap(), path);
+    }
+
+    #[test]
+    fn save_repo_origin_rewrites_when_path_changes() {
+        let (td, store) = ephemeral_store();
+        store.save_repo_origin(&td.path().join("a")).unwrap();
+        store.save_repo_origin(&td.path().join("b")).unwrap();
+        assert_eq!(store.read_repo_origin().unwrap(), td.path().join("b"));
     }
 }

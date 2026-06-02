@@ -133,6 +133,7 @@ reflogless init --insecure-file-key  store key on disk (loud warning)
 reflogless doctor                    verify install + store + canary + encryption
 reflogless snap -m MSG               manual snapshot
 reflogless list                      all snapshots for this repo
+reflogless list --all                cross-repo: every store + snapshot count (no decryption)
 reflogless show ID                   files in a snapshot
 reflogless restore ID                restore (refuses overwrite without --force)
 reflogless restore latest            restore most recent
