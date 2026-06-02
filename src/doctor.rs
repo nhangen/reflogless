@@ -19,6 +19,30 @@ pub struct DoctorReport {
     pub recent_gate_skips: Vec<String>,
     pub watcher: crate::watch::WatcherLiveness,
     pub crypto_status: CryptoStatus,
+    pub remote: RemoteStatus,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RemoteStatus {
+    /// No `<store>/remote.toml` — backend is disabled.
+    Disabled,
+    /// Remote configured + log readable. Health derived from oldest pending
+    /// age vs thresholds. `oldest_age_days = None` means backlog is empty.
+    Enabled {
+        s3_url: String,
+        backlog: usize,
+        oldest_age_days: Option<i64>,
+        health: RemoteHealth,
+    },
+    /// Remote configured but the pending log or remote.toml couldn't be read.
+    Unreadable(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RemoteHealth {
+    Ok,
+    Warn,
+    Unhealthy,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -181,6 +205,11 @@ pub fn run(repo: &Repo, store: &Store) -> Result<DoctorReport> {
     let watcher = crate::watch::liveness(store);
     let crypto_status = assess_crypto(store);
 
+    let thresholds = crate::config::Config::load_or_default(&repo.root)
+        .map(|c| c.remote)
+        .unwrap_or_default();
+    let remote = assess_remote(store, thresholds);
+
     Ok(DoctorReport {
         hooks: hook_status,
         store_size_bytes,
@@ -193,7 +222,35 @@ pub fn run(repo: &Repo, store: &Store) -> Result<DoctorReport> {
         recent_gate_skips,
         watcher,
         crypto_status,
+        remote,
     })
+}
+
+fn assess_remote(store: &Store, thresholds: crate::config::RemoteThresholds) -> RemoteStatus {
+    let cfg = match crate::remote_config::RemoteConfig::load(store) {
+        Ok(Some(c)) => c,
+        Ok(None) => return RemoteStatus::Disabled,
+        Err(e) => return RemoteStatus::Unreadable(format!("remote.toml: {e}")),
+    };
+    let pending = match crate::remote::read_pending(store) {
+        Ok(p) => p,
+        Err(e) => return RemoteStatus::Unreadable(format!("remote-pending.jsonl: {e}")),
+    };
+    let now = chrono::Utc::now();
+    let oldest = pending.iter().map(|e| e.created_at).min();
+    let oldest_age_days = oldest.map(|t| now.signed_duration_since(t).num_days().max(0));
+    let health = match oldest_age_days {
+        None => RemoteHealth::Ok,
+        Some(d) if d >= thresholds.unhealthy_days => RemoteHealth::Unhealthy,
+        Some(d) if d >= thresholds.warn_days => RemoteHealth::Warn,
+        Some(_) => RemoteHealth::Ok,
+    };
+    RemoteStatus::Enabled {
+        s3_url: cfg.s3_url(),
+        backlog: pending.len(),
+        oldest_age_days,
+        health,
+    }
 }
 
 fn assess_crypto(store: &Store) -> CryptoStatus {
@@ -339,6 +396,15 @@ impl DoctorReport {
             ShimStatus::Unreadable { .. } => return Some("shim file is unreadable"),
             ShimStatus::Stale { .. } => return Some("shim points at stale reflogless binary"),
         }
+        match &self.remote {
+            RemoteStatus::Disabled => {}
+            RemoteStatus::Enabled {
+                health: RemoteHealth::Unhealthy,
+                ..
+            } => return Some("remote backlog past unhealthy threshold"),
+            RemoteStatus::Enabled { .. } => {}
+            RemoteStatus::Unreadable(_) => return Some("remote state unreadable"),
+        }
         None
     }
 
@@ -429,6 +495,36 @@ impl DoctorReport {
             CryptoStatus::RoundtripFailed(err) => format!("ROUNDTRIP FAILED: {err}"),
         };
         let _ = writeln!(s, "  encryption          : {crypto_label}");
+        match &self.remote {
+            RemoteStatus::Disabled => {
+                let _ = writeln!(s, "  remote              : disabled");
+            }
+            RemoteStatus::Enabled {
+                s3_url,
+                backlog,
+                oldest_age_days,
+                health,
+            } => {
+                let _ = writeln!(s, "  remote              : enabled ({s3_url})");
+                let oldest_label = match oldest_age_days {
+                    None => "no backlog".to_string(),
+                    Some(0) => "oldest <1d".to_string(),
+                    Some(d) => format!("oldest {d}d"),
+                };
+                let health_label = match health {
+                    RemoteHealth::Ok => "ok",
+                    RemoteHealth::Warn => "WARN",
+                    RemoteHealth::Unhealthy => "UNHEALTHY",
+                };
+                let _ = writeln!(
+                    s,
+                    "  remote.backlog      : {backlog} pending uploads, {oldest_label} ({health_label})"
+                );
+            }
+            RemoteStatus::Unreadable(err) => {
+                let _ = writeln!(s, "  remote              : UNREADABLE ({err})");
+            }
+        }
         let _ = writeln!(
             s,
             "  overall             : {}",
@@ -598,6 +694,137 @@ mod tests {
             "report={report:#?}"
         );
         assert!(report.render().contains("recent hook errors"));
+    }
+
+    #[test]
+    fn doctor_reports_remote_disabled_by_default() {
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        let report = run(&repo, &store).unwrap();
+        assert_eq!(report.remote, RemoteStatus::Disabled);
+        assert!(report.render().contains("remote              : disabled"));
+    }
+
+    #[test]
+    fn doctor_reports_remote_enabled_empty_backlog_is_healthy() {
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        let rc = crate::remote_config::RemoteConfig {
+            bucket: "mb".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            path_style: false,
+            key_prefix: "host/".to_string(),
+        };
+        rc.save(&store).unwrap();
+        let report = run(&repo, &store).unwrap();
+        match &report.remote {
+            RemoteStatus::Enabled {
+                backlog: 0,
+                oldest_age_days: None,
+                health: RemoteHealth::Ok,
+                ..
+            } => {}
+            other => panic!("expected enabled+empty+ok, got {other:?}"),
+        }
+        assert!(report.render().contains("remote              : enabled"));
+        assert!(report
+            .render()
+            .contains("0 pending uploads, no backlog (ok)"));
+    }
+
+    #[test]
+    fn doctor_flags_remote_backlog_past_unhealthy_threshold() {
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        hooks::install(&repo, &store.root.join("hook-errors.log")).unwrap();
+        let rc = crate::remote_config::RemoteConfig {
+            bucket: "mb".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            path_style: false,
+            key_prefix: "host/".to_string(),
+        };
+        rc.save(&store).unwrap();
+        // Seed a pending entry whose created_at is 100 days ago — past the
+        // 60-day unhealthy default. We bypass append_pending so we can pin
+        // the timestamp; this still exercises the on-disk JSONL parser.
+        let stale = crate::remote::PendingEntry {
+            manifest_id: "stale".to_string(),
+            blob_digests: vec!["sha:x".to_string()],
+            created_at: chrono::Utc::now() - chrono::Duration::days(100),
+        };
+        let path = store.remote_pending_path();
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&stale).unwrap()),
+        )
+        .unwrap();
+
+        let report = run(&repo, &store).unwrap();
+        match &report.remote {
+            RemoteStatus::Enabled {
+                backlog: 1,
+                oldest_age_days: Some(d),
+                health: RemoteHealth::Unhealthy,
+                ..
+            } if *d >= 60 => {}
+            other => panic!("expected enabled+unhealthy, got {other:?}"),
+        }
+        assert_eq!(
+            report.first_failure(),
+            Some("remote backlog past unhealthy threshold")
+        );
+        assert!(report.render().contains("UNHEALTHY"));
+    }
+
+    #[test]
+    fn doctor_warns_remote_backlog_past_warn_threshold_but_stays_healthy_overall() {
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        hooks::install(&repo, &store.root.join("hook-errors.log")).unwrap();
+        let rc = crate::remote_config::RemoteConfig {
+            bucket: "mb".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            path_style: false,
+            key_prefix: "host/".to_string(),
+        };
+        rc.save(&store).unwrap();
+        let warn = crate::remote::PendingEntry {
+            manifest_id: "warn".to_string(),
+            blob_digests: vec!["sha:y".to_string()],
+            created_at: chrono::Utc::now() - chrono::Duration::days(20),
+        };
+        let path = store.remote_pending_path();
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&warn).unwrap()),
+        )
+        .unwrap();
+
+        let report = run(&repo, &store).unwrap();
+        match &report.remote {
+            RemoteStatus::Enabled {
+                health: RemoteHealth::Warn,
+                ..
+            } => {}
+            other => panic!("expected enabled+warn, got {other:?}"),
+        }
+        // Warn is informational; overall stays healthy modulo other checks.
+        assert_ne!(
+            report.first_failure(),
+            Some("remote backlog past unhealthy threshold")
+        );
+        assert!(report.render().contains("WARN"));
     }
 
     #[test]
@@ -899,6 +1126,7 @@ mod tests {
                 pid: std::process::id(),
             },
             crypto_status: CryptoStatus::NotProvisioned,
+            remote: RemoteStatus::Disabled,
         };
         assert_eq!(
             isolated.first_failure(),
