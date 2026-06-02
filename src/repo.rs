@@ -46,6 +46,54 @@ impl Repo {
         Ok(())
     }
 
+    /// Resolve the actual `.git` directory, honoring worktree gitfiles.
+    ///
+    /// For a primary worktree, `repo.root/.git` is a directory. For a linked
+    /// worktree (`git worktree add`), it is a file containing `gitdir: <path>`
+    /// pointing at `main-clone/.git/worktrees/<name>/`. We need the resolved
+    /// path so `is_git_busy` checks fire against the correct rebase/merge state.
+    pub fn git_dir(&self) -> PathBuf {
+        let g = self.root.join(".git");
+        if let Ok(meta) = std::fs::metadata(&g) {
+            if meta.is_file() {
+                if let Ok(content) = std::fs::read_to_string(&g) {
+                    for line in content.lines() {
+                        if let Some(rest) = line.strip_prefix("gitdir:") {
+                            let p = PathBuf::from(rest.trim());
+                            if p.is_absolute() {
+                                return p;
+                            }
+                            return self.root.join(p);
+                        }
+                    }
+                }
+            }
+        }
+        g
+    }
+
+    /// Returns `Some(reason)` if git is mid-operation and a snap right now
+    /// would capture transient half-applied state (conflict markers, rebase
+    /// scratch). Hooks/shim/watcher all skip snap when this fires. See #40.
+    pub fn git_busy(&self) -> Option<String> {
+        let g = self.git_dir();
+        const SIGNALS: &[(&str, &str)] = &[
+            ("rebase-merge", "interactive rebase in progress"),
+            ("rebase-apply", "non-interactive rebase in progress"),
+            ("MERGE_HEAD", "merge in progress"),
+            ("CHERRY_PICK_HEAD", "cherry-pick in progress"),
+            ("REVERT_HEAD", "revert in progress"),
+            ("BISECT_LOG", "bisect in progress"),
+            ("index.lock", "another git process holds index.lock"),
+        ];
+        for (path, reason) in SIGNALS {
+            if g.join(path).exists() {
+                return Some((*reason).to_string());
+            }
+        }
+        None
+    }
+
     pub fn status_porcelain(&self) -> Result<Vec<StatusEntry>> {
         let out = Command::new("git")
             .arg("-C")
@@ -194,5 +242,68 @@ mod tests {
         let entries = parse_porcelain_z(buf);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path, PathBuf::from("after.txt"));
+    }
+
+    #[test]
+    fn git_busy_returns_none_on_clean_repo() {
+        let td = tempfile::TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(td.path())
+            .status()
+            .unwrap();
+        let repo = Repo::discover(td.path()).unwrap();
+        assert!(repo.git_busy().is_none());
+    }
+
+    #[test]
+    fn git_busy_detects_each_signal() {
+        for (file, expected) in [
+            ("rebase-merge", "interactive rebase"),
+            ("rebase-apply", "non-interactive rebase"),
+            ("MERGE_HEAD", "merge"),
+            ("CHERRY_PICK_HEAD", "cherry-pick"),
+            ("REVERT_HEAD", "revert"),
+            ("BISECT_LOG", "bisect"),
+            ("index.lock", "index.lock"),
+        ] {
+            let td = tempfile::TempDir::new().unwrap();
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .arg(td.path())
+                .status()
+                .unwrap();
+            let repo = Repo::discover(td.path()).unwrap();
+            // rebase-merge/rebase-apply are directories; the rest are files.
+            let target = repo.git_dir().join(file);
+            if file.starts_with("rebase-") {
+                std::fs::create_dir_all(&target).unwrap();
+            } else {
+                std::fs::write(&target, b"").unwrap();
+            }
+            let reason = repo.git_busy().expect("expected git_busy to fire");
+            assert!(
+                reason.contains(expected),
+                "for {file}, expected reason to mention {expected:?}, got {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_dir_resolves_worktree_gitfile() {
+        let td = tempfile::TempDir::new().unwrap();
+        let wt = td.path().join("wt");
+        let real_gitdir = td.path().join("main/.git/worktrees/wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&real_gitdir).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", real_gitdir.display()),
+        )
+        .unwrap();
+        let repo = Repo::discover(&wt).unwrap();
+        assert_eq!(repo.git_dir(), real_gitdir);
     }
 }

@@ -15,6 +15,10 @@ pub struct SnapshotResult {
     pub files_written: usize,
     pub bytes_written: u64,
     pub skipped: Vec<Skipped>,
+    /// `Some(reason)` when snap was skipped because git was mid-operation
+    /// (rebase, merge, cherry-pick, etc.). `files_written` is 0 and
+    /// `manifest_id`/`manifest_path` are empty in this case. See #40.
+    pub skipped_git_busy: Option<String>,
 }
 
 pub fn snap(
@@ -60,6 +64,19 @@ pub fn snap_with_config(
         ));
     }
     repo.assert_safe_ownership()?;
+    // Skip snap when git is mid-rebase/merge/cherry-pick/bisect or holds
+    // index.lock — snapshotting half-applied state captures conflict markers
+    // as if they were user content. See issue #40.
+    if let Some(reason) = repo.git_busy() {
+        return Ok(SnapshotResult {
+            manifest_id: String::new(),
+            manifest_path: PathBuf::new(),
+            files_written: 0,
+            bytes_written: 0,
+            skipped: Vec::new(),
+            skipped_git_busy: Some(reason),
+        });
+    }
     // Serialize concurrent snaps against this store. Hooks/shim block; this
     // covers the case where shim and a post-commit hook fire near-simultaneously
     // on a long-running rebase. The future watcher daemon (#30) acquires
@@ -121,6 +138,7 @@ pub fn snap_with_config(
         files_written: files.len(),
         bytes_written: bytes,
         skipped,
+        skipped_git_busy: None,
     })
 }
 
@@ -799,6 +817,54 @@ mod tests {
         fs::remove_file(repo.root.join("empty")).unwrap();
         restore(&repo, &store, &s.manifest_id, &[], false).unwrap();
         assert_eq!(fs::read(repo.root.join("empty")).unwrap(), b"");
+    }
+
+    #[test]
+    fn snap_skips_when_git_is_rebasing() {
+        // Pins the git-busy gate wiring inside snap_with_config (#40).
+        // Removing the gate makes snap proceed and capture a manifest with
+        // the rebase-merge artifacts visible.
+        let workdir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let repo = make_repo(workdir.path());
+        let store = Store::for_repo_with_base(&repo, data_dir.path().to_path_buf()).unwrap();
+        fs::write(repo.root.join("file"), b"hi").unwrap();
+        fs::create_dir_all(repo.root.join(".git").join("rebase-merge")).unwrap();
+        let r = snap(&repo, &store, "manual", None).unwrap();
+        assert!(r.skipped_git_busy.is_some(), "should have skipped");
+        assert!(
+            r.skipped_git_busy.as_deref().unwrap().contains("rebase"),
+            "reason should mention rebase, got {:?}",
+            r.skipped_git_busy
+        );
+        assert_eq!(r.files_written, 0);
+        assert!(r.manifest_id.is_empty());
+        assert!(store.list_manifests_lenient().unwrap().0.is_empty());
+    }
+
+    #[test]
+    fn snap_skips_when_index_lock_is_held() {
+        let workdir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let repo = make_repo(workdir.path());
+        let store = Store::for_repo_with_base(&repo, data_dir.path().to_path_buf()).unwrap();
+        fs::write(repo.root.join("file"), b"hi").unwrap();
+        fs::write(repo.root.join(".git").join("index.lock"), b"").unwrap();
+        let r = snap(&repo, &store, "manual", None).unwrap();
+        assert!(r.skipped_git_busy.is_some());
+        assert_eq!(r.files_written, 0);
+    }
+
+    #[test]
+    fn snap_proceeds_when_git_is_idle() {
+        let workdir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let repo = make_repo(workdir.path());
+        let store = Store::for_repo_with_base(&repo, data_dir.path().to_path_buf()).unwrap();
+        fs::write(repo.root.join("file"), b"hi").unwrap();
+        let r = snap(&repo, &store, "manual", None).unwrap();
+        assert!(r.skipped_git_busy.is_none());
+        assert_eq!(r.files_written, 1);
     }
 
     #[test]
