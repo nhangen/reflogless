@@ -481,7 +481,9 @@ pub fn run_with_shutdown(
         let _ = write_state(store, &state);
         last_heartbeat = Instant::now();
         // Re-check shutdown after the snap — if SIGTERM arrived mid-debounce,
-        // exit now rather than blocking on another event.
+        // exit now rather than blocking on another event. `write_state`
+        // already fired above (line just above), so doctor sees the post-snap
+        // state on next read.
         if shutdown.load(Ordering::Relaxed) {
             return Ok(());
         }
