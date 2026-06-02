@@ -324,6 +324,10 @@ fn run_init(
 }
 
 fn print_snap_result(label: Option<&str>, r: &SnapshotResult) {
+    if let Some(reason) = &r.skipped_git_busy {
+        eprintln!("reflogless: skipped snap — {reason}");
+        return;
+    }
     match label {
         Some(l) => println!("{l} {}", r.manifest_id),
         None => println!("{}", r.manifest_id),
