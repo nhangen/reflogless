@@ -15,6 +15,8 @@ pub const RECIPIENT_FILENAME: &str = "recipient.txt";
 pub const INSECURE_KEY_MARKER: &str = "insecure-file-key";
 pub const REPO_ORIGIN_FILENAME: &str = "repo_origin.txt";
 pub const SNAP_LOCK_FILENAME: &str = ".snap.lock";
+pub const REMOTE_LOCK_FILENAME: &str = ".remote.lock";
+pub const REMOTE_PENDING_FILENAME: &str = "remote-pending.jsonl";
 
 /// Acquisition mode for the per-store snap lock.
 ///
@@ -32,6 +34,14 @@ pub enum SnapLockMode {
 /// Releases when dropped (file close releases the OS-level lock). The path
 /// stays on disk between acquisitions — only the lock state is process-scoped.
 pub struct SnapLock {
+    _file: fs::File,
+}
+
+/// RAII guard around `<store-root>/.remote.lock`. Serializes appends to the
+/// remote-pending log against the pusher's read-and-rewrite cycle so
+/// concurrent snap-time appends don't write into a stale offset of a file
+/// the pusher is rewriting (issue #31 audit HIGH-2).
+pub struct RemoteLock {
     _file: fs::File,
 }
 
@@ -124,6 +134,39 @@ impl Store {
                 Err(e) => Err(Error::io(&p, e)),
             },
         }
+    }
+
+    /// Acquire the per-store remote-pending log lock. Mirrors `acquire_snap_lock`
+    /// but at `<root>/.remote.lock`. Snap-time appends use `TryOnce` — if the
+    /// pusher is currently draining the log, skip the append; the entry will
+    /// be re-derived from the manifest on the next push (deduped via
+    /// `head_blob`). The pusher itself uses `Block`.
+    pub fn acquire_remote_lock(&self, mode: SnapLockMode) -> Result<Option<RemoteLock>> {
+        use fs4::fs_std::FileExt;
+        let p = self.root.join(REMOTE_LOCK_FILENAME);
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&p)
+            .map_err(|e| Error::io(&p, e))?;
+        set_file_perms(&p)?;
+        match mode {
+            SnapLockMode::Block => {
+                file.lock_exclusive().map_err(|e| Error::io(&p, e))?;
+                Ok(Some(RemoteLock { _file: file }))
+            }
+            SnapLockMode::TryOnce => match file.try_lock_exclusive() {
+                Ok(true) => Ok(Some(RemoteLock { _file: file })),
+                Ok(false) => Ok(None),
+                Err(e) => Err(Error::io(&p, e)),
+            },
+        }
+    }
+
+    pub fn remote_pending_path(&self) -> PathBuf {
+        self.root.join(REMOTE_PENDING_FILENAME)
     }
 
     /// Persist the origin repo path so `list --all` can show it. Idempotent —
