@@ -165,6 +165,23 @@ pub fn snap_with_config_lock_mode(
         });
     }
     let manifest_path = store.write_manifest(&manifest)?;
+
+    // Per-snap remote-pending append (#31). Cheap presence check first so
+    // snaps without a configured remote pay zero cost (no toml read, no lock
+    // acquisition). `append_pending` uses TryOnce — if a `remote push` is
+    // currently draining, the entry is skipped and re-derived from the manifest
+    // on the next push (deduped via head_blob).
+    if crate::remote_config::is_configured(&store.root) {
+        let entry = crate::remote::PendingEntry {
+            manifest_id: id.clone(),
+            blob_digests: manifest.entries.iter().map(|e| e.blob.clone()).collect(),
+            created_at: chrono::Utc::now(),
+        };
+        if let Err(e) = crate::remote::append_pending(store, &entry) {
+            eprintln!("reflogless: warning: remote-pending append failed: {e}");
+        }
+    }
+
     Ok(SnapshotResult {
         manifest_id: id,
         manifest_path,
@@ -383,6 +400,54 @@ mod tests {
             fs::read(repo.root.join("hello.txt")).unwrap(),
             b"hello world\n"
         );
+    }
+
+    #[test]
+    fn snap_with_remote_configured_appends_pending_entry() {
+        let workdir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let repo = make_repo(workdir.path());
+        let store = Store::for_repo_with_base(&repo, data_dir.path().to_path_buf()).unwrap();
+
+        // Seed a remote.toml so `is_configured` returns true. Content shape
+        // doesn't matter for this test — we're only verifying the snap-time
+        // hook fires.
+        fs::write(
+            store
+                .root
+                .join(crate::remote_config::REMOTE_CONFIG_FILENAME),
+            b"bucket = \"x\"\nregion = \"us-east-1\"\nkey_prefix = \"host/\"\n",
+        )
+        .unwrap();
+
+        fs::write(repo.root.join("hello.txt"), b"hello world\n").unwrap();
+        let snap_res = snap(&repo, &store, "manual", None).unwrap();
+        assert!(snap_res.files_written >= 1);
+
+        let pending = crate::remote::read_pending(&store).unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "snap with remote-configured did not append"
+        );
+        assert_eq!(pending[0].manifest_id, snap_res.manifest_id);
+        assert!(
+            !pending[0].blob_digests.is_empty(),
+            "pending entry has no blob digests"
+        );
+    }
+
+    #[test]
+    fn snap_without_remote_configured_skips_append() {
+        let workdir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let repo = make_repo(workdir.path());
+        let store = Store::for_repo_with_base(&repo, data_dir.path().to_path_buf()).unwrap();
+
+        fs::write(repo.root.join("hello.txt"), b"hello world\n").unwrap();
+        snap(&repo, &store, "manual", None).unwrap();
+
+        assert!(!store.remote_pending_path().exists());
     }
 
     #[test]
