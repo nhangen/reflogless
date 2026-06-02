@@ -62,7 +62,14 @@ impl Store {
         set_dir_perms(&objects)?;
         set_dir_perms(&snapshots)?;
         let s = Self { root, crypto: None };
-        s.save_repo_origin(&repo.root)?;
+        // Origin recording is cosmetic-metadata for `list --all`; a failure here
+        // must not abort `reflogless snap` — the store itself is still valid.
+        if let Err(e) = s.save_repo_origin(&repo.root) {
+            eprintln!(
+                "reflogless: warning: could not record origin path ({e}); \
+                 store will show as legacy in `list --all` until next write succeeds"
+            );
+        }
         Ok(s)
     }
 
@@ -520,6 +527,10 @@ pub struct StoreSummary {
     pub state: StoreOriginState,
     pub snapshot_count: usize,
     pub snapshot_ids: Vec<String>,
+    /// True when the snapshots/ dir couldn't be read at scan time. The count
+    /// is 0 in that case; the printer should distinguish "no snapshots" from
+    /// "snapshots unreadable" so a user doesn't act on a false negative.
+    pub snapshots_unreadable: bool,
 }
 
 /// Walk `<base>/reflogless/<16-hex>/` and summarize each store. Skips entries
@@ -538,7 +549,13 @@ pub fn list_all_stores(base: &Path) -> Result<Vec<StoreSummary>> {
     for ent in entries {
         let ent = match ent {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(e) => {
+                eprintln!(
+                    "reflogless: warning: skipping unreadable entry under {}: {e}",
+                    root.display()
+                );
+                continue;
+            }
         };
         let path = ent.path();
         if !path.is_dir() {
@@ -565,21 +582,32 @@ pub fn list_all_stores(base: &Path) -> Result<Vec<StoreSummary>> {
         };
 
         let snapshots_dir = path.join("snapshots");
-        let mut ids: Vec<String> = Vec::new();
-        if let Ok(dirit) = fs::read_dir(&snapshots_dir) {
-            for f in dirit.flatten() {
-                if let Some(id) = manifest_id_from_path(&f.path()) {
-                    ids.push(id);
+        let (ids, snapshots_unreadable) = match fs::read_dir(&snapshots_dir) {
+            Ok(dirit) => {
+                let mut v: Vec<String> = Vec::new();
+                for f in dirit.flatten() {
+                    if let Some(id) = manifest_id_from_path(&f.path()) {
+                        v.push(id);
+                    }
                 }
+                v.sort();
+                (v, false)
             }
-        }
-        ids.sort();
+            Err(e) => {
+                eprintln!(
+                    "reflogless: warning: cannot read {}: {e}",
+                    snapshots_dir.display()
+                );
+                (Vec::new(), true)
+            }
+        };
 
         out.push(StoreSummary {
             store_id: name,
             state,
             snapshot_count: ids.len(),
             snapshot_ids: ids,
+            snapshots_unreadable,
         });
     }
 
@@ -1041,8 +1069,12 @@ mod tests {
     #[test]
     fn list_all_stores_skips_non_repo_id_directory_names() {
         let td = TempDir::new().unwrap();
+        // non-hex
         fs::create_dir_all(td.path().join("reflogless").join("not-a-hex")).unwrap();
         fs::create_dir_all(td.path().join("reflogless").join("ZZZZZZZZZZZZZZZZ")).unwrap();
+        // boundary: hex but wrong length
+        fs::create_dir_all(td.path().join("reflogless").join("deadbeef")).unwrap();
+        fs::create_dir_all(td.path().join("reflogless").join("deadbeefdeadbeefdead")).unwrap();
         seed_store(td.path(), "eeeeeeeeeeeeeeee", None, &[], false);
         let stores = list_all_stores(td.path()).unwrap();
         assert_eq!(stores.len(), 1);
@@ -1098,5 +1130,16 @@ mod tests {
         store.save_repo_origin(&td.path().join("a")).unwrap();
         store.save_repo_origin(&td.path().join("b")).unwrap();
         assert_eq!(store.read_repo_origin().unwrap(), td.path().join("b"));
+    }
+
+    #[test]
+    fn for_repo_with_base_records_origin_path() {
+        let td = TempDir::new().unwrap();
+        let repo_root = td.path().join("a-repo");
+        fs::create_dir_all(repo_root.join(".git")).unwrap();
+        let repo = Repo::discover(&repo_root).unwrap();
+        let base = td.path().join("data");
+        let store = Store::for_repo_with_base(&repo, base).unwrap();
+        assert_eq!(store.read_repo_origin(), Some(repo.root.clone()));
     }
 }

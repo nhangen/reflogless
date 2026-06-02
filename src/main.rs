@@ -486,10 +486,14 @@ fn run_list_all() -> reflogless::Result<()> {
             StoreOriginState::Stale(p) => ("stale", p.display().to_string()),
             StoreOriginState::Legacy => ("legacy", s.store_id.clone()),
         };
-        println!(
-            "{}  {}  {} snapshots",
-            origin_label, state_label, s.snapshot_count,
-        );
+        if s.snapshots_unreadable {
+            println!("{}  {}  snapshots unreadable", origin_label, state_label,);
+        } else {
+            println!(
+                "{}  {}  {} snapshots",
+                origin_label, state_label, s.snapshot_count,
+            );
+        }
         for id in &s.snapshot_ids {
             println!("  {}", id);
         }
