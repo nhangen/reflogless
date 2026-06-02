@@ -20,6 +20,7 @@ use crate::error::{Error, Result};
 use crate::repo::Repo;
 use crate::store::Store;
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 /// Outcome of an install or uninstall operation. Both fields populated so the
