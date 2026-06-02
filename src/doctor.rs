@@ -306,8 +306,19 @@ impl DoctorReport {
         if !self.recent_shim_errors.is_empty() {
             return Some("recent shim errors logged");
         }
-        if matches!(self.watcher, crate::watch::WatcherLiveness::StateUnreadable) {
-            return Some("watcher state file unreadable");
+        match &self.watcher {
+            // pid reuse across reboot — state file claims a running daemon
+            // but it's actually gone. This is the whole reason boot_id
+            // liveness exists; failing the doctor check is the point.
+            crate::watch::WatcherLiveness::Stale { .. } => {
+                return Some("watcher stale (pid reused after reboot)");
+            }
+            crate::watch::WatcherLiveness::StateUnreadable => {
+                return Some("watcher state file unreadable");
+            }
+            crate::watch::WatcherLiveness::NeverInstalled
+            | crate::watch::WatcherLiveness::Running { .. }
+            | crate::watch::WatcherLiveness::Stopped { .. } => {}
         }
         match &self.crypto_status {
             CryptoStatus::NotProvisioned => {}
@@ -842,6 +853,57 @@ mod tests {
             "watcher             : running (pid {}",
             std::process::id()
         )));
+    }
+
+    #[test]
+    fn doctor_reports_stale_watcher_as_unhealthy() {
+        let td = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(td.path())
+            .status()
+            .unwrap();
+        let repo = Repo::discover(td.path()).unwrap();
+        let store = Store::for_repo_with_base(&repo, data_dir.path().to_path_buf()).unwrap();
+        // Synthetic stale state: our pid is alive but boot_id is forged.
+        let mut s = crate::watch::WatchState::new();
+        s.pid = std::process::id();
+        s.boot_id = "synthetic-prior-boot".to_string();
+        crate::watch::write_state(&store, &s).unwrap();
+        let report = run(&repo, &store).unwrap();
+        assert!(
+            matches!(report.watcher, crate::watch::WatcherLiveness::Stale { .. }),
+            "expected Stale, got {:?}",
+            report.watcher
+        );
+        assert!(
+            !report.is_healthy(),
+            "Stale watcher must fail doctor — pid reuse after reboot is the whole point of boot_id"
+        );
+        // The fixture doesn't install hooks so the first failure is "hook
+        // missing"; what we're asserting is that Stale is *somewhere* in the
+        // unhealthy set — exercise via direct DoctorReport construction.
+        let isolated = DoctorReport {
+            hooks: vec![],
+            store_size_bytes: Ok(0),
+            snapshots: Ok(0),
+            corrupt_snapshots: 0,
+            shim_status: ShimStatus::Off,
+            canary_roundtrip: true,
+            recent_hook_errors: vec![],
+            recent_shim_errors: vec![],
+            recent_gate_skips: vec![],
+            watcher: crate::watch::WatcherLiveness::Stale {
+                pid: std::process::id(),
+            },
+            crypto_status: CryptoStatus::NotProvisioned,
+        };
+        assert_eq!(
+            isolated.first_failure(),
+            Some("watcher stale (pid reused after reboot)")
+        );
     }
 
     #[test]
