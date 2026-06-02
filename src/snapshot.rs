@@ -68,6 +68,7 @@ pub fn snap_with_config(
     // index.lock — snapshotting half-applied state captures conflict markers
     // as if they were user content. See issue #40.
     if let Some(reason) = repo.git_busy() {
+        log_gate_skip(store, event, &reason);
         return Ok(SnapshotResult {
             manifest_id: String::new(),
             manifest_path: PathBuf::new(),
@@ -227,6 +228,62 @@ pub struct RestoreResult {
 
 fn make_id(event: &str) -> String {
     format!("{}-{}", Utc::now().format("%Y%m%dT%H%M%S%3fZ"), event)
+}
+
+const GATE_SKIP_LOG_FILENAME: &str = "skipped_git_busy.jsonl";
+const GATE_SKIP_LOG_DIR: &str = "events";
+const GATE_SKIP_LOG_MAX_BYTES: u64 = 1_048_576;
+
+/// Append one JSONL line per gate firing to `<store>/events/skipped_git_busy.jsonl`.
+/// Best-effort: failures here never propagate (gate already returned a valid skip
+/// result to the caller). Size-capped via head-truncation: when the file exceeds
+/// GATE_SKIP_LOG_MAX_BYTES, drop the oldest 50%.
+fn log_gate_skip(store: &Store, event: &str, reason: &str) {
+    let dir = store.root.join(GATE_SKIP_LOG_DIR);
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join(GATE_SKIP_LOG_FILENAME);
+    let ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let line = format!(
+        "{{\"ts\":\"{}\",\"event\":\"{}\",\"reason\":\"{}\"}}\n",
+        ts,
+        json_escape(event),
+        json_escape(reason),
+    );
+    use std::io::Write;
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(line.as_bytes());
+    }
+    if let Ok(meta) = fs::metadata(&path) {
+        if meta.len() > GATE_SKIP_LOG_MAX_BYTES {
+            let _ = truncate_head(&path);
+        }
+    }
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn truncate_head(path: &Path) -> Result<()> {
+    let body = fs::read_to_string(path).map_err(|e| Error::io(path, e))?;
+    let lines: Vec<&str> = body.lines().collect();
+    let keep_from = lines.len() / 2;
+    let trimmed = lines[keep_from..].join("\n") + "\n";
+    atomic_write(path, trimmed.as_bytes())
 }
 
 #[cfg(unix)]
@@ -865,6 +922,74 @@ mod tests {
         let r = snap(&repo, &store, "manual", None).unwrap();
         assert!(r.skipped_git_busy.is_none());
         assert_eq!(r.files_written, 1);
+    }
+
+    #[test]
+    fn gate_skip_appends_event_log() {
+        let workdir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let repo = make_repo(workdir.path());
+        let store = Store::for_repo_with_base(&repo, data_dir.path().to_path_buf()).unwrap();
+        fs::create_dir_all(repo.root.join(".git").join("rebase-merge")).unwrap();
+        let r = snap(&repo, &store, "post-commit", None).unwrap();
+        assert!(r.skipped_git_busy.is_some());
+        let log = store.root.join("events").join("skipped_git_busy.jsonl");
+        assert!(log.exists(), "gate skip should write event log");
+        let body = fs::read_to_string(&log).unwrap();
+        assert_eq!(body.lines().count(), 1, "one line per skip; got {body:?}");
+        assert!(body.contains("\"event\":\"post-commit\""));
+        assert!(body.contains("\"reason\":\"interactive rebase in progress\""));
+        assert!(body.contains("\"ts\":\""));
+        // Second skip appends, doesn't overwrite.
+        let _ = snap(&repo, &store, "manual", None).unwrap();
+        let body2 = fs::read_to_string(&log).unwrap();
+        assert_eq!(body2.lines().count(), 2);
+    }
+
+    #[test]
+    fn gate_skip_log_escapes_special_chars_in_reason() {
+        // Crafted reason via custom repo: index.lock with a quote in event name.
+        let workdir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let repo = make_repo(workdir.path());
+        let store = Store::for_repo_with_base(&repo, data_dir.path().to_path_buf()).unwrap();
+        fs::write(repo.root.join(".git").join("index.lock"), b"").unwrap();
+        let r = snap(&repo, &store, "weird\"event\nname", None).unwrap();
+        assert!(r.skipped_git_busy.is_some());
+        let body =
+            fs::read_to_string(store.root.join("events").join("skipped_git_busy.jsonl")).unwrap();
+        assert!(
+            body.contains("weird\\\"event\\nname"),
+            "event escaped: {body:?}"
+        );
+    }
+
+    #[test]
+    fn gate_skip_log_truncates_head_when_oversized() {
+        use super::{GATE_SKIP_LOG_DIR, GATE_SKIP_LOG_FILENAME};
+        let workdir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let repo = make_repo(workdir.path());
+        let store = Store::for_repo_with_base(&repo, data_dir.path().to_path_buf()).unwrap();
+        fs::create_dir_all(repo.root.join(".git").join("rebase-merge")).unwrap();
+        let log_dir = store.root.join(GATE_SKIP_LOG_DIR);
+        fs::create_dir_all(&log_dir).unwrap();
+        let log_path = log_dir.join(GATE_SKIP_LOG_FILENAME);
+        // Seed an oversized log with 1.5 MB of lines.
+        let line = "{\"ts\":\"2026-01-01T00:00:00Z\",\"event\":\"x\",\"reason\":\"old\"}\n";
+        let copies = (1_500_000 / line.len()) + 1;
+        fs::write(&log_path, line.repeat(copies)).unwrap();
+        let before = fs::metadata(&log_path).unwrap().len();
+        assert!(before > 1_048_576);
+        let _ = snap(&repo, &store, "post-commit", None).unwrap();
+        let after = fs::metadata(&log_path).unwrap().len();
+        assert!(
+            after < before / 2 + 200,
+            "truncated; before={before} after={after}"
+        );
+        // The newest line (just-written post-commit) must still be there.
+        let body = fs::read_to_string(&log_path).unwrap();
+        assert!(body.contains("post-commit"));
     }
 
     #[test]
