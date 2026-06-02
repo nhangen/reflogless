@@ -11,5 +11,6 @@ pub mod shim;
 pub mod snapshot;
 pub mod store;
 pub mod watch;
+pub mod watch_install;
 
 pub use error::{Error, Result};

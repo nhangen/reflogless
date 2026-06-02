@@ -29,7 +29,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum WatchAction {
-    /// Run the watcher loop in the foreground until SIGTERM / SIGINT.
+    /// Install the watcher into the per-user supervisor (launchd on macOS,
+    /// systemd --user on Linux). Daemon starts immediately + persists across
+    /// reboots. macOS: writes ~/Library/LaunchAgents/com.nhangen.reflogless.<repo>.plist
+    /// + launchctl bootstrap. Linux: not yet implemented (#30 slice 6).
+    Install,
+    /// Remove the watcher from the supervisor + delete the unit/plist file.
+    Uninstall,
+    /// Run the watcher loop in the foreground until SIGTERM / SIGINT. Used by
+    /// the supervisor; can also be invoked directly for testing.
     Run,
     /// Print the last-written heartbeat state file (raw JSON).
     Status,
@@ -93,9 +101,9 @@ enum Cmd {
     },
     /// Verify install + store + canary.
     Doctor,
-    /// Filesystem-watcher daemon (slice 3 of #30). No installer yet —
-    /// invoke `watch run` directly to start the loop in the foreground;
-    /// `watch status` reads the heartbeat state file.
+    /// Filesystem-watcher daemon (#30). macOS launchd installer ships;
+    /// Linux systemd installer is #30 slice 6. Use `install` for auto-start;
+    /// `run` for foreground; `status` for the heartbeat state file.
     Watch {
         #[command(subcommand)]
         action: WatchAction,
@@ -278,6 +286,22 @@ fn run() -> reflogless::Result<()> {
             }
         }
         Cmd::Watch { action } => match action {
+            WatchAction::Install => {
+                let report = reflogless::watch_install::install(&repo, &store)?;
+                println!(
+                    "installed watcher: {} (plist at {})",
+                    report.label,
+                    report.unit_path.display(),
+                );
+            }
+            WatchAction::Uninstall => {
+                let report = reflogless::watch_install::uninstall(&repo, &store)?;
+                println!(
+                    "uninstalled watcher: {} (removed {})",
+                    report.label,
+                    report.unit_path.display(),
+                );
+            }
             WatchAction::Run => {
                 let cfg = Config::load_or_default(&repo.root)?;
                 let wcfg = reflogless::watch::WatchConfig::from_config(&cfg.watch);
