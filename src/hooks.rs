@@ -276,7 +276,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn hook_fallback_produces_no_stderr_when_log_dir_absent() {
-        use std::io::Write;
         use std::process::Command;
         let td = TempDir::new().unwrap();
         let log_dir = td.path().join("store");
