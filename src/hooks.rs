@@ -266,11 +266,40 @@ mod tests {
     }
 
     #[test]
-    fn hook_body_uses_log_path_when_dir_present() {
+    fn hook_body_generates_log_dir_check() {
         let log = std::path::PathBuf::from("/tmp/somestore/hook-errors.log");
         let body = build_hook_body("reference-transaction", &log, None);
         assert!(body.contains("__REFLOGLESS_LOG_DIR='/tmp/somestore'"));
         assert!(body.contains("__REFLOGLESS_DEFAULT_LOG='/tmp/somestore/hook-errors.log'"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_fallback_produces_no_stderr_when_log_dir_absent() {
+        use std::io::Write;
+        use std::process::Command;
+        let td = TempDir::new().unwrap();
+        let log_dir = td.path().join("store");
+        let log = log_dir.join("hook-errors.log");
+        let body = build_hook_body("reference-transaction", &log, None);
+        let script = td.path().join("test-hook.sh");
+        fs::write(&script, &body).unwrap();
+        make_executable(&script).unwrap();
+        // Execute the hook with the log dir absent — must emit no stderr.
+        let out = Command::new("sh")
+            .arg(&script)
+            .arg("prepared")
+            .stderr(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.is_empty(),
+            "expected no stderr when log dir absent, got: {stderr}"
+        );
     }
 
     #[test]
