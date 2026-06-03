@@ -12,7 +12,7 @@ pub const HOOKS: &[&str] = &[
 ];
 
 pub const MARKER: &str = "# reflogless-managed (do not edit manually)";
-pub const MARKER_VERSION: &str = "# reflogless-hook-version: 1";
+pub const MARKER_VERSION: &str = "# reflogless-hook-version: 2";
 
 #[derive(Debug)]
 pub struct InstallReport {
@@ -124,11 +124,19 @@ fn build_hook_body(hook: &str, hook_log_path: &Path, prior: Option<&Path>) -> St
     s.push_str(&format!("# hook: {hook}\n"));
     // Best-effort snap. Never block the underlying git op. Stderr is captured
     // to a per-store log so `reflogless doctor` can surface silent failures.
-    // The default log path is single-quote-escaped in a separate assignment
-    // (POSIX parameter expansion defaults do not honor inline single quotes
-    // when the whole expression is double-quoted).
+    // Guard against the install-time log dir being absent at runtime — e.g. a
+    // hook installed in WSL but triggered from Git-for-Windows on the same
+    // repo. Fall back to /dev/null so git ops stay silent instead of printing
+    // "No such file or directory" on every invocation.
+    let log_dir = hook_log_path.parent().unwrap_or(hook_log_path);
+    let log_dir_q = sh_squote(log_dir);
     let log_q = sh_squote(hook_log_path);
-    s.push_str(&format!("__REFLOGLESS_DEFAULT_LOG={log_q}\n"));
+    s.push_str(&format!("__REFLOGLESS_LOG_DIR={log_dir_q}\n"));
+    s.push_str("if [ -d \"$__REFLOGLESS_LOG_DIR\" ]; then\n");
+    s.push_str(&format!("  __REFLOGLESS_DEFAULT_LOG={log_q}\n"));
+    s.push_str("else\n");
+    s.push_str("  __REFLOGLESS_DEFAULT_LOG='/dev/null'\n");
+    s.push_str("fi\n");
     s.push_str("REFLOGLESS_HOOK_LOG=\"${REFLOGLESS_HOOK_LOG:-$__REFLOGLESS_DEFAULT_LOG}\"\n");
     s.push_str(&format!(
         "reflogless snap --event {hook} 2>>\"$REFLOGLESS_HOOK_LOG\" >/dev/null || true\n"
@@ -246,6 +254,23 @@ mod tests {
         let p = std::path::Path::new("/tmp/it's-a-path");
         let q = sh_squote(p);
         assert_eq!(q, "'/tmp/it'\\''s-a-path'");
+    }
+
+    #[test]
+    fn hook_body_falls_back_to_dev_null_when_log_dir_absent() {
+        let log = std::path::PathBuf::from("/nonexistent/dir/hook-errors.log");
+        let body = build_hook_body("reference-transaction", &log, None);
+        assert!(body.contains("__REFLOGLESS_LOG_DIR='/nonexistent/dir'"));
+        assert!(body.contains("__REFLOGLESS_DEFAULT_LOG='/dev/null'"));
+        assert!(body.contains("[ -d \"$__REFLOGLESS_LOG_DIR\" ]"));
+    }
+
+    #[test]
+    fn hook_body_uses_log_path_when_dir_present() {
+        let log = std::path::PathBuf::from("/tmp/somestore/hook-errors.log");
+        let body = build_hook_body("reference-transaction", &log, None);
+        assert!(body.contains("__REFLOGLESS_LOG_DIR='/tmp/somestore'"));
+        assert!(body.contains("__REFLOGLESS_DEFAULT_LOG='/tmp/somestore/hook-errors.log'"));
     }
 
     #[test]
