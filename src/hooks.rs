@@ -121,7 +121,12 @@ fn write_hook(
     Ok(())
 }
 
-fn build_hook_body(hook: &str, hook_log_path: &Path, repo_id: &str, prior: Option<&Path>) -> String {
+fn build_hook_body(
+    hook: &str,
+    hook_log_path: &Path,
+    repo_id: &str,
+    prior: Option<&Path>,
+) -> String {
     // Shell injection guard: repo_id is interpolated unescaped into the
     // generated script. `repo.id()` produces 16 hex chars; if that ever
     // changes, the format! sites below become a shell-injection surface.
@@ -168,9 +173,7 @@ fn build_hook_body(hook: &str, hook_log_path: &Path, repo_id: &str, prior: Optio
         "mkdir -p \"$(dirname \"$REFLOGLESS_HOOK_LOG\")\" 2>/dev/null \
          || REFLOGLESS_HOOK_LOG=\"$__REFLOGLESS_FALLBACK_LOG\"\n",
     );
-    s.push_str(
-        "[ -d \"$(dirname \"$REFLOGLESS_HOOK_LOG\")\" ] || REFLOGLESS_HOOK_LOG=/dev/null\n",
-    );
+    s.push_str("[ -d \"$(dirname \"$REFLOGLESS_HOOK_LOG\")\" ] || REFLOGLESS_HOOK_LOG=/dev/null\n");
     s.push_str(&format!(
         "reflogless snap --event {hook} 2>>\"$REFLOGLESS_HOOK_LOG\" >/dev/null || true\n"
     ));
@@ -400,10 +403,7 @@ mod tests {
     fn resolver_branch_home_picks_platform_default() {
         let home = TempDir::new().unwrap();
         let fb = TempDir::new().unwrap();
-        let got = resolved_log_path(
-            &[("HOME", home.path())],
-            &fb.path().join("install.log"),
-        );
+        let got = resolved_log_path(&[("HOME", home.path())], &fb.path().join("install.log"));
         let uname = Command::new("uname").arg("-s").output().unwrap();
         let uname_s = String::from_utf8_lossy(&uname.stdout).trim().to_string();
         let expected = match uname_s.as_str() {
@@ -443,7 +443,10 @@ mod tests {
         );
         let uname = Command::new("uname").arg("-s").output().unwrap();
         let uname_s = String::from_utf8_lossy(&uname.stdout).trim().to_string();
-        if uname_s.starts_with("MINGW") || uname_s.starts_with("MSYS") || uname_s.starts_with("CYGWIN") {
+        if uname_s.starts_with("MINGW")
+            || uname_s.starts_with("MSYS")
+            || uname_s.starts_with("CYGWIN")
+        {
             return;
         }
         let runtime_prefix = runtime_home.path().to_string_lossy().to_string();
