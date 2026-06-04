@@ -662,10 +662,16 @@ mod tests {
 
         let td = TempDir::new().unwrap();
         let data = TempDir::new().unwrap();
+        // Install-time hook_log_path lives in a separate tempdir from the
+        // runtime store root. If the hook ever falls back to the baked
+        // install-time path, errors land in `install_only` and doctor (which
+        // reads from `data`) sees nothing — pinning the runtime-resolution
+        // fix per `~/.claude/rules/test-the-fix-not-the-investigation.md`.
+        let install_only = TempDir::new().unwrap();
         let bin = TempDir::new().unwrap();
         let repo = init_repo(td.path());
         let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
-        hooks::install(&repo, &store.root.join("hook-errors.log")).unwrap();
+        hooks::install(&repo, &install_only.path().join("install-time.log")).unwrap();
 
         let fake = bin.path().join("reflogless");
         fs::write(
@@ -681,8 +687,22 @@ mod tests {
             bin.path().display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let status = Command::new(&hook).env("PATH", path).status().unwrap();
+        let status = Command::new(&hook)
+            .env("PATH", path)
+            .env("REFLOGLESS_DATA_DIR", data.path())
+            .status()
+            .unwrap();
         assert!(status.success(), "hook must remain best-effort");
+
+        let runtime_log = store.root.join("hook-errors.log");
+        assert!(
+            runtime_log.exists(),
+            "hook must write to runtime-resolved REFLOGLESS_DATA_DIR path, not install-time fallback"
+        );
+        assert!(
+            !install_only.path().join("install-time.log").exists(),
+            "hook must NOT write to install-time path when REFLOGLESS_DATA_DIR is set"
+        );
 
         let report = run(&repo, &store).unwrap();
         assert_eq!(report.first_failure(), Some("recent hook errors logged"));

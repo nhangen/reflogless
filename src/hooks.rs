@@ -50,6 +50,7 @@ pub fn hooks_dir(repo: &Repo) -> Result<PathBuf> {
 }
 
 pub fn install(repo: &Repo, hook_log_path: &Path) -> Result<InstallReport> {
+    let repo_id = repo.id();
     let dir = hooks_dir(repo)?;
     fs::create_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
     let mut installed = Vec::new();
@@ -59,7 +60,7 @@ pub fn install(repo: &Repo, hook_log_path: &Path) -> Result<InstallReport> {
         if path.exists() {
             let existing = fs::read_to_string(&path).map_err(|e| Error::io(&path, e))?;
             if existing.contains(MARKER) {
-                write_hook(&path, hook, hook_log_path, None)?;
+                write_hook(&path, hook, hook_log_path, &repo_id, None)?;
                 installed.push((*hook).to_string());
                 continue;
             }
@@ -68,10 +69,10 @@ pub fn install(repo: &Repo, hook_log_path: &Path) -> Result<InstallReport> {
             if !backup.exists() {
                 fs::copy(&path, &backup).map_err(|e| Error::io(&backup, e))?;
             }
-            write_hook(&path, hook, hook_log_path, Some(&backup))?;
+            write_hook(&path, hook, hook_log_path, &repo_id, Some(&backup))?;
             chained.push((*hook).to_string());
         } else {
-            write_hook(&path, hook, hook_log_path, None)?;
+            write_hook(&path, hook, hook_log_path, &repo_id, None)?;
             installed.push((*hook).to_string());
         }
     }
@@ -107,14 +108,32 @@ pub fn uninstall(repo: &Repo) -> Result<UninstallReport> {
     Ok(report)
 }
 
-fn write_hook(path: &Path, hook: &str, hook_log_path: &Path, prior: Option<&Path>) -> Result<()> {
-    let body = build_hook_body(hook, hook_log_path, prior);
+fn write_hook(
+    path: &Path,
+    hook: &str,
+    hook_log_path: &Path,
+    repo_id: &str,
+    prior: Option<&Path>,
+) -> Result<()> {
+    let body = build_hook_body(hook, hook_log_path, repo_id, prior);
     fs::write(path, &body).map_err(|e| Error::io(path, e))?;
     make_executable(path)?;
     Ok(())
 }
 
-fn build_hook_body(hook: &str, hook_log_path: &Path, prior: Option<&Path>) -> String {
+fn build_hook_body(
+    hook: &str,
+    hook_log_path: &Path,
+    repo_id: &str,
+    prior: Option<&Path>,
+) -> String {
+    // Shell injection guard: repo_id is interpolated unescaped into the
+    // generated script. `repo.id()` produces 16 hex chars; if that ever
+    // changes, the format! sites below become a shell-injection surface.
+    debug_assert!(
+        repo_id.len() == 16 && repo_id.bytes().all(|b| b.is_ascii_hexdigit()),
+        "repo_id must be 16 ascii hex chars; got {repo_id:?}"
+    );
     let mut s = String::new();
     s.push_str("#!/bin/sh\n");
     s.push_str(MARKER);
@@ -122,22 +141,39 @@ fn build_hook_body(hook: &str, hook_log_path: &Path, prior: Option<&Path>) -> St
     s.push_str(MARKER_VERSION);
     s.push('\n');
     s.push_str(&format!("# hook: {hook}\n"));
-    // Best-effort snap. Never block the underlying git op. Stderr is captured
-    // to a per-store log so `reflogless doctor` can surface silent failures.
-    // Guard against the install-time log dir being absent at runtime — e.g. a
-    // hook installed in WSL but triggered from Git-for-Windows on the same
-    // repo. Fall back to /dev/null so git ops stay silent instead of printing
-    // "No such file or directory" on every invocation.
-    let log_dir = hook_log_path.parent().unwrap_or(hook_log_path);
-    let log_dir_q = sh_squote(log_dir);
-    let log_q = sh_squote(hook_log_path);
-    s.push_str(&format!("__REFLOGLESS_LOG_DIR={log_dir_q}\n"));
-    s.push_str("if [ -d \"$__REFLOGLESS_LOG_DIR\" ]; then\n");
-    s.push_str(&format!("  __REFLOGLESS_DEFAULT_LOG={log_q}\n"));
-    s.push_str("else\n");
-    s.push_str("  __REFLOGLESS_DEFAULT_LOG='/dev/null'\n");
-    s.push_str("fi\n");
+    // Resolve the log path at hook *run* time, not install time, so a hook
+    // installed under one HOME (host) writes to the store another HOME
+    // (container) uses. Priority matches `store::base_data_dir`; install-time
+    // absolute path is the no-HOME fallback. Windows shells (MSYS/Cygwin)
+    // route to the fallback because `dirs::data_dir()` picks %APPDATA% there,
+    // which the POSIX branches can't replicate.
+    let fallback_q = sh_squote(hook_log_path);
+    s.push_str(&format!("__REFLOGLESS_FALLBACK_LOG={fallback_q}\n"));
+    s.push_str(&format!(
+        "if [ -n \"${{REFLOGLESS_DATA_DIR:-}}\" ]; then\n  \
+            __REFLOGLESS_DEFAULT_LOG=\"$REFLOGLESS_DATA_DIR/reflogless/{repo_id}/hook-errors.log\"\n\
+        elif [ -n \"${{XDG_DATA_HOME:-}}\" ]; then\n  \
+            __REFLOGLESS_DEFAULT_LOG=\"$XDG_DATA_HOME/reflogless/{repo_id}/hook-errors.log\"\n\
+        elif [ -n \"${{HOME:-}}\" ]; then\n  \
+            case \"$(uname -s 2>/dev/null)\" in\n    \
+                Darwin) __REFLOGLESS_DEFAULT_LOG=\"$HOME/Library/Application Support/reflogless/{repo_id}/hook-errors.log\" ;;\n    \
+                MINGW*|MSYS*|CYGWIN*) __REFLOGLESS_DEFAULT_LOG=\"$__REFLOGLESS_FALLBACK_LOG\" ;;\n    \
+                *) __REFLOGLESS_DEFAULT_LOG=\"$HOME/.local/share/reflogless/{repo_id}/hook-errors.log\" ;;\n  \
+            esac\n\
+        else\n  \
+            __REFLOGLESS_DEFAULT_LOG=\"$__REFLOGLESS_FALLBACK_LOG\"\n\
+        fi\n"
+    ));
     s.push_str("REFLOGLESS_HOOK_LOG=\"${REFLOGLESS_HOOK_LOG:-$__REFLOGLESS_DEFAULT_LOG}\"\n");
+    // Defense in depth so the redirect below never leaks ENOENT to git's
+    // stderr (the WSL-install / Git-for-Windows-run case from #67):
+    //   1. mkdir -p the resolved parent; on failure, fall to install-time.
+    //   2. If even the install-time parent is absent, redirect to /dev/null.
+    s.push_str(
+        "mkdir -p \"$(dirname \"$REFLOGLESS_HOOK_LOG\")\" 2>/dev/null \
+         || REFLOGLESS_HOOK_LOG=\"$__REFLOGLESS_FALLBACK_LOG\"\n",
+    );
+    s.push_str("[ -d \"$(dirname \"$REFLOGLESS_HOOK_LOG\")\" ] || REFLOGLESS_HOOK_LOG=/dev/null\n");
     s.push_str(&format!(
         "reflogless snap --event {hook} 2>>\"$REFLOGLESS_HOOK_LOG\" >/dev/null || true\n"
     ));
@@ -256,48 +292,172 @@ mod tests {
         assert_eq!(q, "'/tmp/it'\\''s-a-path'");
     }
 
-    #[test]
-    fn hook_body_falls_back_to_dev_null_when_log_dir_absent() {
-        let log = std::path::PathBuf::from("/nonexistent/dir/hook-errors.log");
-        let body = build_hook_body("reference-transaction", &log, None);
-        assert!(body.contains("__REFLOGLESS_LOG_DIR='/nonexistent/dir'"));
-        assert!(body.contains("__REFLOGLESS_DEFAULT_LOG='/dev/null'"));
-        assert!(body.contains("[ -d \"$__REFLOGLESS_LOG_DIR\" ]"));
-    }
-
-    #[test]
-    fn hook_body_generates_log_dir_check() {
-        let log = std::path::PathBuf::from("/tmp/somestore/hook-errors.log");
-        let body = build_hook_body("reference-transaction", &log, None);
-        assert!(body.contains("__REFLOGLESS_LOG_DIR='/tmp/somestore'"));
-        assert!(body.contains("__REFLOGLESS_DEFAULT_LOG='/tmp/somestore/hook-errors.log'"));
-    }
-
+    /// #67-style: install-time path's parent absent at hook-run time AND the
+    /// resolver can't reach a writable dir either. Hook must redirect to
+    /// /dev/null rather than leaking ENOENT to git's stderr. Run with
+    /// `env -i` so the resolver hits the no-env fallback branch.
+    /// #67-style: install-time path's parent absent at hook-run time AND
+    /// mkdir -p can't create it (we point at `/dev/null/...` so mkdir errors
+    /// with ENOTDIR). The final `[ -d ] || =/dev/null` tier must catch this
+    /// and stop the redirect from leaking ENOENT to git's stderr.
     #[cfg(unix)]
     #[test]
-    fn hook_fallback_produces_no_stderr_when_log_dir_absent() {
-        use std::process::Command;
+    fn hook_fallback_to_dev_null_when_no_writable_log_dir() {
         let td = TempDir::new().unwrap();
-        let log_dir = td.path().join("store");
-        let log = log_dir.join("hook-errors.log");
-        let body = build_hook_body("reference-transaction", &log, None);
+        // /dev/null is a char device, not a directory — mkdir -p underneath
+        // it returns ENOTDIR, exercising the final /dev/null tier rather
+        // than the mkdir-p recovery branch.
+        let fallback = std::path::PathBuf::from("/dev/null/cantwrite/hook-errors.log");
+        let body = build_hook_body("reference-transaction", &fallback, "0123456789abcdef", None);
         let script = td.path().join("test-hook.sh");
         fs::write(&script, &body).unwrap();
         make_executable(&script).unwrap();
-        // Execute the hook with the log dir absent — must emit no stderr.
-        let out = Command::new("sh")
+        // env -i with PATH only — strips REFLOGLESS_DATA_DIR/XDG/HOME so the
+        // resolver picks the fallback path, then both mkdir-p and the
+        // [ -d ] check on the fallback fail.
+        let path_env = std::env::var("PATH").unwrap_or_default();
+        let out = Command::new("env")
+            .arg("-i")
+            .arg(format!("PATH={path_env}"))
+            .arg("sh")
             .arg(&script)
             .arg("prepared")
             .stderr(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap()
-            .wait_with_output()
+            .output()
             .unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             stderr.is_empty(),
-            "expected no stderr when log dir absent, got: {stderr}"
+            "hook must not leak stderr when no writable log dir exists; got: {stderr}"
+        );
+    }
+
+    /// Run the generated hook body under controlled env and return the path
+    /// the resolver chose for `REFLOGLESS_HOOK_LOG`. Strips the snap+exit
+    /// suffix so the script doesn't try to exec `reflogless` from PATH.
+    /// The fallback path is also a real tempdir so `mkdir -p` succeeds and
+    /// doesn't mask the resolved value.
+    fn resolved_log_path(env: &[(&str, &std::path::Path)], fallback: &std::path::Path) -> String {
+        let body = build_hook_body("post-checkout", fallback, "0123456789abcdef", None);
+        let probe = match body.find("reflogless snap --event") {
+            Some(i) => format!("{}echo \"$REFLOGLESS_HOOK_LOG\"\nexit 0\n", &body[..i]),
+            None => panic!("hook body missing snap line"),
+        };
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(probe).env_clear();
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("sh failed");
+        assert!(
+            out.status.success(),
+            "sh exited {:?}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn resolver_branch_reflogless_data_dir_wins() {
+        let runtime = TempDir::new().unwrap();
+        let xdg = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let fb = TempDir::new().unwrap();
+        let got = resolved_log_path(
+            &[
+                ("REFLOGLESS_DATA_DIR", runtime.path()),
+                ("XDG_DATA_HOME", xdg.path()),
+                ("HOME", home.path()),
+            ],
+            &fb.path().join("install.log"),
+        );
+        assert_eq!(
+            got,
+            runtime
+                .path()
+                .join("reflogless/0123456789abcdef/hook-errors.log")
+                .to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn resolver_branch_xdg_data_home_wins_over_home() {
+        let xdg = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let fb = TempDir::new().unwrap();
+        let got = resolved_log_path(
+            &[("XDG_DATA_HOME", xdg.path()), ("HOME", home.path())],
+            &fb.path().join("install.log"),
+        );
+        assert_eq!(
+            got,
+            xdg.path()
+                .join("reflogless/0123456789abcdef/hook-errors.log")
+                .to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn resolver_branch_home_picks_platform_default() {
+        let home = TempDir::new().unwrap();
+        let fb = TempDir::new().unwrap();
+        let got = resolved_log_path(&[("HOME", home.path())], &fb.path().join("install.log"));
+        let uname = Command::new("uname").arg("-s").output().unwrap();
+        let uname_s = String::from_utf8_lossy(&uname.stdout).trim().to_string();
+        let expected = match uname_s.as_str() {
+            "Darwin" => home
+                .path()
+                .join("Library/Application Support/reflogless/0123456789abcdef/hook-errors.log")
+                .to_string_lossy()
+                .to_string(),
+            s if s.starts_with("MINGW") || s.starts_with("MSYS") || s.starts_with("CYGWIN") => {
+                fb.path().join("install.log").to_string_lossy().to_string()
+            }
+            _ => home
+                .path()
+                .join(".local/share/reflogless/0123456789abcdef/hook-errors.log")
+                .to_string_lossy()
+                .to_string(),
+        };
+        assert_eq!(got, expected, "uname={uname_s:?}");
+    }
+
+    #[test]
+    fn resolver_branch_no_env_falls_back_to_install_time_path() {
+        let fb = TempDir::new().unwrap();
+        let got = resolved_log_path(&[], &fb.path().join("install.log"));
+        assert_eq!(got, fb.path().join("install.log").to_string_lossy());
+    }
+
+    #[test]
+    fn resolver_devcontainer_scenario_uses_runtime_home_not_install_path() {
+        // Bug being fixed: install under HOME=A bakes A's path; container
+        // runs hook under HOME=B. Resolver must pick B's path, not A's.
+        let install_home = TempDir::new().unwrap();
+        let runtime_home = TempDir::new().unwrap();
+        let got = resolved_log_path(
+            &[("HOME", runtime_home.path())],
+            &install_home.path().join("install.log"),
+        );
+        let uname = Command::new("uname").arg("-s").output().unwrap();
+        let uname_s = String::from_utf8_lossy(&uname.stdout).trim().to_string();
+        if uname_s.starts_with("MINGW")
+            || uname_s.starts_with("MSYS")
+            || uname_s.starts_with("CYGWIN")
+        {
+            return;
+        }
+        let runtime_prefix = runtime_home.path().to_string_lossy().to_string();
+        let install_prefix = install_home.path().to_string_lossy().to_string();
+        assert!(
+            got.starts_with(&runtime_prefix),
+            "expected runtime HOME to win; got {got:?}"
+        );
+        assert!(
+            !got.starts_with(&install_prefix),
+            "must not have used install-time path; got {got:?}"
         );
     }
 
@@ -306,7 +466,7 @@ mod tests {
         use std::process::Command;
         let path = std::path::PathBuf::from("/tmp/foo$bar/post-checkout.reflogless-orig");
         let log = std::path::PathBuf::from("/tmp/foo$bar/log");
-        let body = build_hook_body("post-checkout", &log, Some(&path));
+        let body = build_hook_body("post-checkout", &log, "0123456789abcdef", Some(&path));
         // `sh -n` parses the script without executing — catches quoting bugs.
         let mut child = Command::new("sh")
             .arg("-n")
