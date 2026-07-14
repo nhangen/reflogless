@@ -592,7 +592,7 @@ cd reflogless
 cargo test
 ```
 
-83 tests; should be quick (< 2s).
+The test suite should be quick on a local checkout.
 
 Conventions:
 
