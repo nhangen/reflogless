@@ -118,7 +118,7 @@ pub struct StatusEntry {
 
 impl StatusEntry {
     pub fn is_untracked(&self) -> bool {
-        self.xy == [b'?', b'?']
+        self.xy == *b"??"
     }
 
     pub fn is_modified_unstaged(&self) -> bool {
