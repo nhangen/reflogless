@@ -15,7 +15,8 @@
 
 name: Release
 # Least-privilege: only the `host` and `publish-homebrew-formula` jobs below
-# escalate to contents: write.
+# escalate to contents: write. Windows release signing grants id-token to the
+# build-local-artifacts job so Azure Artifact Signing can authenticate by OIDC.
 permissions:
   contents: read
 
@@ -116,6 +117,9 @@ jobs:
       # - N "local" tasks that build each platform's binaries and platform-specific installers
       matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
     container: ${{ matrix.container && matrix.container.image || null }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -152,6 +156,68 @@ jobs:
           # Actually do builds and make zips and whatnot
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
+      - name: Verify Windows Authenticode signing configuration
+        if: ${{ needs.plan.outputs.publishing == 'true' && contains(join(matrix.targets, ','), 'x86_64-pc-windows-msvc') }}
+        shell: bash
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          AZURE_ARTIFACT_SIGNING_ENDPOINT: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in \
+            AZURE_CLIENT_ID \
+            AZURE_TENANT_ID \
+            AZURE_SUBSCRIPTION_ID \
+            AZURE_ARTIFACT_SIGNING_ENDPOINT \
+            AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME \
+            AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME
+          do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::$name is required for Windows Authenticode release signing."
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+      - name: Prepare Windows Authenticode signing
+        id: windows-signing
+        if: ${{ needs.plan.outputs.publishing == 'true' && contains(join(matrix.targets, ','), 'x86_64-pc-windows-msvc') }}
+        shell: pwsh
+        run: |
+          ./scripts/prepare-windows-signing.ps1 -DistribDir target/distrib
+      - name: Azure login for Windows Authenticode signing
+        if: ${{ needs.plan.outputs.publishing == 'true' && contains(join(matrix.targets, ','), 'x86_64-pc-windows-msvc') }}
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Sign Windows binaries with Azure Artifact Signing
+        if: ${{ needs.plan.outputs.publishing == 'true' && contains(join(matrix.targets, ','), 'x86_64-pc-windows-msvc') }}
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          files-folder: ${{ steps.windows-signing.outputs.signing_folder }}
+          files-folder-filter: exe,dll
+          files-folder-recurse: true
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+      - name: Verify and repack signed Windows archive
+        if: ${{ needs.plan.outputs.publishing == 'true' && contains(join(matrix.targets, ','), 'x86_64-pc-windows-msvc') }}
+        shell: pwsh
+        run: |
+          ./scripts/verify-repack-windows-signing.ps1 `
+            -SigningFolder "${{ steps.windows-signing.outputs.signing_folder }}" `
+            -ZipPath "${{ steps.windows-signing.outputs.zip_path }}"
       - id: cargo-dist
         name: Post-build
         # We force bash here just because github makes it really hard to get values up

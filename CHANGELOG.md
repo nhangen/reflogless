@@ -7,6 +7,12 @@ follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Windows Authenticode release signing (#32): tag releases now sign the
+  Windows `.exe` inside the cargo-dist ZIP with Azure Artifact Signing,
+  verify the Authenticode signature, rebuild the ZIP, and regenerate its
+  SHA-256 checksum before publication. Missing signing configuration,
+  signing failures, or verification failures stop the release before assets
+  are published.
 - Optional remote snapshot backend (#31): push the blob and manifest content
   of an encrypted store to S3-compatible object storage so snapshots survive
   laptop loss. Opt-in via `cargo install reflogless --features remote`; the
