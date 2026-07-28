@@ -12,7 +12,16 @@ pub const HOOKS: &[&str] = &[
 ];
 
 pub const MARKER: &str = "# reflogless-managed (do not edit manually)";
-pub const MARKER_VERSION: &str = "# reflogless-hook-version: 2";
+/// Bumped to 3 in #74: the body now invokes an absolute binary path via
+/// `$__REFLOGLESS_BIN` instead of the bare name, so v2 installs are stale and
+/// want rewriting by `reflogless init`.
+pub const MARKER_VERSION: &str = "# reflogless-hook-version: 3";
+
+/// Substring identifying the snap invocation inside a generated hook body,
+/// independent of how the binary is addressed. `doctor` keys off this to tell a
+/// marker-stripped reflogless hook (tampered) from a genuine third-party hook,
+/// so it must not embed the binary name.
+pub const INVOKE_PROBE: &str = "snap --event";
 
 #[derive(Debug)]
 pub struct InstallReport {
@@ -161,6 +170,11 @@ pub(crate) fn resolve_hooks_target(repo: &Repo) -> Result<HooksTarget> {
 pub fn install(repo: &Repo, hook_log_path: &Path) -> Result<InstallReport> {
     let repo_id = repo.id();
     let HooksTarget { dir, declined } = resolve_hooks_target(repo)?;
+    // Bake the absolute path to the running binary into the hook. Resolution
+    // failure is not fatal — the body falls back to a bare `reflogless`, which
+    // is exactly the pre-#74 behavior, so a hostile `current_exe` degrades
+    // rather than blocking the install.
+    let bin = std::env::current_exe().ok();
     fs::create_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
     let mut installed = Vec::new();
     let mut chained = Vec::new();
@@ -169,7 +183,7 @@ pub fn install(repo: &Repo, hook_log_path: &Path) -> Result<InstallReport> {
         let backup = path.with_extension("reflogless-orig");
         match read_entry(&path) {
             Entry::Missing => {
-                write_hook(&path, hook, hook_log_path, &repo_id, None)?;
+                write_hook(&path, hook, hook_log_path, &repo_id, None, bin.as_deref())?;
                 installed.push((*hook).to_string());
             }
             // Already ours. Re-chain if a backup is present: passing `None` here
@@ -179,7 +193,7 @@ pub fn install(repo: &Repo, hook_log_path: &Path) -> Result<InstallReport> {
                 let prior = fs::symlink_metadata(&backup)
                     .is_ok()
                     .then_some(backup.as_path());
-                write_hook(&path, hook, hook_log_path, &repo_id, prior)?;
+                write_hook(&path, hook, hook_log_path, &repo_id, prior, bin.as_deref())?;
                 if prior.is_some() {
                     chained.push((*hook).to_string());
                 } else {
@@ -190,7 +204,7 @@ pub fn install(repo: &Repo, hook_log_path: &Path) -> Result<InstallReport> {
             // the install part-way through. There is no body to preserve, so
             // replace it outright.
             Entry::Symlink { dangling: true } => {
-                write_hook(&path, hook, hook_log_path, &repo_id, None)?;
+                write_hook(&path, hook, hook_log_path, &repo_id, None, bin.as_deref())?;
                 installed.push((*hook).to_string());
             }
             // Foreign, or unreadable and therefore assumed foreign. Preserve and
@@ -200,7 +214,14 @@ pub fn install(repo: &Repo, hook_log_path: &Path) -> Result<InstallReport> {
                 if fs::symlink_metadata(&backup).is_err() {
                     fs::copy(&path, &backup).map_err(|e| Error::io(&path, e))?;
                 }
-                write_hook(&path, hook, hook_log_path, &repo_id, Some(&backup))?;
+                write_hook(
+                    &path,
+                    hook,
+                    hook_log_path,
+                    &repo_id,
+                    Some(&backup),
+                    bin.as_deref(),
+                )?;
                 chained.push((*hook).to_string());
             }
         }
@@ -320,8 +341,9 @@ fn write_hook(
     hook_log_path: &Path,
     repo_id: &str,
     prior: Option<&Path>,
+    bin: Option<&Path>,
 ) -> Result<()> {
-    let body = build_hook_body(hook, hook_log_path, repo_id, prior);
+    let body = build_hook_body(hook, hook_log_path, repo_id, prior, bin);
     // Unlink first. `fs::write` and `set_permissions` both follow symlinks, so
     // writing straight to a symlinked entry rewrites and chmods the *target* —
     // which, when several entries link to one shared dispatcher, destroys that
@@ -341,6 +363,7 @@ fn build_hook_body(
     hook_log_path: &Path,
     repo_id: &str,
     prior: Option<&Path>,
+    bin: Option<&Path>,
 ) -> String {
     // Shell injection guard: repo_id is interpolated unescaped into the
     // generated script. `repo.id()` produces 16 hex chars; if that ever
@@ -389,8 +412,29 @@ fn build_hook_body(
          || REFLOGLESS_HOOK_LOG=\"$__REFLOGLESS_FALLBACK_LOG\"\n",
     );
     s.push_str("[ -d \"$(dirname \"$REFLOGLESS_HOOK_LOG\")\" ] || REFLOGLESS_HOOK_LOG=/dev/null\n");
+    // Address the binary by absolute path. A bare `reflogless` resolves against
+    // whatever PATH the git caller happens to have, and a GUI editor, launchd
+    // job, or sandboxed runner typically lacks ~/.cargo/bin or
+    // /opt/homebrew/bin — the lookup then fails and `|| true` swallows it, so
+    // the snapshot is silently skipped (#74). Fall back to the bare name if the
+    // baked path later disappears (reinstall to a new prefix, moved binary).
+    // Resolution order: `$REFLOGLESS_BIN` override, then the baked path, then
+    // the bare name. The override exists so a relocated install can be pointed
+    // at the new binary without reinstalling every hook, and so tests can
+    // substitute a stub without depending on PATH.
+    match bin {
+        Some(p) => {
+            s.push_str(&format!("__REFLOGLESS_BIN={}\n", sh_squote(p)));
+            s.push_str("[ -n \"${REFLOGLESS_BIN:-}\" ] && __REFLOGLESS_BIN=\"$REFLOGLESS_BIN\"\n");
+            s.push_str("[ -x \"$__REFLOGLESS_BIN\" ] || __REFLOGLESS_BIN=reflogless\n");
+        }
+        None => {
+            s.push_str("__REFLOGLESS_BIN=reflogless\n");
+            s.push_str("[ -n \"${REFLOGLESS_BIN:-}\" ] && __REFLOGLESS_BIN=\"$REFLOGLESS_BIN\"\n");
+        }
+    }
     s.push_str(&format!(
-        "reflogless snap --event {hook} 2>>\"$REFLOGLESS_HOOK_LOG\" >/dev/null || true\n"
+        "\"$__REFLOGLESS_BIN\" {INVOKE_PROBE} {hook} 2>>\"$REFLOGLESS_HOOK_LOG\" >/dev/null || true\n"
     ));
     if let Some(p) = prior {
         let q = sh_squote(p);
@@ -718,6 +762,165 @@ mod tests {
             .status();
     }
 
+    #[test]
+    fn hook_body_invokes_baked_absolute_binary_with_bare_name_fallback() {
+        let bin = Path::new("/opt/somewhere/bin/reflogless");
+        let body = build_hook_body(
+            "post-checkout",
+            Path::new("/tmp/log"),
+            "0123456789abcdef",
+            None,
+            Some(bin),
+        );
+        assert!(
+            body.contains("__REFLOGLESS_BIN='/opt/somewhere/bin/reflogless'"),
+            "absolute path not baked in: {body}"
+        );
+        // Fallback keeps a moved/removed binary from breaking the hook outright.
+        assert!(body.contains("[ -x \"$__REFLOGLESS_BIN\" ] || __REFLOGLESS_BIN=reflogless"));
+        assert!(body.contains("\"$__REFLOGLESS_BIN\" snap --event post-checkout"));
+        // The bare-name invocation is what #74 fixed; it must not survive.
+        assert!(
+            !body.contains("\nreflogless snap --event"),
+            "still invokes bare `reflogless`: {body}"
+        );
+    }
+
+    /// End-to-end: run a generated hook with a stub binary and confirm it is
+    /// actually invoked. This is the behavior #74 restores — under a PATH that
+    /// lacks the install dir, the pre-fix hook silently skipped the snapshot.
+    #[test]
+    fn generated_hook_invokes_the_binary_under_a_stripped_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        let marker = td.path().join("it-ran");
+        let stub = td.path().join("reflogless-stub");
+        fs::write(
+            &stub,
+            format!("#!/bin/sh\necho \"$@\" > {}\n", sh_squote(&marker)),
+        )
+        .unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let body = build_hook_body(
+            "post-checkout",
+            &td.path().join("hook-errors.log"),
+            "0123456789abcdef",
+            None,
+            Some(&stub),
+        );
+        let script = td.path().join("hook.sh");
+        fs::write(&script, &body).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // PATH deliberately holds nothing that could resolve a bare
+        // `reflogless` — the baked absolute path is the only way through.
+        let status = Command::new(&script)
+            .env("PATH", "/nonexistent-bin")
+            .env("HOME", td.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "hook must stay best-effort");
+        assert_eq!(
+            fs::read_to_string(&marker).unwrap().trim(),
+            "snap --event post-checkout",
+            "stub was not invoked with the expected args"
+        );
+    }
+
+    #[test]
+    fn hook_body_honors_reflogless_bin_override() {
+        let body = build_hook_body(
+            "post-checkout",
+            Path::new("/tmp/log"),
+            "0123456789abcdef",
+            None,
+            Some(Path::new("/baked/reflogless")),
+        );
+        assert!(
+            body.contains("[ -n \"${REFLOGLESS_BIN:-}\" ] && __REFLOGLESS_BIN=\"$REFLOGLESS_BIN\""),
+            "override not honored: {body}"
+        );
+        // Order matters: override must be applied after the baked default and
+        // before the executability fallback.
+        let baked = body.find("__REFLOGLESS_BIN='/baked/reflogless'").unwrap();
+        let over = body.find("REFLOGLESS_BIN:-").unwrap();
+        let fallback = body.find("|| __REFLOGLESS_BIN=reflogless").unwrap();
+        assert!(baked < over && over < fallback, "wrong order in: {body}");
+    }
+
+    #[test]
+    fn hook_body_falls_back_to_bare_name_when_binary_unknown() {
+        let body = build_hook_body(
+            "post-checkout",
+            Path::new("/tmp/log"),
+            "0123456789abcdef",
+            None,
+            None,
+        );
+        assert!(body.contains("__REFLOGLESS_BIN=reflogless"));
+        assert!(body.contains("\"$__REFLOGLESS_BIN\" snap --event post-checkout"));
+    }
+
+    #[test]
+    fn hook_body_squotes_a_binary_path_containing_spaces() {
+        let bin = Path::new("/Applications/My Tools/reflogless");
+        let body = build_hook_body(
+            "pre-rebase",
+            Path::new("/tmp/log"),
+            "0123456789abcdef",
+            None,
+            Some(bin),
+        );
+        assert!(
+            body.contains("__REFLOGLESS_BIN='/Applications/My Tools/reflogless'"),
+            "space-bearing path not quoted: {body}"
+        );
+    }
+
+    #[test]
+    fn installed_hooks_reference_an_absolute_binary() {
+        let td = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        install(&repo, &repo.root.join("hook-errors.log")).unwrap();
+        let want = std::env::current_exe().unwrap();
+        for hook in HOOKS {
+            let body = fs::read_to_string(repo.root.join(".git").join("hooks").join(hook)).unwrap();
+            assert!(
+                body.contains(&format!("__REFLOGLESS_BIN={}", sh_squote(&want))),
+                "{hook} does not bake the running binary path"
+            );
+        }
+    }
+
+    /// The generated body must remain runnable by `/bin/sh`. A quoting or
+    /// syntax slip in the binary-resolution block would otherwise only surface
+    /// as a silent `|| true` swallow at hook time.
+    #[test]
+    fn hook_body_is_valid_posix_sh() {
+        let bin = Path::new("/Applications/My Tools/reflogless");
+        for hook in HOOKS {
+            let body = build_hook_body(
+                hook,
+                Path::new("/tmp/log"),
+                "0123456789abcdef",
+                None,
+                Some(bin),
+            );
+            let out = Command::new("sh")
+                .arg("-n")
+                .arg("-c")
+                .arg(&body)
+                .output()
+                .expect("sh failed");
+            assert!(
+                out.status.success(),
+                "sh -n rejected {hook} body: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn install_replaces_symlink_instead_of_writing_through_it() {
@@ -778,7 +981,7 @@ mod tests {
             let p = repo.root.join(".git").join("hooks").join(hook);
             let body = fs::read_to_string(&p).unwrap();
             assert!(body.contains(MARKER), "{hook} missing marker");
-            assert!(body.contains(&format!("reflogless snap --event {hook}")));
+            assert!(body.contains(&format!("{INVOKE_PROBE} {hook}")));
         }
     }
 
@@ -797,7 +1000,7 @@ mod tests {
         let backup = hooks.join("post-checkout.reflogless-orig");
         assert!(backup.exists(), "backup not preserved");
         let body = fs::read_to_string(&existing).unwrap();
-        assert!(body.contains("reflogless snap --event post-checkout"));
+        assert!(body.contains(&format!("{INVOKE_PROBE} post-checkout")));
         assert!(body.contains("post-checkout.reflogless-orig"));
         // Chained exec must single-quote the prior path for POSIX safety.
         assert!(body.contains("exec '"));
@@ -833,7 +1036,13 @@ mod tests {
         // it returns ENOTDIR, exercising the final /dev/null tier rather
         // than the mkdir-p recovery branch.
         let fallback = std::path::PathBuf::from("/dev/null/cantwrite/hook-errors.log");
-        let body = build_hook_body("reference-transaction", &fallback, "0123456789abcdef", None);
+        let body = build_hook_body(
+            "reference-transaction",
+            &fallback,
+            "0123456789abcdef",
+            None,
+            None,
+        );
         let script = td.path().join("test-hook.sh");
         fs::write(&script, &body).unwrap();
         make_executable(&script).unwrap();
@@ -864,8 +1073,8 @@ mod tests {
     /// The fallback path is also a real tempdir so `mkdir -p` succeeds and
     /// doesn't mask the resolved value.
     fn resolved_log_path(env: &[(&str, &std::path::Path)], fallback: &std::path::Path) -> String {
-        let body = build_hook_body("post-checkout", fallback, "0123456789abcdef", None);
-        let probe = match body.find("reflogless snap --event") {
+        let body = build_hook_body("post-checkout", fallback, "0123456789abcdef", None, None);
+        let probe = match body.find("__REFLOGLESS_BIN=") {
             Some(i) => format!("{}echo \"$REFLOGLESS_HOOK_LOG\"\nexit 0\n", &body[..i]),
             None => panic!("hook body missing snap line"),
         };
@@ -991,7 +1200,7 @@ mod tests {
         use std::process::Command;
         let path = std::path::PathBuf::from("/tmp/foo$bar/post-checkout.reflogless-orig");
         let log = std::path::PathBuf::from("/tmp/foo$bar/log");
-        let body = build_hook_body("post-checkout", &log, "0123456789abcdef", Some(&path));
+        let body = build_hook_body("post-checkout", &log, "0123456789abcdef", Some(&path), None);
         // `sh -n` parses the script without executing — catches quoting bugs.
         let mut child = Command::new("sh")
             .arg("-n")

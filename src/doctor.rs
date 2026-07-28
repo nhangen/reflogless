@@ -1,7 +1,8 @@
 use crate::crypto;
 use crate::error::Result;
 use crate::hooks::{
-    body_chains_to, read_entry, resolve_hooks_target, Entry, HooksTarget, HOOKS, MARKER,
+    body_chains_to, read_entry, resolve_hooks_target, Entry, HooksTarget, HOOKS, INVOKE_PROBE,
+    MARKER,
 };
 use crate::repo::Repo;
 use crate::store::Store;
@@ -161,7 +162,7 @@ pub fn run(repo: &Repo, store: &Store) -> Result<DoctorReport> {
                         // `hooks::body_chains_to`.
                         chained: body_chains_to(&body, &backup),
                     }
-                } else if body.contains("reflogless snap --event") {
+                } else if body.contains(INVOKE_PROBE) {
                     // A user hand-edited the reflogless wrapper and stripped
                     // the marker, but the reflogless call is still present —
                     // distinct from a legitimate third-party hook.
@@ -726,8 +727,12 @@ mod tests {
             bin.path().display(),
             std::env::var("PATH").unwrap_or_default()
         );
+        // `REFLOGLESS_BIN` rather than PATH: since #74 the hook addresses an
+        // absolute baked-in binary, so a PATH-injected stub is (correctly) not
+        // consulted.
         let status = Command::new(&hook)
             .env("PATH", path)
+            .env("REFLOGLESS_BIN", &fake)
             .env("REFLOGLESS_DATA_DIR", data.path())
             .status()
             .unwrap();
