@@ -29,16 +29,21 @@ pub struct UninstallReport {
     pub removed: Vec<String>,
     pub restored: Vec<String>,
     pub skipped: Vec<String>,
+    /// Entries that exist but couldn't be read, so ownership is unknown and they
+    /// were left in place. Reported separately from `skipped` — a skipped hook is
+    /// known to be someone else's; these might be ours and still firing.
+    pub unreadable: Vec<String>,
     pub declined_hooks_path: Option<PathBuf>,
 }
 
 /// The repo's own hooks directory — the one git uses absent `core.hooksPath`.
 ///
-/// Resolved through `Repo::git_dir()`, not `root/.git`, because in a linked
-/// worktree `.git` is a *file* containing `gitdir:` and the real hooks dir lives
-/// under the main clone's `.git/worktrees/<name>/`.
+/// Resolved through the git **common** dir. Two wrong answers to avoid: `root/.git`
+/// is a *file* in a linked worktree, and the per-worktree `git_dir()` is a
+/// directory git never reads hooks from. Only the common dir matches what
+/// `git rev-parse --git-path hooks` reports. See `Repo::git_common_dir`.
 fn own_hooks_dir(repo: &Repo) -> PathBuf {
-    repo.git_dir().join("hooks")
+    repo.git_common_dir().join("hooks")
 }
 
 /// `core.hooksPath` as git resolves it for this repo, or `None` if unset.
@@ -74,15 +79,48 @@ pub struct HooksTarget {
     pub declined: Option<PathBuf>,
 }
 
-/// Is `dir` part of this repo — under the working tree or under its git dir?
+/// Canonicalize as much of `p` as exists, keeping the rest verbatim.
 ///
-/// Canonicalized where possible so `/var` vs `/private/var` and other symlinked
-/// prefixes don't produce a false negative; falls back to raw paths for
-/// components that don't exist yet.
+/// `fs::canonicalize` is all-or-nothing: one missing component and it fails, so a
+/// not-yet-created directory would be compared raw (`/var/...`) against an
+/// already-canonical root (`/private/var/...`) and spuriously look foreign. Since
+/// `install` *creates* its target, that path is the common case, not the edge one.
+fn canonicalize_existing(p: &Path) -> PathBuf {
+    let mut tail = Vec::new();
+    let mut cur = p.to_path_buf();
+    loop {
+        if let Ok(c) = cur.canonicalize() {
+            let mut out = c;
+            for part in tail.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        match (cur.file_name().map(|s| s.to_owned()), cur.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                cur = parent.to_path_buf();
+            }
+            _ => return p.to_path_buf(),
+        }
+    }
+}
+
+/// Is `dir` this repo's own hooks territory rather than machine-wide infrastructure?
+///
+/// Accepts the working tree and the git **common** dir. The common dir is the
+/// right boundary: it is where git reads hooks from, it contains `git_dir()` for a
+/// linked worktree, and for a primary worktree the two coincide. Testing
+/// `git_dir()` instead rejected `main/.git/hooks` — git's own answer for a linked
+/// worktree — while telling the user it was machine-shared.
+///
+/// Both sides are canonicalized as far as they exist so symlinked prefixes
+/// (`/var` vs `/private/var`) and not-yet-created directories compare in one
+/// namespace.
 fn is_within_repo(repo: &Repo, dir: &Path) -> bool {
-    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    let dir_c = canon(dir);
-    dir_c.starts_with(canon(&repo.root)) || dir_c.starts_with(canon(&repo.git_dir()))
+    let dir_c = canonicalize_existing(dir);
+    dir_c.starts_with(canonicalize_existing(&repo.root))
+        || dir_c.starts_with(canonicalize_existing(&repo.git_common_dir()))
 }
 
 /// Resolve the write target, declining a `core.hooksPath` that lives outside the
@@ -91,14 +129,18 @@ fn is_within_repo(repo: &Repo, dir: &Path) -> bool {
 /// A `core.hooksPath` set *globally* names shared infrastructure used by every
 /// repo on the machine — commonly a directory of symlinks pointing at one
 /// dispatcher. Writing there takes that dispatcher over for every repo, and
-/// uninstalling deletes entries reflogless never owned (#73). But refusing
-/// outright makes `install` fail on every repo on such a machine, which is no
-/// good either: those dispatchers conventionally `exec` the repo's own hook, so
-/// the repo-local dir is still live. So we decline the foreign path, fall back to
-/// the repo's own hooks dir, and report what we skipped.
+/// uninstalling deletes entries reflogless never owned (#73). Refusing outright is
+/// no better: `install` then fails on every repo of such a machine.
 ///
-/// Gated inside `install`/`uninstall` rather than at the call sites so no caller
-/// can opt out.
+/// So the foreign path is declined and the write goes to the repo's own hooks dir.
+/// **This only helps if the configured dispatcher execs the repo's hook, and that
+/// is an assumption, not a convention** — husky and lefthook (named in
+/// `hooks_dir`'s docs) do not chain. When it doesn't hold, git runs the configured
+/// path and never reaches what we installed, so `doctor` checks for that
+/// explicitly instead of trusting the assumption: see `shadowed_hooks`.
+///
+/// `install`, `uninstall`, and `doctor` all resolve through here so they cannot
+/// disagree about where hooks live.
 pub(crate) fn resolve_hooks_target(repo: &Repo) -> Result<HooksTarget> {
     match configured_hooks_path(repo)? {
         Some(p) if is_within_repo(repo, &p) => Ok(HooksTarget {
@@ -124,28 +166,43 @@ pub fn install(repo: &Repo, hook_log_path: &Path) -> Result<InstallReport> {
     let mut chained = Vec::new();
     for hook in HOOKS {
         let path = dir.join(hook);
-        // `symlink_metadata` so a symlinked entry is seen as *itself*, not as
-        // its target: `Path::exists` follows links (a dangling link reads as
-        // absent) and `read_to_string` would inspect the target's body.
-        if fs::symlink_metadata(&path).is_ok() {
-            let existing = read_entry(&path);
-            if existing.contains(MARKER) {
+        let backup = path.with_extension("reflogless-orig");
+        match read_entry(&path) {
+            Entry::Missing => {
                 write_hook(&path, hook, hook_log_path, &repo_id, None)?;
                 installed.push((*hook).to_string());
-                continue;
             }
-            // Preserve and chain existing third-party hook. Copy resolves the
-            // link, so the backup holds the real body and stays runnable even
-            // after we replace the entry.
-            let backup = path.with_extension("reflogless-orig");
-            if fs::symlink_metadata(&backup).is_err() {
-                fs::copy(&path, &backup).map_err(|e| Error::io(&backup, e))?;
+            // Already ours. Re-chain if a backup is present: passing `None` here
+            // rewrote the wrapper without its `exec`, so a second `install`
+            // silently stopped running a third-party hook it had preserved.
+            Entry::Body(body) if body.contains(MARKER) => {
+                let prior = fs::symlink_metadata(&backup)
+                    .is_ok()
+                    .then_some(backup.as_path());
+                write_hook(&path, hook, hook_log_path, &repo_id, prior)?;
+                if prior.is_some() {
+                    chained.push((*hook).to_string());
+                } else {
+                    installed.push((*hook).to_string());
+                }
             }
-            write_hook(&path, hook, hook_log_path, &repo_id, Some(&backup))?;
-            chained.push((*hook).to_string());
-        } else {
-            write_hook(&path, hook, hook_log_path, &repo_id, None)?;
-            installed.push((*hook).to_string());
+            // A link with nothing behind it: `fs::copy` would fail ENOENT and abort
+            // the install part-way through. There is no body to preserve, so
+            // replace it outright.
+            Entry::Symlink { dangling: true } => {
+                write_hook(&path, hook, hook_log_path, &repo_id, None)?;
+                installed.push((*hook).to_string());
+            }
+            // Foreign, or unreadable and therefore assumed foreign. Preserve and
+            // chain. `fs::copy` resolves a link, so the backup holds the real body
+            // and stays runnable after we replace the entry.
+            Entry::Symlink { dangling: false } | Entry::Unreadable(_) | Entry::Body(_) => {
+                if fs::symlink_metadata(&backup).is_err() {
+                    fs::copy(&path, &backup).map_err(|e| Error::io(&path, e))?;
+                }
+                write_hook(&path, hook, hook_log_path, &repo_id, Some(&backup))?;
+                chained.push((*hook).to_string());
+            }
         }
     }
     Ok(InstallReport {
@@ -156,17 +213,68 @@ pub fn install(repo: &Repo, hook_log_path: &Path) -> Result<InstallReport> {
     })
 }
 
-/// Read a hook entry's body for classification.
+/// What is sitting at a hook entry path.
 ///
-/// A symlinked entry reads as empty: `read_to_string` would follow the link and
-/// report the *target's* body, which for a shared dispatcher is not this entry's
-/// content. Empty means "not ours", so the entry is preserved and chained rather
-/// than overwritten. Unreadable/binary entries take the same path. Shared with
-/// `doctor` so install-time and report-time classification cannot diverge.
-pub(crate) fn read_entry(path: &Path) -> String {
-    match fs::symlink_metadata(path) {
-        Ok(md) if md.is_symlink() => String::new(),
-        _ => fs::read_to_string(path).unwrap_or_default(),
+/// Four outcomes rather than a body string, because collapsing them loses the two
+/// distinctions the callers need: `install` must not follow a symlink (writing
+/// through one destroyed a shared dispatcher — #73), and `doctor` must not report
+/// "someone else owns this hook" when the truth is "I could not read it".
+pub(crate) enum Entry {
+    Missing,
+    /// A symlink. Classified without following it: `read_to_string` would report
+    /// the *target's* body, which for a shared dispatcher is not this entry's
+    /// content. `dangling` distinguishes a link with nothing behind it — there is
+    /// no body to preserve, so it is replaced rather than backed up.
+    Symlink {
+        dangling: bool,
+    },
+    /// Present but unreadable — permissions, I/O error, non-UTF-8, or a directory.
+    /// Carries the reason so `doctor` can print it.
+    Unreadable(String),
+    Body(String),
+}
+
+/// Of `HOOKS`, the ones git will provably never invoke.
+///
+/// When `core.hooksPath` is set, git looks **only** there. So for a hook we
+/// installed in the repo's own dir after declining `declined`, absence of
+/// `declined/<hook>` means nothing can forward to ours — it is dead, with no
+/// probing or heuristics required. Presence is not proof of the converse (the
+/// entry may not chain), which is why this reports only the certain case.
+pub fn shadowed_hooks(declined: &Path) -> Vec<String> {
+    HOOKS
+        .iter()
+        .filter(|h| fs::symlink_metadata(declined.join(h)).is_err())
+        .map(|h| (*h).to_string())
+        .collect()
+}
+
+/// Does this wrapper body forward to `backup`?
+///
+/// Read from the body rather than from the backup file's existence: an orphaned
+/// `.reflogless-orig` next to a wrapper that no longer execs it is exactly the
+/// state that made `doctor` report `OK (chained)` for a hook that had stopped
+/// running.
+pub(crate) fn body_chains_to(body: &str, backup: &Path) -> bool {
+    body.contains(&sh_squote(backup))
+}
+
+/// Classify a hook entry. Shared by `install`, `uninstall`, and `doctor` so
+/// install-time and report-time classification cannot diverge.
+pub(crate) fn read_entry(path: &Path) -> Entry {
+    let md = match fs::symlink_metadata(path) {
+        Ok(md) => md,
+        Err(_) => return Entry::Missing,
+    };
+    if md.is_symlink() {
+        return Entry::Symlink {
+            // `metadata` follows the link, so failure here means nothing behind it.
+            dangling: fs::metadata(path).is_err(),
+        };
+    }
+    match fs::read_to_string(path) {
+        Ok(body) => Entry::Body(body),
+        Err(e) => Entry::Unreadable(e.to_string()),
     }
 }
 
@@ -178,13 +286,21 @@ pub fn uninstall(repo: &Repo) -> Result<UninstallReport> {
     };
     for hook in HOOKS {
         let path = dir.join(hook);
-        if fs::symlink_metadata(&path).is_err() {
-            continue;
-        }
-        let body = read_entry(&path);
-        if !body.contains(MARKER) {
-            report.skipped.push((*hook).to_string());
-            continue;
+        match read_entry(&path) {
+            Entry::Missing => continue,
+            Entry::Body(body) if body.contains(MARKER) => {}
+            // Distinct from a legitimate third-party hook: a reflogless-managed
+            // hook we can't read stays installed and keeps firing, so saying
+            // "not reflogless-managed" and exiting 0 would be a silent partial
+            // uninstall.
+            Entry::Unreadable(e) => {
+                report.unreadable.push(format!("{hook} ({e})"));
+                continue;
+            }
+            Entry::Symlink { .. } | Entry::Body(_) => {
+                report.skipped.push((*hook).to_string());
+                continue;
+            }
         }
         let backup = path.with_extension("reflogless-orig");
         if fs::symlink_metadata(&backup).is_ok() {
@@ -327,17 +443,14 @@ mod tests {
     /// Point the repo's hooks dir at an arbitrary path (absolute or
     /// repo-relative), the way husky/lefthook or a global dispatcher would.
     fn set_hooks_path(repo: &Repo, value: &str) {
-        Command::new("git")
-            .args([
-                "-C",
-                repo.root.to_str().unwrap(),
-                "config",
-                "--local",
-                "core.hooksPath",
-                value,
-            ])
-            .status()
-            .unwrap();
+        crate::testutil::git_in(&[
+            "-C",
+            repo.root.to_str().unwrap(),
+            "config",
+            "--local",
+            "core.hooksPath",
+            value,
+        ]);
     }
 
     #[test]
@@ -353,7 +466,7 @@ mod tests {
         let report = install(&repo, &repo.root.join("hook-errors.log")).unwrap();
 
         // Fell back to the repo's own hooks dir, and says which path it declined.
-        assert_eq!(report.hooks_dir, repo.git_dir().join("hooks"));
+        assert_eq!(report.hooks_dir, repo.git_common_dir().join("hooks"));
         assert_eq!(
             report.declined_hooks_path.as_deref(),
             Some(outside.path()),
@@ -398,7 +511,7 @@ mod tests {
         // Removed what it installed...
         assert_eq!(report.removed.len(), HOOKS.len(), "{report:?}");
         for h in HOOKS {
-            assert!(!repo.git_dir().join("hooks").join(h).exists());
+            assert!(!repo.git_common_dir().join("hooks").join(h).exists());
         }
         // ...and did not delete a marker-bearing entry in the shared dir, which it
         // never owned. This is the case that destroyed the real dispatcher.
@@ -406,6 +519,101 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&sentinel).unwrap(),
             format!("{MARKER}\n")
+        );
+    }
+
+    #[test]
+    fn reinstall_keeps_chaining_a_preserved_third_party_hook() {
+        let td = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        let hooks = repo.git_common_dir().join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let entry = hooks.join("post-checkout");
+        fs::write(&entry, "#!/bin/sh\n# third-party\n").unwrap();
+
+        let log = repo.root.join("hook-errors.log");
+        install(&repo, &log).unwrap();
+        let after_first = fs::read_to_string(&entry).unwrap();
+        let backup = entry.with_extension("reflogless-orig");
+        assert!(
+            body_chains_to(&after_first, &backup),
+            "first install must chain the third-party hook"
+        );
+
+        // The bug: the second install took the already-managed branch and rewrote
+        // the wrapper with no `prior`, so the preserved hook silently stopped
+        // running while the orphaned backup made doctor still report it chained.
+        let report = install(&repo, &log).unwrap();
+        let after_second = fs::read_to_string(&entry).unwrap();
+        assert!(
+            body_chains_to(&after_second, &backup),
+            "re-install dropped the chain: the third-party hook no longer runs"
+        );
+        assert!(
+            report.chained.contains(&"post-checkout".to_string()),
+            "re-install must still report the hook as chained: {report:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_leaves_a_symlink_to_a_marker_bearing_target_alone() {
+        let td = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        let hooks = repo.git_common_dir().join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+
+        // A symlink pointing at something that *looks* reflogless-managed — e.g. a
+        // shared dispatcher another repo's install already wrote. Following the link
+        // would classify it as ours and delete the link, which is how #73 turned 4
+        // of 19 dispatcher symlinks into casualties.
+        let shared = repo.root.join("dispatcher.sh");
+        fs::write(&shared, format!("{MARKER}\n# shared\n")).unwrap();
+        let entry = hooks.join("post-checkout");
+        std::os::unix::fs::symlink(&shared, &entry).unwrap();
+
+        let report = uninstall(&repo).unwrap();
+
+        assert!(
+            report.skipped.contains(&"post-checkout".to_string()),
+            "a symlinked entry is not ours to remove: {report:?}"
+        );
+        assert!(
+            fs::symlink_metadata(&entry).is_ok(),
+            "the symlink must survive uninstall"
+        );
+        assert_eq!(
+            fs::read_to_string(&shared).unwrap(),
+            format!("{MARKER}\n# shared\n"),
+            "the link target must be untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_replaces_a_dangling_symlink_without_aborting() {
+        let td = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        let hooks = repo.git_common_dir().join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        // A link whose target moved away — #73's own aftermath. `fs::copy` on this
+        // fails ENOENT, which aborted install part-way and left earlier hooks
+        // installed and later ones not.
+        let entry = hooks.join("reference-transaction");
+        std::os::unix::fs::symlink(repo.root.join("gone.sh"), &entry).unwrap();
+
+        let report = install(&repo, &repo.root.join("hook-errors.log")).unwrap();
+
+        assert_eq!(
+            report.installed.len() + report.chained.len(),
+            HOOKS.len(),
+            "every hook must be installed, not aborted part-way: {report:?}"
+        );
+        let body = fs::read_to_string(&entry).unwrap();
+        assert!(body.contains(MARKER), "dangling link must be replaced");
+        assert!(
+            fs::symlink_metadata(entry.with_extension("reflogless-orig")).is_err(),
+            "there is no body to preserve, so no backup should be made"
         );
     }
 
@@ -425,72 +633,83 @@ mod tests {
     }
 
     #[test]
-    fn install_into_linked_worktree_uses_the_worktree_hooks_dir() {
+    fn install_into_linked_worktree_uses_the_dir_git_actually_reads() {
         let main = TempDir::new().unwrap();
         let repo = init_repo(main.path());
         // A commit is required before `git worktree add` will branch.
         fs::write(repo.root.join("f"), b"x").unwrap();
-        for args in [
-            vec!["-C", main.path().to_str().unwrap(), "add", "f"],
-            vec!["-C", main.path().to_str().unwrap(), "commit", "-qm", "c"],
-        ] {
-            assert!(Command::new("git").args(&args).status().unwrap().success());
-        }
+        crate::testutil::git_in(&["-C", main.path().to_str().unwrap(), "add", "f"]);
+        crate::testutil::git_in(&["-C", main.path().to_str().unwrap(), "commit", "-qm", "c"]);
         let wt = main.path().parent().unwrap().join(format!(
             "{}-wt",
             main.path().file_name().unwrap().to_str().unwrap()
         ));
-        assert!(Command::new("git")
-            .args(["-C", main.path().to_str().unwrap(), "worktree", "add", "-q"])
-            .arg(&wt)
-            .args(["-b", "wtbranch"])
-            .status()
-            .unwrap()
-            .success());
-
-        // Drop the fixture's `.git/hooks` pin: it is *relative*, and inside a
-        // linked worktree `.git` is a file, so it names a path that cannot exist.
-        // Unpinned, resolution goes through `git_dir()` — the behavior under test.
-        assert!(Command::new("git")
-            .args([
-                "-C",
-                wt.to_str().unwrap(),
-                "config",
-                "--local",
-                "--unset",
-                "core.hooksPath",
-            ])
-            .status()
-            .unwrap()
-            .success());
+        crate::testutil::git_in(&[
+            "-C",
+            main.path().to_str().unwrap(),
+            "worktree",
+            "add",
+            "-q",
+            wt.to_str().unwrap(),
+            "-b",
+            "wtbranch",
+        ]);
 
         let wt_repo = Repo::discover(&wt).expect("linked worktree is a git repo");
         let report = install(&wt_repo, &wt.join("hook-errors.log")).unwrap();
 
-        // In a linked worktree `.git` is a *file*, so `root/.git/hooks` is not a
-        // directory that can be created — the real hooks dir lives under the main
-        // clone's `.git/worktrees/<name>/`. Resolving via `root/.git` made install
-        // fail outright here.
         assert!(
             wt.join(".git").is_file(),
             "precondition: linked worktree .git is a gitfile"
         );
-        assert_eq!(report.hooks_dir, wt_repo.git_dir().join("hooks"));
-        // Under the main clone's per-worktree admin dir, not the worktree's own
-        // `.git`. Compared as a suffix because the gitfile records a canonical
-        // path (`/private/var/...`) while TempDir hands back `/var/...`.
+
+        // Ask git where it reads hooks and require we wrote exactly there. Asserting
+        // a path *shape* instead is what let the per-worktree dir (which git never
+        // reads) pass as correct.
+        let git_says = Command::new("git")
+            .args([
+                "-C",
+                wt.to_str().unwrap(),
+                "rev-parse",
+                "--git-path",
+                "hooks",
+            ])
+            .output()
+            .unwrap();
+        let git_hooks_dir =
+            PathBuf::from(String::from_utf8_lossy(&git_says.stdout).trim().to_string());
+        assert_eq!(
+            canonicalize_existing(&report.hooks_dir),
+            canonicalize_existing(&git_hooks_dir),
+            "installed into a directory git does not read hooks from"
+        );
+        // Explicitly *not* the per-worktree admin dir, and not the gitfile path.
         assert!(
-            report
+            !report
                 .hooks_dir
                 .to_string_lossy()
                 .contains(".git/worktrees/"),
-            "expected a per-worktree hooks dir, got {}",
+            "hooks must go to the common dir, not per-worktree: {}",
             report.hooks_dir.display()
         );
-        assert_ne!(report.hooks_dir, wt.join(".git").join("hooks"));
-        for h in HOOKS {
-            assert!(report.hooks_dir.join(h).exists(), "{h} missing");
-        }
+
+        // The assertion that actually matters: a git operation in the worktree fires
+        // the installed hook. Everything above is a path claim; this is behavior.
+        let sentinel = wt.join("fired.txt");
+        let hook = report.hooks_dir.join("post-checkout");
+        fs::write(
+            &hook,
+            format!("#!/bin/sh\necho fired >> {}\n", sh_squote(&sentinel)),
+        )
+        .unwrap();
+        make_executable(&hook).unwrap();
+        crate::testutil::git_in(&["-C", wt.to_str().unwrap(), "checkout", "-q", "-b", "probe"]);
+        assert!(
+            sentinel.exists(),
+            "post-checkout in {} was not invoked by git — hooks are installed \
+             somewhere git does not look",
+            report.hooks_dir.display()
+        );
 
         let _ = Command::new("git")
             .args(["-C", main.path().to_str().unwrap(), "worktree", "remove"])

@@ -1,6 +1,8 @@
 use crate::crypto;
 use crate::error::Result;
-use crate::hooks::{read_entry, resolve_hooks_target, HooksTarget, HOOKS, MARKER};
+use crate::hooks::{
+    body_chains_to, read_entry, resolve_hooks_target, Entry, HooksTarget, HOOKS, MARKER,
+};
 use crate::repo::Repo;
 use crate::store::Store;
 use std::fmt::Write as _;
@@ -21,9 +23,13 @@ pub struct DoctorReport {
     pub crypto_status: CryptoStatus,
     pub remote: RemoteStatus,
     /// `core.hooksPath` pointed outside the repo, so hooks live in the repo's own
-    /// hooks dir instead. Git invokes the configured path first, so these only run
-    /// if that dispatcher chains to the repo's hook — worth telling the user.
+    /// hooks dir instead. Git invokes only the configured path, so these run only
+    /// if that dispatcher chains to the repo's hook.
     pub declined_hooks_path: Option<std::path::PathBuf>,
+    /// Hooks git provably cannot invoke: `core.hooksPath` was declined and that
+    /// directory has no entry to forward from. A failure, not a note — the same
+    /// call reflogless makes for a shadowed shim.
+    pub shadowed_hooks: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -131,35 +137,38 @@ impl From<crate::shim::ShimStatus> for ShimStatus {
 }
 
 pub fn run(repo: &Repo, store: &Store) -> Result<DoctorReport> {
-    // Inspect the directory `install` writes to, not merely what `core.hooksPath`
-    // names. With a *global* `core.hooksPath` those differ, and reading the shared
-    // dispatcher reported a healthy install as Foreign for every repo on the
-    // machine. Sharing the resolver keeps install and doctor from disagreeing.
+    // Inspect the directory `install` writes to, not whatever `core.hooksPath`
+    // names — with a global `core.hooksPath` those differ, and reading the shared
+    // dispatcher classifies a healthy install as Foreign (#76). Resolving through
+    // the same function as `install` is what keeps the two from disagreeing.
     let HooksTarget { dir, declined } = resolve_hooks_target(repo)?;
     let mut hook_status = Vec::new();
     for h in HOOKS {
         let p = dir.join(h);
         let backup = p.with_extension("reflogless-orig");
-        // `symlink_metadata`, not `exists()`: the latter follows links, so a
-        // dangling symlink would read as Missing.
-        let state = if fs::symlink_metadata(&p).is_err() {
-            HookState::Missing
-        } else {
-            // Shared with `install` so a symlinked entry classifies identically
-            // in both — previously doctor followed the link and called it
-            // Managed while install saw it as foreign and chained it.
-            let body = read_entry(&p);
-            if body.contains(MARKER) {
-                HookState::Managed {
-                    chained: backup.exists(),
+        // Classified through the same `read_entry` as `install`, so the two cannot
+        // disagree about a given entry.
+        let state = match read_entry(&p) {
+            Entry::Missing => HookState::Missing,
+            // Ownership unknown, and saying `FOREIGN` here would assert something
+            // false about a file that may well be ours.
+            Entry::Unreadable(e) => HookState::Unreadable(e),
+            Entry::Symlink { .. } => HookState::Foreign,
+            Entry::Body(body) => {
+                if body.contains(MARKER) {
+                    HookState::Managed {
+                        // From the body, not `backup.exists()` — see
+                        // `hooks::body_chains_to`.
+                        chained: body_chains_to(&body, &backup),
+                    }
+                } else if body.contains("reflogless snap --event") {
+                    // A user hand-edited the reflogless wrapper and stripped
+                    // the marker, but the reflogless call is still present —
+                    // distinct from a legitimate third-party hook.
+                    HookState::Tampered
+                } else {
+                    HookState::Foreign
                 }
-            } else if body.contains("reflogless snap --event") {
-                // A user hand-edited the reflogless wrapper and stripped
-                // the marker, but the reflogless call is still present —
-                // distinct from a legitimate third-party hook.
-                HookState::Tampered
-            } else {
-                HookState::Foreign
             }
         };
         hook_status.push(HookStatus {
@@ -232,6 +241,10 @@ pub fn run(repo: &Repo, store: &Store) -> Result<DoctorReport> {
         watcher,
         crypto_status,
         remote,
+        shadowed_hooks: declined
+            .as_deref()
+            .map(crate::hooks::shadowed_hooks)
+            .unwrap_or_default(),
         declined_hooks_path: declined,
     })
 }
@@ -355,6 +368,12 @@ impl DoctorReport {
                 HookState::Managed { .. } => {}
             }
         }
+        // A hook git will never call is as broken as a shadowed shim, which this
+        // same function already fails on. Reporting it as a note let `doctor`
+        // exit 0 on a repo with no protection at all.
+        if !self.shadowed_hooks.is_empty() {
+            return Some("hooks shadowed by core.hooksPath (git will not invoke them)");
+        }
         if !self.canary_roundtrip {
             return Some("canary roundtrip failed");
         }
@@ -433,13 +452,30 @@ impl DoctorReport {
             let _ = writeln!(s, "  hook {:>22}: {state}", h.name);
         }
         if let Some(p) = &self.declined_hooks_path {
-            let _ = writeln!(
-                s,
-                "  note                : core.hooksPath is set to {} (outside this \
-                 repo); hooks were installed in the repo's own hooks dir. They run \
-                 only if that dispatcher chains to the repo hook.",
-                p.display()
-            );
+            if self.shadowed_hooks.is_empty() {
+                let _ = writeln!(s, "  core.hooksPath      : {} (outside repo)", p.display());
+                let _ = writeln!(
+                    s,
+                    "                        hooks installed in the repo's own dir; they run \
+                     only if that dispatcher chains to them"
+                );
+            } else {
+                let _ = writeln!(
+                    s,
+                    "  core.hooksPath      : SHADOWED by {} (outside repo)",
+                    p.display()
+                );
+                let _ = writeln!(
+                    s,
+                    "                        git looks only there, and it has no entry for: {}",
+                    self.shadowed_hooks.join(", ")
+                );
+                let _ = writeln!(
+                    s,
+                    "                        those hooks will never run — reflogless is not \
+                     protecting this repo"
+                );
+            }
         }
         match &self.store_size_bytes {
             Ok(n) => {
@@ -1151,11 +1187,192 @@ mod tests {
             crypto_status: CryptoStatus::NotProvisioned,
             remote: RemoteStatus::Disabled,
             declined_hooks_path: None,
+            shadowed_hooks: vec![],
         };
         assert_eq!(
             isolated.first_failure(),
             Some("watcher stale (pid reused after reboot)")
         );
+    }
+
+    /// Point `core.hooksPath` at `value` for this repo only, under the suite's
+    /// isolated git config.
+    fn set_hooks_path(repo: &Repo, value: &str) {
+        crate::testutil::git_in(&[
+            "-C",
+            repo.root.to_str().unwrap(),
+            "config",
+            "--local",
+            "core.hooksPath",
+            value,
+        ]);
+    }
+
+    /// #76: with `core.hooksPath` outside the repo, doctor used to inspect that
+    /// shared directory and call a perfectly good install FOREIGN on every repo of
+    /// the machine. It must inspect what `install` wrote.
+    #[test]
+    fn doctor_reports_managed_when_hookspath_points_outside_the_repo() {
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        set_hooks_path(&repo, outside.path().to_str().unwrap());
+        // The dispatcher forwards, so nothing is shadowed — the healthy shape.
+        for h in HOOKS {
+            let p = outside.path().join(h);
+            fs::write(
+                &p,
+                "#!/bin/sh\nexec \"$(git rev-parse --git-path hooks)/$0\"\n",
+            )
+            .unwrap();
+        }
+
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        crate::hooks::install(&repo, &repo.root.join("hook-errors.log")).unwrap();
+        let report = run(&repo, &store).unwrap();
+
+        for h in &report.hooks {
+            assert_eq!(
+                h.state,
+                HookState::Managed { chained: false },
+                "{} should be Managed, not {:?}",
+                h.name,
+                h.state
+            );
+        }
+        assert_eq!(report.declined_hooks_path.as_deref(), Some(outside.path()));
+        assert!(
+            report.shadowed_hooks.is_empty(),
+            "dispatcher has an entry for every hook, so none are shadowed"
+        );
+    }
+
+    /// The other half: when the declined directory has *no* entry for a hook, git
+    /// can never reach ours. That is a failure, not a note — reporting healthy here
+    /// told the user they were protected when they were not.
+    #[test]
+    fn doctor_fails_when_hooks_are_shadowed_by_hookspath() {
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        set_hooks_path(&repo, outside.path().to_str().unwrap());
+
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        crate::hooks::install(&repo, &repo.root.join("hook-errors.log")).unwrap();
+        let report = run(&repo, &store).unwrap();
+
+        assert_eq!(
+            report.shadowed_hooks.len(),
+            HOOKS.len(),
+            "the declined dir is empty, so every hook is unreachable"
+        );
+        assert_eq!(
+            report.first_failure(),
+            Some("hooks shadowed by core.hooksPath (git will not invoke them)"),
+            "a dead install must not report healthy"
+        );
+        assert!(!report.is_healthy());
+        let rendered = report.render();
+        assert!(rendered.contains("SHADOWED"), "render: {rendered}");
+        assert!(rendered.contains("will never run"), "render: {rendered}");
+    }
+
+    /// Install and doctor must classify one entry the same way. Doctor used to
+    /// follow the symlink and call it Managed while install saw a foreign entry and
+    /// chained it.
+    #[cfg(unix)]
+    #[test]
+    fn doctor_and_install_agree_on_a_symlinked_entry() {
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        let hooks = repo.git_common_dir().join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let shared = repo.root.join("dispatcher.sh");
+        fs::write(&shared, format!("{MARKER}\n")).unwrap();
+        std::os::unix::fs::symlink(&shared, hooks.join("post-checkout")).unwrap();
+
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        let report = run(&repo, &store).unwrap();
+
+        let pc = report
+            .hooks
+            .iter()
+            .find(|h| h.name == "post-checkout")
+            .unwrap();
+        assert_eq!(
+            pc.state,
+            HookState::Foreign,
+            "a symlink is foreign to doctor exactly as it is to install"
+        );
+    }
+
+    /// `chained` must be read from the wrapper body, not from the backup file's
+    /// existence. An orphaned `.reflogless-orig` beside a wrapper that no longer
+    /// execs it is exactly the state that reported `OK (chained)` for a
+    /// third-party hook that had silently stopped running.
+    #[test]
+    fn doctor_reports_unchained_when_a_backup_is_orphaned() {
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        crate::hooks::install(&repo, &repo.root.join("hook-errors.log")).unwrap();
+        let hooks = repo.git_common_dir().join("hooks");
+        // A backup with no corresponding `exec` in the installed wrapper.
+        fs::write(
+            hooks.join("post-checkout.reflogless-orig"),
+            "#!/bin/sh\n# orphaned\n",
+        )
+        .unwrap();
+
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        let report = run(&repo, &store).unwrap();
+        let pc = report
+            .hooks
+            .iter()
+            .find(|h| h.name == "post-checkout")
+            .unwrap();
+
+        assert_eq!(
+            pc.state,
+            HookState::Managed { chained: false },
+            "a backup that nothing execs is not a chain"
+        );
+        assert!(report.render().contains("post-checkout: OK\n"));
+    }
+
+    /// An unreadable hook is not evidence that someone else owns it. Reporting
+    /// FOREIGN there is a wrong answer, not a vague one, and it points the user at
+    /// the wrong fix.
+    #[cfg(unix)]
+    #[test]
+    fn doctor_reports_unreadable_hook_distinctly_from_foreign() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        crate::hooks::install(&repo, &repo.root.join("hook-errors.log")).unwrap();
+        let p = repo.git_common_dir().join("hooks").join("post-checkout");
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        let report = run(&repo, &store).unwrap();
+        let pc = report
+            .hooks
+            .iter()
+            .find(|h| h.name == "post-checkout")
+            .unwrap();
+
+        // Restore before asserting so a failure doesn't leave an unreadable temp file.
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+
+        match &pc.state {
+            HookState::Unreadable(e) => assert!(!e.is_empty(), "must carry the reason"),
+            other => panic!("expected Unreadable, got {other:?}"),
+        }
+        assert!(report.render().contains("UNREADABLE"));
     }
 
     #[test]

@@ -580,7 +580,22 @@ Not in v0.1.0. The encryption key is bound to the machine's keychain. v2 may add
 Snapshots stay on the old machine. New machine starts fresh. The encryption key doesn't roam.
 
 **Q: Does it work with worktrees?**
-Yes — each worktree is treated as its own repo (different `<repo-hash>`). Snapshots from worktree A can't be restored into worktree B even if they share the same `.git`.
+Yes. Each worktree gets its own store (different `<repo-hash>`), so snapshots from
+worktree A can't be restored into worktree B even though they share one `.git`. The
+hooks themselves are shared: git reads hooks from the *common* directory, so
+installing from any worktree writes to `<main-clone>/.git/hooks` and covers all of
+them. Each hook still resolves its own store at run time from the worktree git is
+operating in.
+
+**Q: `reflogless init` warned that `core.hooksPath` is outside the repo. What now?**
+You have a machine-wide `core.hooksPath` (husky, lefthook, or a shared dispatcher).
+reflogless won't write there — that directory is shared by every repo, and taking it
+over is how it once clobbered a dispatcher. Hooks go to this repo's own hooks
+directory instead, which git only reaches if your dispatcher forwards to it. Run
+`reflogless doctor`: if it says `SHADOWED`, git has no path to those hooks and the
+repo is **not** protected. Two fixes — point this repo at its own hooks
+(`git -C <repo> config --local core.hooksPath .git/hooks`), or make your dispatcher
+exec `"$(git rev-parse --git-path hooks)/<hook-name>"`.
 
 ## Contributing
 

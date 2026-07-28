@@ -283,6 +283,13 @@ fn run() -> reflogless::Result<()> {
             for h in &report.skipped {
                 println!("skipped {h} (not reflogless-managed)");
             }
+            for h in &report.unreadable {
+                eprintln!(
+                    "reflogless: warning: could not read {h} — left in place. If it is \
+                     reflogless-managed it is still installed and still running; fix the \
+                     permissions and re-run `reflogless uninstall`."
+                );
+            }
             match shim::uninstall() {
                 Ok(Some(p)) => println!("removed shim at {}", p.display()),
                 Ok(None) => {}
@@ -385,11 +392,32 @@ fn run_init(
         eprintln!(
             "reflogless: warning: core.hooksPath is set to {}, which is outside this \
              repo — not writing there (it is shared by every repo on this machine). \
-             Installing into {} instead; these run if that dispatcher chains to the \
-             repo's hook.",
+             Installing into {} instead.",
             p.display(),
             report.hooks_dir.display()
         );
+        // Git consults only core.hooksPath, so a hook with no entry there cannot be
+        // reached at all. Say so at install time rather than leaving the user to
+        // discover it from `doctor` — or from a lost file.
+        let shadowed = reflogless::hooks::shadowed_hooks(p);
+        if shadowed.is_empty() {
+            eprintln!(
+                "reflogless: warning: these run only if {} forwards to the repo's hook. \
+                 Verify with `reflogless doctor`.",
+                p.display()
+            );
+        } else {
+            eprintln!(
+                "reflogless: warning: {} has no entry for {} — git will never invoke \
+                 those hooks, so this repo is NOT protected. Fix by pointing this repo \
+                 at its own hooks (`git -C {} config --local core.hooksPath {}`) or by \
+                 having that dispatcher forward to them.",
+                p.display(),
+                shadowed.join(", "),
+                repo.root.display(),
+                report.hooks_dir.display(),
+            );
+        }
     }
     println!("installed into {}", report.hooks_dir.display());
     for h in &report.installed {

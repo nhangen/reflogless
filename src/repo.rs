@@ -72,6 +72,45 @@ impl Repo {
         g
     }
 
+    /// Resolve the git **common** directory — the one shared by every worktree of
+    /// a clone.
+    ///
+    /// This is not the same as [`Self::git_dir`], and the difference decides where
+    /// hooks live. Git splits its admin state in two: per-worktree state (rebase
+    /// and merge progress, `index.lock`, `HEAD`) lives in the *git dir*, while
+    /// `hooks`, `config`, and `refs` live in the *common* dir. `hooks` is on git's
+    /// common list, so a linked worktree runs the **main clone's** hooks —
+    /// `main/.git/hooks`, never `main/.git/worktrees/<name>/hooks`.
+    ///
+    /// Verified: with a hook planted in both directories, two checkouts inside a
+    /// linked worktree fired the common-dir copy twice and the per-worktree copy
+    /// zero times.
+    ///
+    /// Falls back to [`Self::git_dir`] when git can't be asked, which is correct
+    /// for a primary worktree (there the two are the same directory).
+    pub fn git_common_dir(&self) -> PathBuf {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(["rev-parse", "--git-common-dir"])
+            .output();
+        if let Ok(o) = out {
+            if o.status.success() {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if !s.is_empty() {
+                    let p = PathBuf::from(&s);
+                    // git may answer relatively (plain `.git`) depending on cwd.
+                    return if p.is_absolute() {
+                        p
+                    } else {
+                        self.root.join(p)
+                    };
+                }
+            }
+        }
+        self.git_dir()
+    }
+
     /// Returns `Some(reason)` if git is mid-operation and a snap right now
     /// would capture transient half-applied state (conflict markers, rebase
     /// scratch). Hooks/shim/watcher all skip snap when this fires. See #40.
