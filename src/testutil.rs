@@ -7,13 +7,18 @@ use std::process::Command;
 /// Initialize a throwaway git repo for tests, isolated from the developer's
 /// ambient git configuration.
 ///
-/// The `core.hooksPath` pin is the load-bearing part. A temp repo still inherits
-/// *global* git config, so on any machine with a global `core.hooksPath` (husky,
-/// lefthook, an identity-gate dispatcher) `hooks::hooks_dir` resolves to that
-/// shared directory and every test touching `install`/`uninstall` operates on
-/// the developer's real hooks instead of this repo. Pinning locally makes the
-/// resolution deterministic without weakening the production path, which still
-/// honors `core.hooksPath` as git does.
+/// The `core.hooksPath` pin keeps a temp repo from inheriting the *global* value.
+/// Without it, git commands run here execute the developer's real hooks — on a
+/// machine with an identity-gate dispatcher a test commit gets rejected outright —
+/// and `install` would resolve against that shared directory.
+///
+/// The pin must **not** be mistaken for coverage of the global-`core.hooksPath`
+/// case. Pinning it and stopping there is what let #73 ship green while `install`
+/// was in fact broken on every repo of a machine that sets it. That condition is
+/// covered by pointing `core.hooksPath` at a directory *outside* the repo
+/// explicitly (`install_declines_hooks_dir_outside_repo_and_falls_back` and its
+/// uninstall twin), which is deterministic on every machine rather than depending
+/// on whatever the developer happens to have configured.
 ///
 /// Every test that installs hooks must build its repo through here rather than
 /// calling `git init` inline — that is what keeps the isolation from rotting.

@@ -1,6 +1,6 @@
 use crate::crypto;
 use crate::error::Result;
-use crate::hooks::{hooks_dir, HOOKS, MARKER};
+use crate::hooks::{read_entry, resolve_hooks_target, HooksTarget, HOOKS, MARKER};
 use crate::repo::Repo;
 use crate::store::Store;
 use std::fmt::Write as _;
@@ -20,6 +20,10 @@ pub struct DoctorReport {
     pub watcher: crate::watch::WatcherLiveness,
     pub crypto_status: CryptoStatus,
     pub remote: RemoteStatus,
+    /// `core.hooksPath` pointed outside the repo, so hooks live in the repo's own
+    /// hooks dir instead. Git invokes the configured path first, so these only run
+    /// if that dispatcher chains to the repo's hook — worth telling the user.
+    pub declined_hooks_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -127,30 +131,35 @@ impl From<crate::shim::ShimStatus> for ShimStatus {
 }
 
 pub fn run(repo: &Repo, store: &Store) -> Result<DoctorReport> {
-    let dir = hooks_dir(repo)?;
+    // Inspect the directory `install` writes to, not merely what `core.hooksPath`
+    // names. With a *global* `core.hooksPath` those differ, and reading the shared
+    // dispatcher reported a healthy install as Foreign for every repo on the
+    // machine. Sharing the resolver keeps install and doctor from disagreeing.
+    let HooksTarget { dir, declined } = resolve_hooks_target(repo)?;
     let mut hook_status = Vec::new();
     for h in HOOKS {
         let p = dir.join(h);
         let backup = p.with_extension("reflogless-orig");
-        let state = if !p.exists() {
+        // `symlink_metadata`, not `exists()`: the latter follows links, so a
+        // dangling symlink would read as Missing.
+        let state = if fs::symlink_metadata(&p).is_err() {
             HookState::Missing
         } else {
-            match fs::read_to_string(&p) {
-                Err(e) => HookState::Unreadable(e.to_string()),
-                Ok(body) => {
-                    if body.contains(MARKER) {
-                        HookState::Managed {
-                            chained: backup.exists(),
-                        }
-                    } else if body.contains("reflogless snap --event") {
-                        // A user hand-edited the reflogless wrapper and stripped
-                        // the marker, but the reflogless call is still present —
-                        // distinct from a legitimate third-party hook.
-                        HookState::Tampered
-                    } else {
-                        HookState::Foreign
-                    }
+            // Shared with `install` so a symlinked entry classifies identically
+            // in both — previously doctor followed the link and called it
+            // Managed while install saw it as foreign and chained it.
+            let body = read_entry(&p);
+            if body.contains(MARKER) {
+                HookState::Managed {
+                    chained: backup.exists(),
                 }
+            } else if body.contains("reflogless snap --event") {
+                // A user hand-edited the reflogless wrapper and stripped
+                // the marker, but the reflogless call is still present —
+                // distinct from a legitimate third-party hook.
+                HookState::Tampered
+            } else {
+                HookState::Foreign
             }
         };
         hook_status.push(HookStatus {
@@ -223,6 +232,7 @@ pub fn run(repo: &Repo, store: &Store) -> Result<DoctorReport> {
         watcher,
         crypto_status,
         remote,
+        declined_hooks_path: declined,
     })
 }
 
@@ -421,6 +431,15 @@ impl DoctorReport {
                 HookState::Foreign => "FOREIGN (not reflogless-managed)".into(),
             };
             let _ = writeln!(s, "  hook {:>22}: {state}", h.name);
+        }
+        if let Some(p) = &self.declined_hooks_path {
+            let _ = writeln!(
+                s,
+                "  note                : core.hooksPath is set to {} (outside this \
+                 repo); hooks were installed in the repo's own hooks dir. They run \
+                 only if that dispatcher chains to the repo hook.",
+                p.display()
+            );
         }
         match &self.store_size_bytes {
             Ok(n) => {
@@ -1131,6 +1150,7 @@ mod tests {
             },
             crypto_status: CryptoStatus::NotProvisioned,
             remote: RemoteStatus::Disabled,
+            declined_hooks_path: None,
         };
         assert_eq!(
             isolated.first_failure(),

@@ -267,6 +267,13 @@ fn run() -> reflogless::Result<()> {
                 ));
             }
             let report = hooks::uninstall(&repo)?;
+            if let Some(p) = &report.declined_hooks_path {
+                eprintln!(
+                    "reflogless: note: core.hooksPath is set to {} (outside this repo); \
+                     left it untouched and uninstalled from the repo's own hooks dir.",
+                    p.display()
+                );
+            }
             for h in &report.removed {
                 println!("removed {h}");
             }
@@ -374,6 +381,16 @@ fn run_init(
 ) -> reflogless::Result<()> {
     let log = store.root.join("hook-errors.log");
     let report = hooks::install(repo, &log)?;
+    if let Some(p) = &report.declined_hooks_path {
+        eprintln!(
+            "reflogless: warning: core.hooksPath is set to {}, which is outside this \
+             repo — not writing there (it is shared by every repo on this machine). \
+             Installing into {} instead; these run if that dispatcher chains to the \
+             repo's hook.",
+            p.display(),
+            report.hooks_dir.display()
+        );
+    }
     println!("installed into {}", report.hooks_dir.display());
     for h in &report.installed {
         println!("  + {h}");
