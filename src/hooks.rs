@@ -49,24 +49,64 @@ pub fn hooks_dir(repo: &Repo) -> Result<PathBuf> {
     Ok(repo.root.join(".git").join("hooks"))
 }
 
+/// Refuse to touch a hooks directory that lives outside the repository.
+///
+/// `core.hooksPath` can be set globally, in which case it names shared
+/// infrastructure used by *every* repo on the machine — commonly a directory of
+/// symlinks pointing at one dispatcher script. Installing there silently takes
+/// over that dispatcher for every repo, and uninstalling deletes entries
+/// reflogless never owned. Neither is ever what the caller meant by "install
+/// hooks into this repo".
+///
+/// Gated here rather than at the call sites so no caller can opt out.
+fn assert_hooks_dir_in_repo(repo: &Repo, dir: &Path) -> Result<()> {
+    // Compare canonically where possible so `/var` vs `/private/var` and other
+    // symlinked prefixes don't produce a false refusal. Fall back to the raw
+    // paths when a component doesn't exist yet.
+    let dir_c = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let root_c = repo
+        .root
+        .canonicalize()
+        .unwrap_or_else(|_| repo.root.clone());
+    if dir_c.starts_with(&root_c) {
+        return Ok(());
+    }
+    Err(Error::Config(format!(
+        "core.hooksPath points at {}, which is outside the repository {}. \
+         Refusing to write there — a hooks directory outside the repo is usually \
+         a global dispatcher shared by every repo on this machine. Set a \
+         repo-local core.hooksPath (git -C {} config --local core.hooksPath \
+         .git/hooks) and re-run.",
+        dir_c.display(),
+        root_c.display(),
+        root_c.display(),
+    )))
+}
+
 pub fn install(repo: &Repo, hook_log_path: &Path) -> Result<InstallReport> {
     let repo_id = repo.id();
     let dir = hooks_dir(repo)?;
+    assert_hooks_dir_in_repo(repo, &dir)?;
     fs::create_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
     let mut installed = Vec::new();
     let mut chained = Vec::new();
     for hook in HOOKS {
         let path = dir.join(hook);
-        if path.exists() {
-            let existing = fs::read_to_string(&path).map_err(|e| Error::io(&path, e))?;
+        // `symlink_metadata` so a symlinked entry is seen as *itself*, not as
+        // its target: `Path::exists` follows links (a dangling link reads as
+        // absent) and `read_to_string` would inspect the target's body.
+        if fs::symlink_metadata(&path).is_ok() {
+            let existing = read_entry(&path)?;
             if existing.contains(MARKER) {
                 write_hook(&path, hook, hook_log_path, &repo_id, None)?;
                 installed.push((*hook).to_string());
                 continue;
             }
-            // Preserve and chain existing third-party hook.
+            // Preserve and chain existing third-party hook. Copy resolves the
+            // link, so the backup holds the real body and stays runnable even
+            // after we replace the entry.
             let backup = path.with_extension("reflogless-orig");
-            if !backup.exists() {
+            if fs::symlink_metadata(&backup).is_err() {
                 fs::copy(&path, &backup).map_err(|e| Error::io(&backup, e))?;
             }
             write_hook(&path, hook, hook_log_path, &repo_id, Some(&backup))?;
@@ -83,21 +123,32 @@ pub fn install(repo: &Repo, hook_log_path: &Path) -> Result<InstallReport> {
     })
 }
 
+/// Read a hook entry's body. A symlink or unreadable/binary entry is reported as
+/// empty rather than erroring, so it is treated as foreign and chained instead
+/// of aborting the whole install.
+fn read_entry(path: &Path) -> Result<String> {
+    match fs::symlink_metadata(path) {
+        Ok(md) if md.is_symlink() => Ok(String::new()),
+        _ => Ok(fs::read_to_string(path).unwrap_or_default()),
+    }
+}
+
 pub fn uninstall(repo: &Repo) -> Result<UninstallReport> {
     let dir = hooks_dir(repo)?;
+    assert_hooks_dir_in_repo(repo, &dir)?;
     let mut report = UninstallReport::default();
     for hook in HOOKS {
         let path = dir.join(hook);
-        if !path.exists() {
+        if fs::symlink_metadata(&path).is_err() {
             continue;
         }
-        let body = fs::read_to_string(&path).map_err(|e| Error::io(&path, e))?;
+        let body = read_entry(&path)?;
         if !body.contains(MARKER) {
             report.skipped.push((*hook).to_string());
             continue;
         }
         let backup = path.with_extension("reflogless-orig");
-        if backup.exists() {
+        if fs::symlink_metadata(&backup).is_ok() {
             fs::rename(&backup, &path).map_err(|e| Error::io(&path, e))?;
             report.restored.push((*hook).to_string());
         } else {
@@ -116,6 +167,15 @@ fn write_hook(
     prior: Option<&Path>,
 ) -> Result<()> {
     let body = build_hook_body(hook, hook_log_path, repo_id, prior);
+    // Unlink first. `fs::write` and `set_permissions` both follow symlinks, so
+    // writing straight to a symlinked entry rewrites and chmods the *target* —
+    // which, when several entries link to one shared dispatcher, destroys that
+    // dispatcher instead of replacing the entry. See #73.
+    if let Ok(md) = fs::symlink_metadata(path) {
+        if md.is_symlink() {
+            fs::remove_file(path).map_err(|e| Error::io(path, e))?;
+        }
+    }
     fs::write(path, &body).map_err(|e| Error::io(path, e))?;
     make_executable(path)?;
     Ok(())
@@ -223,22 +283,115 @@ mod tests {
     use std::process::Command;
     use tempfile::TempDir;
 
-    fn init_repo(td: &Path) -> Repo {
+    use crate::testutil::init_repo;
+
+    /// Point the repo's hooks dir at an arbitrary path (absolute or
+    /// repo-relative), the way husky/lefthook or a global dispatcher would.
+    fn set_hooks_path(repo: &Repo, value: &str) {
         Command::new("git")
-            .arg("init")
-            .arg("-q")
-            .arg(td)
+            .args([
+                "-C",
+                repo.root.to_str().unwrap(),
+                "config",
+                "--local",
+                "core.hooksPath",
+                value,
+            ])
             .status()
             .unwrap();
-        Command::new("git")
-            .args(["-C", td.to_str().unwrap(), "config", "user.email", "t@t"])
-            .status()
-            .unwrap();
-        Command::new("git")
-            .args(["-C", td.to_str().unwrap(), "config", "user.name", "t"])
-            .status()
-            .unwrap();
-        Repo::discover(td).unwrap()
+    }
+
+    #[test]
+    fn install_refuses_hooks_dir_outside_repo() {
+        let outside = TempDir::new().unwrap();
+        let sentinel = outside.path().join("reference-transaction");
+        fs::write(&sentinel, "#!/bin/sh\n# not ours\n").unwrap();
+
+        let td = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        set_hooks_path(&repo, outside.path().to_str().unwrap());
+
+        let err = install(&repo, &repo.root.join("hook-errors.log")).unwrap_err();
+        assert!(
+            err.to_string().contains("outside the repository"),
+            "unexpected error: {err}"
+        );
+        // The foreign directory must be untouched — no write, no backup.
+        assert_eq!(
+            fs::read_to_string(&sentinel).unwrap(),
+            "#!/bin/sh\n# not ours\n"
+        );
+        assert!(!outside
+            .path()
+            .join("reference-transaction.reflogless-orig")
+            .exists());
+    }
+
+    #[test]
+    fn uninstall_refuses_hooks_dir_outside_repo() {
+        let outside = TempDir::new().unwrap();
+        let sentinel = outside.path().join("reference-transaction");
+        fs::write(&sentinel, format!("{MARKER}\n")).unwrap();
+
+        let td = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        set_hooks_path(&repo, outside.path().to_str().unwrap());
+
+        let err = uninstall(&repo).unwrap_err();
+        assert!(
+            err.to_string().contains("outside the repository"),
+            "unexpected error: {err}"
+        );
+        // Must not delete a hook it does not own the directory of.
+        assert!(sentinel.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_replaces_symlink_instead_of_writing_through_it() {
+        let td = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        let hooks = repo.root.join(".git").join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+
+        // A shared dispatcher that several hook entries symlink to — the shape
+        // that got destroyed in #73.
+        let shared = repo.root.join("dispatcher.sh");
+        let shared_body = "#!/bin/sh\n# shared dispatcher — must survive\n";
+        fs::write(&shared, shared_body).unwrap();
+        let entry = hooks.join("reference-transaction");
+        std::os::unix::fs::symlink(&shared, &entry).unwrap();
+
+        install(&repo, &repo.root.join("hook-errors.log")).unwrap();
+
+        // The symlink target must be byte-identical afterwards.
+        assert_eq!(fs::read_to_string(&shared).unwrap(), shared_body);
+        // And the entry itself is now a real reflogless hook, not a link.
+        assert!(!fs::symlink_metadata(&entry).unwrap().is_symlink());
+        assert!(fs::read_to_string(&entry).unwrap().contains(MARKER));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_chains_symlinked_foreign_hook_by_copying_target() {
+        let td = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        let hooks = repo.root.join(".git").join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+
+        let shared = repo.root.join("foreign.sh");
+        let shared_body = "#!/bin/sh\necho foreign\n";
+        fs::write(&shared, shared_body).unwrap();
+        let entry = hooks.join("post-checkout");
+        std::os::unix::fs::symlink(&shared, &entry).unwrap();
+
+        let report = install(&repo, &repo.root.join("hook-errors.log")).unwrap();
+
+        assert!(report.chained.contains(&"post-checkout".to_string()));
+        assert_eq!(fs::read_to_string(&shared).unwrap(), shared_body);
+        // The chained backup holds the foreign body, so it can still run.
+        let backup = hooks.join("post-checkout.reflogless-orig");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), shared_body);
     }
 
     #[test]

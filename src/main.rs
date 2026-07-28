@@ -912,6 +912,14 @@ mod tests {
         assert!(status.success(), "git {args:?} failed with {status}");
     }
 
+    /// `git init` plus the local `core.hooksPath` pin, so a test that installs
+    /// hooks can't inherit an ambient global `core.hooksPath` and reach outside
+    /// the temp repo. Mirrors `testutil::init_repo`; see #73.
+    fn git_init(repo: &TempDir) {
+        git(repo, &["init", "-q"]);
+        git(repo, &["config", "--local", "core.hooksPath", ".git/hooks"]);
+    }
+
     #[test]
     fn run_init_creates_baseline_manifest() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -920,7 +928,7 @@ mod tests {
         let old_data_dir = std::env::var_os("REFLOGLESS_DATA_DIR");
         std::env::set_var("REFLOGLESS_DATA_DIR", data.path());
 
-        git(&repo, &["init", "-q"]);
+        git_init(&repo);
         std::fs::write(repo.path().join("untracked.txt"), "baseline\n").unwrap();
 
         let cwd = std::env::current_dir().unwrap();
@@ -967,7 +975,7 @@ mod tests {
         let old_data_dir = std::env::var_os("REFLOGLESS_DATA_DIR");
         std::env::set_var("REFLOGLESS_DATA_DIR", data.path());
 
-        git(&repo, &["init", "-q"]);
+        git_init(&repo);
         std::fs::write(repo.path().join(".reflogless.toml"), "shim = false\n").unwrap();
         std::fs::write(repo.path().join("untracked.txt"), "save me\n").unwrap();
 

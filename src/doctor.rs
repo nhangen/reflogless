@@ -606,23 +606,7 @@ mod tests {
     use std::process::Command;
     use tempfile::TempDir;
 
-    fn init_repo(td: &std::path::Path) -> Repo {
-        Command::new("git")
-            .arg("init")
-            .arg("-q")
-            .arg(td)
-            .status()
-            .unwrap();
-        Command::new("git")
-            .args(["-C", td.to_str().unwrap(), "config", "user.email", "t@t"])
-            .status()
-            .unwrap();
-        Command::new("git")
-            .args(["-C", td.to_str().unwrap(), "config", "user.name", "t"])
-            .status()
-            .unwrap();
-        Repo::discover(td).unwrap()
-    }
+    use crate::testutil::init_repo;
 
     #[test]
     fn doctor_reports_missing_hooks_on_fresh_repo() {
