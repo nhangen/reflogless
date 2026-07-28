@@ -267,6 +267,13 @@ fn run() -> reflogless::Result<()> {
                 ));
             }
             let report = hooks::uninstall(&repo)?;
+            if let Some(p) = &report.declined_hooks_path {
+                eprintln!(
+                    "reflogless: note: core.hooksPath is set to {} (outside this repo); \
+                     left it untouched and uninstalled from the repo's own hooks dir.",
+                    p.display()
+                );
+            }
             for h in &report.removed {
                 println!("removed {h}");
             }
@@ -275,6 +282,13 @@ fn run() -> reflogless::Result<()> {
             }
             for h in &report.skipped {
                 println!("skipped {h} (not reflogless-managed)");
+            }
+            for h in &report.unreadable {
+                eprintln!(
+                    "reflogless: warning: could not read {h} — left in place. If it is \
+                     reflogless-managed it is still installed and still running; fix the \
+                     permissions and re-run `reflogless uninstall`."
+                );
             }
             match shim::uninstall() {
                 Ok(Some(p)) => println!("removed shim at {}", p.display()),
@@ -374,6 +388,37 @@ fn run_init(
 ) -> reflogless::Result<()> {
     let log = store.root.join("hook-errors.log");
     let report = hooks::install(repo, &log)?;
+    if let Some(p) = &report.declined_hooks_path {
+        eprintln!(
+            "reflogless: warning: core.hooksPath is set to {}, which is outside this \
+             repo — not writing there (it is shared by every repo on this machine). \
+             Installing into {} instead.",
+            p.display(),
+            report.hooks_dir.display()
+        );
+        // Git consults only core.hooksPath, so a hook with no entry there cannot be
+        // reached at all. Say so at install time rather than leaving the user to
+        // discover it from `doctor` — or from a lost file.
+        let shadowed = reflogless::hooks::shadowed_hooks(p);
+        if shadowed.is_empty() {
+            eprintln!(
+                "reflogless: warning: these run only if {} forwards to the repo's hook. \
+                 Verify with `reflogless doctor`.",
+                p.display()
+            );
+        } else {
+            eprintln!(
+                "reflogless: warning: {} has no entry for {} — git will never invoke \
+                 those hooks, so this repo is NOT protected. Fix by pointing this repo \
+                 at its own hooks (`git -C {} config --local core.hooksPath {}`) or by \
+                 having that dispatcher forward to them.",
+                p.display(),
+                shadowed.join(", "),
+                repo.root.display(),
+                report.hooks_dir.display(),
+            );
+        }
+    }
     println!("installed into {}", report.hooks_dir.display());
     for h in &report.installed {
         println!("  + {h}");
@@ -912,6 +957,14 @@ mod tests {
         assert!(status.success(), "git {args:?} failed with {status}");
     }
 
+    /// `git init` plus the local `core.hooksPath` pin, so a test that installs
+    /// hooks can't inherit an ambient global `core.hooksPath` and reach outside
+    /// the temp repo. Mirrors `testutil::init_repo`; see #73.
+    fn git_init(repo: &TempDir) {
+        git(repo, &["init", "-q"]);
+        git(repo, &["config", "--local", "core.hooksPath", ".git/hooks"]);
+    }
+
     #[test]
     fn run_init_creates_baseline_manifest() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -920,7 +973,7 @@ mod tests {
         let old_data_dir = std::env::var_os("REFLOGLESS_DATA_DIR");
         std::env::set_var("REFLOGLESS_DATA_DIR", data.path());
 
-        git(&repo, &["init", "-q"]);
+        git_init(&repo);
         std::fs::write(repo.path().join("untracked.txt"), "baseline\n").unwrap();
 
         let cwd = std::env::current_dir().unwrap();
@@ -967,7 +1020,7 @@ mod tests {
         let old_data_dir = std::env::var_os("REFLOGLESS_DATA_DIR");
         std::env::set_var("REFLOGLESS_DATA_DIR", data.path());
 
-        git(&repo, &["init", "-q"]);
+        git_init(&repo);
         std::fs::write(repo.path().join(".reflogless.toml"), "shim = false\n").unwrap();
         std::fs::write(repo.path().join("untracked.txt"), "save me\n").unwrap();
 

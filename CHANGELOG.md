@@ -34,6 +34,46 @@ follow [SemVer](https://semver.org/).
   `legacy` until next touched.
 
 ### Fixed
+- Hook installation destroyed a shared `core.hooksPath` directory (#73).
+  `core.hooksPath` is frequently set *globally*, naming one directory of
+  symlinks that every repo on the machine shares. `install` wrote straight
+  into it, and because `fs::write` and `set_permissions` follow symlinks it
+  rewrote the link *target* — overwriting the shared dispatcher those links
+  point at. `uninstall` then deleted entries reflogless never created.
+  Observed damage: a dispatcher truncated from 71 lines to 24, 4 of 19 hook
+  symlinks turned into regular files, and a git-tracked file in an unrelated
+  repo modified. Now: an out-of-repo `core.hooksPath` is declined and hooks
+  go to the repo's own hooks directory, reported by `install`, `uninstall`,
+  and `doctor`; entries are unlinked before writing so a symlink is replaced
+  rather than followed; and every existence check uses `symlink_metadata`, so
+  a dangling link no longer reads as absent.
+- Hooks were installed where git does not read them, in a linked worktree.
+  Resolution used the per-worktree git dir, but `hooks` is a *common*-dir
+  path — git runs `<main-clone>/.git/hooks`. Hooks landed in
+  `.git/worktrees/<name>/hooks`, `install` reported success, and `doctor`
+  reported healthy while nothing was ever invoked. Resolution now goes
+  through `git rev-parse --git-common-dir`.
+- `doctor` reported a healthy install as FOREIGN on any machine with a global
+  `core.hooksPath` (#76), because it inspected whatever the setting named
+  rather than where `install` writes. It now shares one resolver and one
+  entry classifier with `install`, so the two cannot disagree.
+- `doctor` reported healthy for hooks git can never invoke. When
+  `core.hooksPath` is declined and that directory has no entry for a hook,
+  nothing can forward to ours — the hook is provably dead. That is now a
+  doctor failure (`hooks shadowed by core.hooksPath`) and a warning at
+  install time, not a footnote.
+- A second `reflogless init` silently stopped running a preserved
+  third-party hook: the already-managed branch rewrote the wrapper without
+  its `exec`, while `doctor` kept reporting `OK (chained)` because it read
+  the backup file's existence rather than the wrapper body. Both fixed.
+- An unreadable hook (permissions, non-UTF-8, a directory) was reported as
+  `FOREIGN (not reflogless-managed)` — a wrong answer that points at the
+  wrong fix. `doctor` now reports `UNREADABLE` with the reason, and
+  `uninstall` warns instead of silently skipping a hook that may be ours and
+  still firing.
+- A dangling symlink at a hook entry aborted `install` part-way through,
+  leaving some hooks installed and others not. It is now replaced outright,
+  since a link with nothing behind it has no body worth preserving.
 - macOS lock release race in `RemoteLock` (#62): on macOS, closing a file
   that holds a `flock` does not release the kernel-level lock fast enough
   for a same-process re-acquire — back-to-back `TryOnce` attempts failed
