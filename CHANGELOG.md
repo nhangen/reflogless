@@ -34,6 +34,39 @@ follow [SemVer](https://semver.org/).
   `legacy` until next touched.
 
 ### Fixed
+- Installed hooks resolved the binary off `PATH`, so snapshots were silently
+  skipped wherever `PATH` lacked the install dir (#74). Hooks invoked bare
+  `reflogless`, and a GUI editor, launchd/cron job, or sandboxed runner
+  typically has neither `~/.cargo/bin` nor `/opt/homebrew/bin` — the lookup
+  failed, the trailing `|| true` swallowed it, and nothing at the call site
+  showed a snapshot had been missed. Measured on one real store: 118
+  `reflogless: command not found` lines in `hook-errors.log`. Coverage was
+  intermittent rather than absent, since the same repo snapshots fine when git
+  is driven from an interactive shell, which is what made it easy to miss.
+  `install` now bakes the absolute path of the running binary into each hook
+  (normalized so the install-time working directory can't leak in via `..`,
+  and without resolving the final symlink, so an install reached through a
+  version manager's stable link survives an upgrade). Resolution order in the
+  generated hook is: the baked path, overridden by `$REFLOGLESS_BIN` when that
+  names something executable, then bare `reflogless` as a last resort. Every
+  step down that chain writes a line to `hook-errors.log` naming itself, and
+  `MARKER_VERSION` is bumped to 3 so older hooks are detected (see below).
+- `reflogless doctor` reported hooks as healthy when they had stopped
+  protecting the repo (#74 follow-on). A hook body predating the current format
+  still resolves the binary off `PATH`, and a baked path that a reinstall or
+  upgrade deleted falls back to the same lookup — both printed `OK` and
+  `overall: HEALTHY`. Nothing rewrites hooks automatically, so a user had no way
+  to learn they should re-run `reflogless init`. `doctor` now reads the version
+  and the baked path back out of each managed hook and reports `STALE (...)`,
+  naming the dead path, and fails the run with `run reflogless init` as the
+  remedy — matching what it already did for a stale PATH shim.
+- A hook run with a minimal `PATH` discarded its own error log. The log's parent
+  directory was derived with `$(dirname ...)`, an external command, so under a
+  PATH without coreutils the substitution returned empty, the directory check
+  failed, and the entire log was redirected to `/dev/null`. The hook then failed
+  *and* destroyed the only record of it, in exactly the environment class where
+  that is most likely. Now uses the `${VAR%/*}` builtin, so an existing log
+  directory keeps logging with no `PATH` at all.
 - Hook installation destroyed a shared `core.hooksPath` directory (#73).
   `core.hooksPath` is frequently set *globally*, naming one directory of
   symlinks that every repo on the machine shares. `install` wrote straight
