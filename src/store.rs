@@ -733,8 +733,204 @@ pub fn list_all_stores(base: &Path) -> Result<Vec<StoreSummary>> {
     Ok(out)
 }
 
+/// Hex-only, fixed-length. That is also the path-traversal guard for every
+/// caller that joins this name onto the store root: a name passing this check
+/// cannot contain `/`, `.`, or `..`.
 fn is_repo_id_dirname(name: &str) -> bool {
     name.len() == 16 && name.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Recursive byte total under `p`.
+///
+/// Symlinks are counted at their own (tiny) link size and never traversed: a
+/// store holding a link to a large tree elsewhere must not report that tree as
+/// its own bytes, because the number is presented to the user as reclaimable
+/// space. That holds because `DirEntry::metadata` does *not* follow symlinks —
+/// unlike `fs::metadata`, which would.
+pub(crate) fn dir_size(p: &Path) -> Result<u64> {
+    if !p.exists() {
+        return Err(Error::io(
+            p,
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+        ));
+    }
+    let mut total = 0;
+    let mut stack = vec![p.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).map_err(|e| Error::io(&dir, e))? {
+            let entry = entry.map_err(|e| Error::io(&dir, e))?;
+            let md = entry.metadata().map_err(|e| Error::io(entry.path(), e))?;
+            if md.is_dir() {
+                stack.push(entry.path());
+            } else {
+                total += md.len();
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// Machine-wide store accounting, for the visibility half of #78: `snap` never
+/// prunes, so without a reported total the data dir grows unobserved until a
+/// user notices the disk.
+///
+/// Walks every store directory, so this is one full stat pass over the data dir
+/// — a diagnostic, not something to call from a hook.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StoreUsage {
+    pub store_count: usize,
+    pub total_bytes: u64,
+    /// Stores whose recorded origin repo is gone. The reclaimable ones.
+    pub stale_count: usize,
+    pub stale_bytes: u64,
+    /// Stores with no `repo_origin.txt`. Reported for visibility only: absence
+    /// of that file tracks install age, not deadness — stores in active use
+    /// today predate the file — so these are never reclaimable.
+    pub legacy_count: usize,
+    pub legacy_bytes: u64,
+    /// Store ids whose size could not be read. Their bytes are missing from
+    /// the totals, so a caller must not present the totals as exact.
+    pub unreadable: Vec<String>,
+}
+
+pub fn store_usage(base: &Path) -> Result<StoreUsage> {
+    let root = base.join("reflogless");
+    let mut usage = StoreUsage::default();
+    for s in list_all_stores(base)? {
+        usage.store_count += 1;
+        let bytes = match dir_size(&root.join(&s.store_id)) {
+            Ok(b) => b,
+            Err(_) => {
+                usage.unreadable.push(s.store_id.clone());
+                continue;
+            }
+        };
+        usage.total_bytes += bytes;
+        match s.state {
+            StoreOriginState::Active(_) => {}
+            StoreOriginState::Stale(_) => {
+                usage.stale_count += 1;
+                usage.stale_bytes += bytes;
+            }
+            StoreOriginState::Legacy => {
+                usage.legacy_count += 1;
+                usage.legacy_bytes += bytes;
+            }
+        }
+    }
+    Ok(usage)
+}
+
+/// One store eligible for reclamation: its recorded origin repo was absent when
+/// the pass scanned it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReclaimCandidate {
+    pub store_id: String,
+    pub origin: PathBuf,
+    pub bytes: u64,
+    pub snapshot_count: usize,
+}
+
+#[derive(Debug, Default)]
+pub struct ReclaimReport {
+    /// Every stale store found, whether or not it was removed. Populated in
+    /// both modes — this is what a dry run reports.
+    pub candidates: Vec<ReclaimCandidate>,
+    /// True when nothing was deleted because `apply` was not set.
+    pub dry_run: bool,
+    pub removed: Vec<String>,
+    pub bytes_freed: u64,
+    /// Candidates skipped because the origin repo reappeared between the scan
+    /// and the delete. Not an error — the store is live again.
+    pub revived: Vec<String>,
+    /// Candidates that could not be removed, with the reason. Non-empty means
+    /// the pass partly failed; a caller must not report clean success.
+    pub failed: Vec<(String, String)>,
+}
+
+/// Reclaim whole stores whose origin repo no longer exists (#78).
+///
+/// This operates on `base` rather than on a `Store`, because a `Store` is
+/// constructed from an existing repo path — so `Store::gc` structurally cannot
+/// reach the one class of store guaranteed to be dead.
+///
+/// With `apply` false nothing is deleted; the report lists what would be. One
+/// store failing does not abort the pass: the remaining stores are still
+/// reclaimed and the failure is recorded in `failed`.
+pub fn reclaim_stale_stores(base: &Path, apply: bool) -> Result<ReclaimReport> {
+    let root = base.join("reflogless");
+    let mut report = ReclaimReport {
+        dry_run: !apply,
+        ..Default::default()
+    };
+    for s in list_all_stores(base)? {
+        let origin = match &s.state {
+            StoreOriginState::Stale(p) => p.clone(),
+            // Active is in use. Legacy has no recorded origin, so nothing about
+            // it proves the repo is gone — never evict it (#78).
+            StoreOriginState::Active(_) | StoreOriginState::Legacy => continue,
+        };
+        let dir = root.join(&s.store_id);
+        report.candidates.push(ReclaimCandidate {
+            store_id: s.store_id.clone(),
+            origin: origin.clone(),
+            bytes: dir_size(&dir).unwrap_or(0),
+            snapshot_count: s.snapshot_count,
+        });
+        if !apply {
+            continue;
+        }
+        // Size again immediately before the delete so `bytes_freed` reflects
+        // what was actually there, not a scan-time figure.
+        let bytes = dir_size(&dir).unwrap_or(0);
+        match remove_stale_store(base, &s.store_id, &origin) {
+            Ok(true) => {
+                report.removed.push(s.store_id.clone());
+                report.bytes_freed += bytes;
+            }
+            Ok(false) => report.revived.push(s.store_id.clone()),
+            Err(e) => report.failed.push((s.store_id.clone(), e.to_string())),
+        }
+    }
+    Ok(report)
+}
+
+/// Delete one store directory. Every precondition is enforced here rather than
+/// at the call site so no caller can opt out.
+///
+/// Invariant: a store directory is removed only when it is a real directory
+/// named by a 16-hex store id under `<base>/reflogless`, and its recorded origin
+/// repo is absent *at the moment of removal*.
+///
+/// Returns `Ok(false)` when the origin reappeared since the scan — a repo can be
+/// restored, re-cloned, or a volume remounted while the pass runs, and the store
+/// is then live again.
+fn remove_stale_store(base: &Path, store_id: &str, origin: &Path) -> Result<bool> {
+    if !is_repo_id_dirname(store_id) {
+        return Err(Error::UnsafeOwnership(format!(
+            "refusing to reclaim {store_id}: not a store id"
+        )));
+    }
+    if origin.exists() {
+        return Ok(false);
+    }
+    let dir = base.join("reflogless").join(store_id);
+    let md = fs::symlink_metadata(&dir).map_err(|e| Error::io(&dir, e))?;
+    if md.is_symlink() {
+        return Err(Error::UnsafeOwnership(format!(
+            "refusing to reclaim {store_id}: {} is a symlink, and deleting through it \
+             would remove data outside the store directory",
+            dir.display()
+        )));
+    }
+    if !md.is_dir() {
+        return Err(Error::UnsafeOwnership(format!(
+            "refusing to reclaim {store_id}: {} is not a directory",
+            dir.display()
+        )));
+    }
+    fs::remove_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
+    Ok(true)
 }
 
 pub fn base_data_dir() -> Result<PathBuf> {
@@ -1216,6 +1412,211 @@ mod tests {
             })
             .collect();
         assert_eq!(states, vec!["active", "stale", "legacy"]);
+    }
+
+    /// The core #78 invariant: a store whose origin repo is gone gets reclaimed,
+    /// and neither an active store nor a legacy one is touched. Legacy is the
+    /// dangerous case — absence of `repo_origin.txt` tracks install age, not
+    /// deadness, so stores in daily use look identical to dead ones.
+    #[test]
+    fn reclaim_removes_stale_stores_and_never_active_or_legacy() {
+        let td = TempDir::new().unwrap();
+        let live = td.path().join("live-repo");
+        fs::create_dir_all(&live).unwrap();
+        let dead = td.path().join("deleted-repo");
+        seed_store(td.path(), "1111111111111111", Some(&live), &["a"], false);
+        seed_store(td.path(), "2222222222222222", Some(&dead), &["b"], false);
+        seed_store(td.path(), "3333333333333333", None, &["c"], false);
+
+        let report = reclaim_stale_stores(td.path(), true).unwrap();
+        assert!(!report.dry_run);
+        assert_eq!(report.removed, vec!["2222222222222222".to_string()]);
+        assert!(report.failed.is_empty(), "unexpected failures: {report:?}");
+        assert!(report.revived.is_empty());
+
+        let root = td.path().join("reflogless");
+        assert!(root.join("1111111111111111").exists(), "active was removed");
+        assert!(!root.join("2222222222222222").exists(), "stale survived");
+        assert!(root.join("3333333333333333").exists(), "legacy was removed");
+    }
+
+    #[test]
+    fn reclaim_dry_run_reports_candidates_without_deleting() {
+        let td = TempDir::new().unwrap();
+        let dead = td.path().join("deleted-repo");
+        seed_store(
+            td.path(),
+            "4444444444444444",
+            Some(&dead),
+            &["a", "b"],
+            false,
+        );
+
+        let report = reclaim_stale_stores(td.path(), false).unwrap();
+        assert!(report.dry_run);
+        assert_eq!(report.candidates.len(), 1);
+        assert_eq!(report.candidates[0].store_id, "4444444444444444");
+        assert_eq!(report.candidates[0].origin, dead);
+        assert_eq!(report.candidates[0].snapshot_count, 2);
+        assert!(report.candidates[0].bytes > 0, "size not measured");
+        assert!(report.removed.is_empty());
+        assert_eq!(report.bytes_freed, 0);
+        assert!(
+            td.path()
+                .join("reflogless")
+                .join("4444444444444444")
+                .exists(),
+            "dry run deleted the store"
+        );
+    }
+
+    /// TOCTOU: the origin repo can come back between the scan and the delete
+    /// (restored from backup, re-cloned, volume remounted). The re-check lives
+    /// inside `remove_stale_store`, so this is what keeps a revived repo's
+    /// snapshots from being destroyed by a pass that started moments earlier.
+    #[test]
+    fn reclaim_skips_a_store_whose_origin_reappeared_before_the_delete() {
+        let td = TempDir::new().unwrap();
+        let revived = td.path().join("came-back");
+        seed_store(td.path(), "5555555555555555", Some(&revived), &["a"], false);
+        // Scan-time state is Stale; recreate the repo before the delete runs.
+        let scanned = list_all_stores(td.path()).unwrap();
+        assert!(matches!(scanned[0].state, StoreOriginState::Stale(_)));
+        fs::create_dir_all(&revived).unwrap();
+
+        assert!(
+            !remove_stale_store(td.path(), "5555555555555555", &revived).unwrap(),
+            "removed a store whose repo had come back"
+        );
+        assert!(td
+            .path()
+            .join("reflogless")
+            .join("5555555555555555")
+            .exists());
+    }
+
+    #[test]
+    fn reclaim_refuses_a_store_id_that_is_not_a_store_id() {
+        let td = TempDir::new().unwrap();
+        let gone = td.path().join("nope");
+        // Traversal shape: hex-only/len-16 is the guard that makes joining the
+        // name onto the store root safe.
+        let err = remove_stale_store(td.path(), "../../../etc", &gone).unwrap_err();
+        assert!(
+            matches!(err, Error::UnsafeOwnership(_)),
+            "wrong error: {err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_refuses_to_delete_through_a_symlinked_store_dir() {
+        let td = TempDir::new().unwrap();
+        let outside = td.path().join("someone-elses-data");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("precious.txt"), b"keep me").unwrap();
+        let root = td.path().join("reflogless");
+        fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("6666666666666666")).unwrap();
+
+        let gone = td.path().join("deleted-repo");
+        let err = remove_stale_store(td.path(), "6666666666666666", &gone).unwrap_err();
+        assert!(
+            matches!(err, Error::UnsafeOwnership(_)),
+            "wrong error: {err:?}"
+        );
+        // The diagnosis must name the symlink. Falling through to the generic
+        // "not a directory" refusal would also be safe but would point the user
+        // at the wrong problem.
+        assert!(
+            err.to_string().contains("symlink"),
+            "refusal does not identify the symlink: {err}"
+        );
+        assert!(
+            outside.join("precious.txt").exists(),
+            "deleted data outside the store directory"
+        );
+    }
+
+    /// One unremovable store must not abort the pass — the rest still get
+    /// reclaimed, and the failure is reported rather than swallowed.
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_reports_a_failure_without_abandoning_the_remaining_stores() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        let root = td.path().join("reflogless");
+        let gone_a = td.path().join("dead-a");
+        let gone_b = td.path().join("dead-b");
+        seed_store(td.path(), "7777777777777777", Some(&gone_a), &["a"], false);
+        seed_store(td.path(), "8888888888888888", Some(&gone_b), &["b"], false);
+        // Read+execute but not write: the directory is still traversable (so it
+        // scans as a normal store) but its children cannot be unlinked, so
+        // `remove_dir_all` fails part-way. This is the shape a permissions- or
+        // ownership-damaged store takes in the wild.
+        let blocked = root.join("7777777777777777");
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let report = reclaim_stale_stores(td.path(), true).unwrap();
+
+        // Restore before any assertion can unwind, or TempDir cleanup fails.
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(report.failed.len(), 1, "failure not reported: {report:?}");
+        assert_eq!(report.failed[0].0, "7777777777777777");
+        assert_eq!(
+            report.removed,
+            vec!["8888888888888888".to_string()],
+            "one failure abandoned the remaining stores"
+        );
+    }
+
+    #[test]
+    fn store_usage_separates_total_stale_and_legacy_bytes() {
+        let td = TempDir::new().unwrap();
+        let live = td.path().join("live-repo");
+        fs::create_dir_all(&live).unwrap();
+        let dead = td.path().join("dead-repo");
+        seed_store(td.path(), "aaaaaaaaaaaaaaa1", Some(&live), &["a"], false);
+        seed_store(td.path(), "aaaaaaaaaaaaaaa2", Some(&dead), &["b"], false);
+        seed_store(td.path(), "aaaaaaaaaaaaaaa3", None, &["c"], false);
+
+        let u = store_usage(td.path()).unwrap();
+        assert_eq!(u.store_count, 3);
+        assert_eq!(u.stale_count, 1);
+        assert_eq!(u.legacy_count, 1);
+        assert!(u.unreadable.is_empty());
+        assert!(u.stale_bytes > 0 && u.legacy_bytes > 0);
+        // Totals include active stores, so the total must exceed either class.
+        assert!(u.total_bytes > u.stale_bytes + u.legacy_bytes);
+    }
+
+    #[test]
+    fn store_usage_is_empty_when_no_stores_exist() {
+        let td = TempDir::new().unwrap();
+        assert_eq!(store_usage(td.path()).unwrap(), StoreUsage::default());
+    }
+
+    /// A store containing a symlink to a big tree elsewhere must not report that
+    /// tree's bytes as its own — the figure is presented to the user as
+    /// reclaimable space.
+    #[cfg(unix)]
+    #[test]
+    fn dir_size_does_not_follow_symlinks_out_of_the_tree() {
+        let td = TempDir::new().unwrap();
+        let outside = td.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("big"), vec![0u8; 4096]).unwrap();
+        let inside = td.path().join("inside");
+        fs::create_dir_all(&inside).unwrap();
+        fs::write(inside.join("small"), b"xy").unwrap();
+        std::os::unix::fs::symlink(&outside, inside.join("link")).unwrap();
+
+        let n = dir_size(&inside).unwrap();
+        assert!(
+            n < 4096,
+            "counted the symlink target's bytes ({n}) as store bytes"
+        );
     }
 
     #[test]

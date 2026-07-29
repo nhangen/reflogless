@@ -12,8 +12,8 @@ use reflogless::repo::Repo;
 use reflogless::shim;
 use reflogless::snapshot::{restore, snap_with_config, SnapshotResult};
 use reflogless::store::{
-    base_data_dir, list_all_stores, CryptoCtx, Store, StoreOriginState, DEFAULT_MAX_AGE_DAYS,
-    DEFAULT_MAX_STORE_BYTES,
+    base_data_dir, list_all_stores, reclaim_stale_stores, CryptoCtx, Store, StoreOriginState,
+    DEFAULT_MAX_AGE_DAYS, DEFAULT_MAX_STORE_BYTES,
 };
 
 #[derive(Parser)]
@@ -105,12 +105,23 @@ enum Cmd {
     },
     /// Diff a snapshot file vs the current working tree.
     Diff { id: String, path: Option<PathBuf> },
-    /// Run LRU + age eviction.
+    /// Run LRU + age eviction on this repo's store, or with --stale-stores
+    /// reclaim whole stores whose repo has been deleted.
     Gc {
         #[arg(long, default_value_t = DEFAULT_MAX_AGE_DAYS)]
         max_age_days: i64,
         #[arg(long, default_value_t = DEFAULT_MAX_STORE_BYTES)]
         max_bytes: u64,
+        /// Reclaim entire stores whose recorded origin repo no longer exists.
+        /// Operates across every store under the data dir, not just this repo,
+        /// so it runs from anywhere. Reports only unless --yes is also given.
+        /// Never touches a store that has no recorded origin: that file's
+        /// absence tracks install age, not deadness.
+        #[arg(long, conflicts_with_all = ["max_age_days", "max_bytes"])]
+        stale_stores: bool,
+        /// Confirms the deletion. Without it --stale-stores is a dry run.
+        #[arg(long, requires = "stale_stores")]
+        yes: bool,
     },
     /// Install reflogless hooks into the current repo and provision an
     /// encryption identity (keychain by default; pass --insecure-file-key
@@ -190,6 +201,19 @@ fn run() -> reflogless::Result<()> {
         return run_list_all();
     }
 
+    // Same for `gc --stale-stores`: the stores it reclaims belong to repos that
+    // no longer exist, so requiring the caller to stand inside a repo would be
+    // arbitrary — and a `Store` cannot be constructed for a repo that is gone,
+    // which is exactly why this can't be a `Store` method (#78).
+    if let Cmd::Gc {
+        stale_stores: true,
+        yes,
+        ..
+    } = cli.cmd
+    {
+        return run_reclaim_stale_stores(yes);
+    }
+
     let cwd = std::env::current_dir().map_err(|e| reflogless::Error::io(".", e))?;
     let repo = Repo::discover(&cwd)?;
     repo.assert_safe_ownership()?;
@@ -243,6 +267,7 @@ fn run() -> reflogless::Result<()> {
         Cmd::Gc {
             max_age_days,
             max_bytes,
+            ..
         } => {
             let report = store.gc(max_age_days, max_bytes)?;
             println!(
@@ -839,6 +864,63 @@ fn run_list_all() -> reflogless::Result<()> {
         for id in &s.snapshot_ids {
             println!("  {}", id);
         }
+    }
+    Ok(())
+}
+
+/// `gc --stale-stores`. Dry run unless `apply`. Prints every candidate so the
+/// user sees what a subsequent `--yes` would destroy, since a reclaimed store's
+/// snapshots are unrecoverable.
+fn run_reclaim_stale_stores(apply: bool) -> reflogless::Result<()> {
+    let base = base_data_dir()?;
+    let report = reclaim_stale_stores(&base, apply)?;
+
+    if report.candidates.is_empty() {
+        println!(
+            "no orphaned stores under {}",
+            base.join("reflogless").display()
+        );
+        return Ok(());
+    }
+
+    let total: u64 = report.candidates.iter().map(|c| c.bytes).sum();
+    for c in &report.candidates {
+        println!(
+            "{}  {} bytes  {} snapshots  origin gone: {}",
+            c.store_id,
+            c.bytes,
+            c.snapshot_count,
+            c.origin.display()
+        );
+    }
+
+    if report.dry_run {
+        println!(
+            "would reclaim {} store(s), {} bytes — re-run with --yes to delete",
+            report.candidates.len(),
+            total
+        );
+        return Ok(());
+    }
+
+    println!(
+        "reclaimed {} store(s), {} bytes",
+        report.removed.len(),
+        report.bytes_freed
+    );
+    for id in &report.revived {
+        println!("  kept {id}: origin repo reappeared before the delete");
+    }
+    if !report.failed.is_empty() {
+        for (id, err) in &report.failed {
+            eprintln!("reflogless: could not reclaim {id}: {err}");
+        }
+        // Partial failure must not exit 0 — this runs under `--yes`, and a
+        // caller scripting it would otherwise read silence as success.
+        return Err(reflogless::Error::UnsafeOwnership(format!(
+            "{} store(s) could not be reclaimed",
+            report.failed.len()
+        )));
     }
     Ok(())
 }

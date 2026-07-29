@@ -25,6 +25,26 @@ follow [SemVer](https://semver.org/).
   appends a tiny entry to `<store>/remote-pending.jsonl` (a local "waiting
   room") via a try-once lock that yields immediately on contention, and
   uploads happen out-of-band when `remote push` runs.
+- `reflogless gc --stale-stores` (#78): reclaim whole stores whose origin repo
+  has been deleted. Orphaned stores were previously detected by
+  `list --all` and then never acted on — and because a `Store` is constructed
+  from an existing repo path, `Store::gc` structurally could not reach the one
+  class of store guaranteed to be dead. One such store held 1.9 GB for 52 days
+  and had to be removed by hand. The reclaim path is a free function over the
+  data directory rather than a `Store` method, so it can act on stores whose
+  repo is gone. Reports only unless `--yes` is also passed; prints each
+  candidate's size, snapshot count, and dead origin path first. A store whose
+  origin repo reappears between the scan and the delete is kept, and one
+  unremovable store no longer aborts the pass (it is reported, and the command
+  exits non-zero). Stores with no recorded origin are never evicted — that
+  file's absence tracks install age, not deadness.
+- `reflogless doctor` now reports machine-wide store totals and reclaimable
+  orphans (#78): `all stores` (bytes + count) and, when any exist,
+  `orphaned stores` with reclaimable bytes and the command to review them.
+  `snap` deliberately does not prune — running a GC pass from a git hook would
+  mean silently deleting user data on the hot path — so this is what makes
+  unbounded growth visible. Orphans are informational and do not fail doctor:
+  another repo's dead store is not a failure of this repo's protection.
 - `reflogless list --all` (#29): cross-repo listing enumerates every store
   under the configured data directory, surfacing each store's origin path
   (active / stale / legacy), snapshot count, and snapshot IDs. Plaintext-only

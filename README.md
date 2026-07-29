@@ -141,7 +141,8 @@ reflogless restore ID                restore (refuses overwrite without --force)
 reflogless restore latest            restore most recent
 reflogless restore ID PATH ...       restore specific paths only
 reflogless diff ID [PATH]            unified diff snap vs work
-reflogless gc                        LRU + age eviction
+reflogless gc                        LRU + age eviction for this repo's store
+reflogless gc --stale-stores         report stores whose repo is gone (add --yes to delete)
 reflogless uninstall                 remove hooks; restore prior chained hooks
 reflogless uninstall --purge --yes   also delete the store (--yes required)
 ```
@@ -542,6 +543,37 @@ Enterprise Windows policies such as Smart App Control or AppLocker may block uns
 ### Recovering from a corrupted store
 
 `reflogless gc` evicts corrupt snapshots automatically (`snapshots_corrupt_evicted` count in the gc summary). If `reflogless list` is producing UNREADABLE warnings, run `reflogless gc` and they'll drop. If the store itself is unreadable (permissions, disk corruption), the nuclear option is `reflogless uninstall --purge --yes` followed by `reflogless init` — you'll lose snapshot history but the install will be clean.
+
+### Disk usage grows and nothing prunes it
+
+`snap` never runs a GC pass. Doing that from a git hook would mean deleting
+snapshots on the hot path of a git command, so eviction is always something you
+run deliberately:
+
+- `reflogless gc` — age + size eviction inside the current repo's store.
+- `reflogless doctor` — reports `all stores` (machine-wide bytes and count), so
+  growth is at least visible without hunting through the data directory.
+
+### Reclaiming stores for repos you deleted
+
+A store is addressed by a hash of its repo's absolute path. Delete or move the
+repo and its store is orphaned: still on disk, no longer reachable by anything
+scoped to a repo. `reflogless doctor` counts these as `orphaned stores` with the
+bytes they hold.
+
+```
+reflogless gc --stale-stores          # report only: size, snapshot count, dead origin
+reflogless gc --stale-stores --yes    # delete them
+```
+
+Runs from anywhere — it operates on the data directory, not the current repo.
+Reclaimed snapshots are gone for good, which is why the default is a dry run.
+
+Two things it deliberately will not do. It never evicts a store with no
+recorded origin (`repo_origin.txt`): that file's absence means the store
+predates the feature, not that the repo is dead, and stores in daily use look
+identical. And if a repo reappears between the scan and the delete — restored
+from backup, re-cloned, a volume remounted — that store is kept and reported.
 
 ### WSL / Headless Linux / CI / Docker
 
