@@ -105,8 +105,13 @@ impl Store {
         set_dir_perms(&objects)?;
         set_dir_perms(&snapshots)?;
         let s = Self { root, crypto: None };
-        // Origin recording is cosmetic-metadata for `list --all`; a failure here
-        // must not abort `reflogless snap` — the store itself is still valid.
+        // Not cosmetic, despite what this comment used to say: since #78 the
+        // origin file is the only evidence `gc --stale-stores` has that a store
+        // is dead. A failure here still must not abort `reflogless snap` — the
+        // store is usable without it — but the consequence is that the store
+        // becomes unreclaimable, so it is warned about rather than ignored, and
+        // `remove_stale_store` verifies the recorded path against the store id
+        // rather than trusting whatever ends up on disk.
         if let Err(e) = s.save_repo_origin(&repo.root) {
             eprintln!(
                 "reflogless: warning: could not record origin path ({e}); \
@@ -621,10 +626,25 @@ fn is_encrypted_manifest_path(p: &Path) -> bool {
 pub enum StoreOriginState {
     /// `repo_origin.txt` present and the path still exists on disk.
     Active(PathBuf),
-    /// `repo_origin.txt` present but the path is gone.
+    /// `repo_origin.txt` present, and the origin path is confirmed *absent* —
+    /// the check returned "not found", not merely "could not tell". Only this
+    /// state is reclaimable.
     Stale(PathBuf),
     /// No `repo_origin.txt` — store predates the feature or was hand-created.
     Legacy,
+    /// The origin could not be resolved: `repo_origin.txt` was unreadable, or
+    /// probing the path failed for some reason other than "not found" — an
+    /// unmounted volume, an offline network share, a permission change on a
+    /// parent directory, a path over the OS length limit.
+    ///
+    /// Never reclaimable. `Path::exists()` collapses every one of those causes
+    /// into `false`, which would classify a fully intact repo as dead and delete
+    /// its snapshots. Destroying data requires positive confirmation that the
+    /// origin is gone, never absence of evidence that it is there.
+    Unknown {
+        origin: Option<PathBuf>,
+        reason: String,
+    },
 }
 
 /// Per-store summary surfaced by `list_all_stores`. Metadata is plaintext-only;
@@ -640,6 +660,87 @@ pub struct StoreSummary {
     /// is 0 in that case; the printer should distinguish "no snapshots" from
     /// "snapshots unreadable" so a user doesn't act on a false negative.
     pub snapshots_unreadable: bool,
+}
+
+/// Decide a store's origin state from its `repo_origin.txt`.
+///
+/// The only path to `Stale` — the only reclaimable state — is a *confirmed*
+/// absent origin. `try_exists` is what makes that distinction available:
+/// `Path::exists()` returns `false` for a permission error on a parent, an
+/// unmounted volume, an offline share, or a too-long path, all of which would
+/// otherwise present a live repo's store as reclaimable garbage.
+fn classify_origin(origin_file: &Path) -> StoreOriginState {
+    let recorded = match fs::read_to_string(origin_file) {
+        // Strip only the line ending, not general whitespace. `save_repo_origin`
+        // writes the path verbatim, so trimming made a root with a leading or
+        // trailing space (legal on both Linux and macOS) read back as a *different*
+        // path: it classified Stale, appeared on the dry-run consent screen as
+        // reclaimable while the repo was alive, and could never be reclaimed once
+        // it really died, because the trimmed spelling no longer hashed to the
+        // store id.
+        Ok(s) => s.trim_end_matches(['\n', '\r']).to_string(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StoreOriginState::Legacy,
+        Err(e) => {
+            return StoreOriginState::Unknown {
+                origin: None,
+                reason: format!("cannot read {}: {e}", origin_file.display()),
+            }
+        }
+    };
+    // An empty file is not an absent one. `Legacy` means "predates the origin
+    // file", i.e. install age; an empty file means a truncated write, a full
+    // disk, or an interrupted delete — a damaged store, which must not be
+    // filed under a design decision and reported as "kept" forever.
+    // Blank, not just zero-length: `save_repo_origin` never writes whitespace-only
+    // content, so a file of spaces or tabs is the same damage a zero-length one is.
+    // Only this emptiness check trims — the value carried forward keeps any leading
+    // or trailing space, because that may be part of a real path.
+    if recorded.trim().is_empty() {
+        return StoreOriginState::Unknown {
+            origin: None,
+            reason: format!("{} is empty", origin_file.display()),
+        };
+    }
+    // A path is bytes on Unix, but `Repo::id` and `save_repo_origin` both go
+    // through `to_string_lossy`, so a non-UTF-8 repo root is recorded — and hashed
+    // — as the same U+FFFD-substituted spelling. The store-id gate in
+    // `remove_stale_store` therefore agrees with itself and passes, while the
+    // mangled spelling genuinely does not exist on disk. That combination is
+    // indistinguishable from a dead repo and destroys a live one's snapshots.
+    //
+    // The replacement character means the record is a transcription failure, not an
+    // observation about the filesystem. A path we never wrote down correctly cannot
+    // have its absence confirmed, so this is never `Stale`. A genuine path
+    // containing U+FFFD is caught by the same rule and left unreclaimable; refusing
+    // to delete a store we cannot identify is the correct side to err on.
+    if recorded.contains('\u{FFFD}') {
+        return StoreOriginState::Unknown {
+            reason: format!(
+                "recorded origin {recorded} is a lossy transcription (contains U+FFFD), \
+                 so it cannot identify this store's repo"
+            ),
+            origin: Some(PathBuf::from(recorded)),
+        };
+    }
+    let p = PathBuf::from(recorded);
+    // A relative origin is resolved against the *caller's* cwd, and
+    // `gc --stale-stores` dispatches before repo discovery so its cwd is
+    // arbitrary — the same store would classify Active or Stale depending on
+    // where the command was run. That is not a confirmed anything.
+    if !p.is_absolute() {
+        return StoreOriginState::Unknown {
+            reason: format!("recorded origin {} is not an absolute path", p.display()),
+            origin: Some(p),
+        };
+    }
+    match p.try_exists() {
+        Ok(true) => StoreOriginState::Active(p),
+        Ok(false) => StoreOriginState::Stale(p),
+        Err(e) => StoreOriginState::Unknown {
+            reason: format!("cannot determine whether {} exists: {e}", p.display()),
+            origin: Some(p),
+        },
+    }
 }
 
 /// Walk `<base>/reflogless/<16-hex>/` and summarize each store. Skips entries
@@ -678,17 +779,7 @@ pub fn list_all_stores(base: &Path) -> Result<Vec<StoreSummary>> {
             continue;
         }
 
-        let origin_path = fs::read_to_string(path.join(REPO_ORIGIN_FILENAME))
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from);
-
-        let state = match origin_path {
-            Some(p) if p.exists() => StoreOriginState::Active(p),
-            Some(p) => StoreOriginState::Stale(p),
-            None => StoreOriginState::Legacy,
-        };
+        let state = classify_origin(&path.join(REPO_ORIGIN_FILENAME));
 
         let snapshots_dir = path.join("snapshots");
         let (ids, snapshots_unreadable) = match fs::read_dir(&snapshots_dir) {
@@ -720,21 +811,452 @@ pub fn list_all_stores(base: &Path) -> Result<Vec<StoreSummary>> {
         });
     }
 
-    out.sort_by(|a, b| match (&a.state, &b.state) {
-        (StoreOriginState::Active(pa), StoreOriginState::Active(pb)) => pa.cmp(pb),
-        (StoreOriginState::Active(_), _) => std::cmp::Ordering::Less,
-        (_, StoreOriginState::Active(_)) => std::cmp::Ordering::Greater,
-        (StoreOriginState::Stale(pa), StoreOriginState::Stale(pb)) => pa.cmp(pb),
-        (StoreOriginState::Stale(_), _) => std::cmp::Ordering::Less,
-        (_, StoreOriginState::Stale(_)) => std::cmp::Ordering::Greater,
-        (StoreOriginState::Legacy, StoreOriginState::Legacy) => a.store_id.cmp(&b.store_id),
+    // Active first, then stale, then unknown, then legacy; ties by origin path
+    // (or store id where there is none) so output is stable across runs.
+    fn rank(s: &StoreOriginState) -> u8 {
+        match s {
+            StoreOriginState::Active(_) => 0,
+            StoreOriginState::Stale(_) => 1,
+            StoreOriginState::Unknown { .. } => 2,
+            StoreOriginState::Legacy => 3,
+        }
+    }
+    fn origin_of(s: &StoreOriginState) -> Option<&PathBuf> {
+        match s {
+            StoreOriginState::Active(p) | StoreOriginState::Stale(p) => Some(p),
+            StoreOriginState::Unknown { origin, .. } => origin.as_ref(),
+            StoreOriginState::Legacy => None,
+        }
+    }
+    out.sort_by(|a, b| {
+        rank(&a.state)
+            .cmp(&rank(&b.state))
+            .then_with(|| origin_of(&a.state).cmp(&origin_of(&b.state)))
+            .then_with(|| a.store_id.cmp(&b.store_id))
     });
 
     Ok(out)
 }
 
+/// Hex-only, fixed-length. That is also the path-traversal guard for every
+/// caller that joins this name onto the store root: a name passing this check
+/// cannot contain `/`, `.`, or `..`.
 fn is_repo_id_dirname(name: &str) -> bool {
     name.len() == 16 && name.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Recursive byte total under `p`.
+///
+/// Symlinks are counted at their own (tiny) link size and never traversed: a
+/// store holding a link to a large tree elsewhere must not report that tree as
+/// its own bytes, because the number is presented to the user as reclaimable
+/// space. That holds because `DirEntry::metadata` does *not* follow symlinks —
+/// unlike `fs::metadata`, which would.
+/// Errors rather than reporting a partial figure: the total is shown to the user
+/// as reclaimable space and as the size of something about to be deleted, so an
+/// undercount reads as "this store is nearly empty" when it may be gigabytes.
+pub(crate) fn dir_size(p: &Path) -> Result<u64> {
+    let mut total = 0;
+    let mut stack = vec![p.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).map_err(|e| Error::io(&dir, e))? {
+            let entry = entry.map_err(|e| Error::io(&dir, e))?;
+            let md = entry.metadata().map_err(|e| Error::io(entry.path(), e))?;
+            if md.is_dir() {
+                stack.push(entry.path());
+            } else {
+                total += md.len();
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// Machine-wide store accounting, for the visibility half of #78: `snap` never
+/// prunes, so without a reported total the data dir grows unobserved until a
+/// user notices the disk.
+///
+/// Walks every store directory, so this is one full stat pass over the data dir
+/// — a diagnostic, not something to call from a hook.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StoreUsage {
+    pub store_count: usize,
+    pub total_bytes: u64,
+    /// Stores whose recorded origin repo is gone. The reclaimable ones.
+    pub stale_count: usize,
+    pub stale_bytes: u64,
+    /// Stores with no `repo_origin.txt`. Reported for visibility only: absence
+    /// of that file tracks install age, not deadness — stores in active use
+    /// today predate the file — so these are never reclaimable.
+    pub legacy_count: usize,
+    pub legacy_bytes: u64,
+    /// Stores whose origin could not be resolved (see
+    /// `StoreOriginState::Unknown`). Reported separately from stale because
+    /// these are *not* reclaimable — they may well be live.
+    pub unknown_count: usize,
+    pub unknown_bytes: u64,
+    /// Store ids whose size could not be read. Their bytes are missing from
+    /// the totals, so a caller must not present the totals as exact.
+    pub unreadable: Vec<String>,
+}
+
+pub fn store_usage(base: &Path) -> Result<StoreUsage> {
+    let root = base.join("reflogless");
+    let mut usage = StoreUsage::default();
+    for s in list_all_stores(base)? {
+        usage.store_count += 1;
+        let bytes = match dir_size(&root.join(&s.store_id)) {
+            Ok(b) => b,
+            Err(_) => {
+                usage.unreadable.push(s.store_id.clone());
+                continue;
+            }
+        };
+        usage.total_bytes += bytes;
+        match s.state {
+            StoreOriginState::Active(_) => {}
+            StoreOriginState::Stale(_) => {
+                usage.stale_count += 1;
+                usage.stale_bytes += bytes;
+            }
+            StoreOriginState::Legacy => {
+                usage.legacy_count += 1;
+                usage.legacy_bytes += bytes;
+            }
+            StoreOriginState::Unknown { .. } => {
+                usage.unknown_count += 1;
+                usage.unknown_bytes += bytes;
+            }
+        }
+    }
+    Ok(usage)
+}
+
+/// One store eligible for reclamation: its recorded origin repo was absent when
+/// the pass scanned it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReclaimCandidate {
+    pub store_id: String,
+    pub origin: PathBuf,
+    /// `None` when the store's size could not be measured. The printer must say
+    /// so rather than render it as `0 bytes`: this is the consent screen for an
+    /// irreversible delete, and "0 bytes" invites a yes on what may be
+    /// gigabytes of snapshots.
+    pub bytes: Option<u64>,
+    pub snapshot_count: usize,
+    /// True when `snapshots/` was unreadable at scan time, making
+    /// `snapshot_count` a floor rather than a count — same reasoning as `bytes`.
+    pub snapshots_unreadable: bool,
+}
+
+/// Why a candidate was not reclaimed, and — the part that matters — what that
+/// implies about the store's contents. The three kinds need three different
+/// pieces of advice, and conflating any two of them tells the user something
+/// false about their own data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReclaimFailureKind {
+    /// Nothing was removed: either a precondition refused before the delete, or
+    /// the delete ran and the store measured the same size afterwards. Safe to
+    /// retry once the cause is fixed.
+    Intact,
+    /// The store measured smaller after the failure, so content was removed.
+    /// `snapshots_left` is counted directly rather than inferred, because "you
+    /// have lost snapshots" is the one claim here worth being sure of.
+    PartlyDeleted {
+        bytes_removed: u64,
+        snapshots_left: usize,
+    },
+    /// The store's size could not be read on one or both sides of the failed
+    /// delete, so whether anything was removed is genuinely unknown. Reported as
+    /// unknown — not guessed in either direction.
+    Unverified,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReclaimFailure {
+    pub store_id: String,
+    pub reason: String,
+    pub kind: ReclaimFailureKind,
+}
+
+#[derive(Debug, Default)]
+pub struct ReclaimReport {
+    /// Every stale store found, whether or not it was removed. Populated in
+    /// both modes — this is what a dry run reports.
+    pub candidates: Vec<ReclaimCandidate>,
+    /// True when nothing was deleted because `apply` was not set.
+    pub dry_run: bool,
+    pub removed: Vec<String>,
+    /// Bytes freed by stores this pass removed *completely*. Kept separate from
+    /// `bytes_destroyed` so the "reclaimed N store(s), X bytes" line can never
+    /// pair a count of zero with a non-zero total.
+    pub bytes_freed: u64,
+    /// Bytes removed from stores whose delete then failed. Not a success figure.
+    pub bytes_destroyed: u64,
+    /// Candidates skipped because the origin repo reappeared between the scan
+    /// and the delete. Not an error — the store is live again.
+    pub revived: Vec<String>,
+    /// Candidates that could not be reclaimed. Non-empty means the pass partly
+    /// failed; a caller must not report clean success.
+    pub failures: Vec<ReclaimFailure>,
+    /// Stores skipped because their origin could not be resolved, with the
+    /// reason. These are not candidates and were not touched, but they are
+    /// reported so a store that is silently never reclaimed is still visible —
+    /// an unmounted volume looks exactly like a leak otherwise.
+    pub skipped_unknown: Vec<(String, String)>,
+}
+
+/// Reclaim whole stores whose origin repo no longer exists (#78).
+///
+/// This operates on `base` rather than on a `Store`, because a `Store` is
+/// constructed from an existing repo path — so `Store::gc` structurally cannot
+/// reach the one class of store guaranteed to be dead.
+///
+/// With `apply` false nothing is deleted; the report lists what would be. One
+/// store failing does not abort the pass: the remaining stores are still
+/// reclaimed and the failure is recorded in `failed`.
+pub fn reclaim_stale_stores(base: &Path, apply: bool) -> Result<ReclaimReport> {
+    let root = base.join("reflogless");
+    let mut report = ReclaimReport {
+        dry_run: !apply,
+        ..Default::default()
+    };
+    for s in list_all_stores(base)? {
+        let origin = match &s.state {
+            StoreOriginState::Stale(p) => p.clone(),
+            // Not proof of death, so not reclaimable. Active is in use. Legacy
+            // has no recorded origin at all. Unknown means the probe failed, and
+            // a failed probe is not an absent repo (#78).
+            StoreOriginState::Unknown { reason, .. } => {
+                report
+                    .skipped_unknown
+                    .push((s.store_id.clone(), reason.clone()));
+                continue;
+            }
+            StoreOriginState::Active(_) | StoreOriginState::Legacy => continue,
+        };
+        let dir = root.join(&s.store_id);
+        let bytes = dir_size(&dir).ok();
+        report.candidates.push(ReclaimCandidate {
+            store_id: s.store_id.clone(),
+            origin: origin.clone(),
+            bytes,
+            snapshot_count: s.snapshot_count,
+            snapshots_unreadable: s.snapshots_unreadable,
+        });
+        if !apply {
+            continue;
+        }
+        match remove_stale_store(base, &s.store_id, &origin, current_euid()) {
+            RemoveOutcome::Removed => {
+                report.removed.push(s.store_id.clone());
+                report.bytes_freed += bytes.unwrap_or(0);
+            }
+            RemoveOutcome::Revived => report.revived.push(s.store_id.clone()),
+            // Nothing was touched, by construction — the refusal happened before
+            // the delete.
+            RemoveOutcome::Refused(reason) => report.failures.push(ReclaimFailure {
+                store_id: s.store_id.clone(),
+                reason,
+                kind: ReclaimFailureKind::Intact,
+            }),
+            RemoveOutcome::DeleteFailed(reason) => {
+                // The delete ran, so part of the tree may already be unlinked.
+                // Which of the three cases this is has to be established, not
+                // assumed: "your snapshots are gone" and "nothing happened, retry"
+                // are both damaging when wrong, and the third case — we cannot
+                // tell — is a real outcome that must not be rounded to either.
+                let residual = dir_size(&dir).ok();
+                let kind = match bytes.zip(residual) {
+                    Some((before, after)) if after < before => ReclaimFailureKind::PartlyDeleted {
+                        bytes_removed: before - after,
+                        snapshots_left: count_snapshots(&dir),
+                    },
+                    Some(_) => ReclaimFailureKind::Intact,
+                    // Unmeasurable on one or both sides. Not provably intact and
+                    // not provably damaged.
+                    None => ReclaimFailureKind::Unverified,
+                };
+                if let ReclaimFailureKind::PartlyDeleted { bytes_removed, .. } = kind {
+                    report.bytes_destroyed += bytes_removed;
+                }
+                report.failures.push(ReclaimFailure {
+                    store_id: s.store_id.clone(),
+                    reason,
+                    kind,
+                });
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// The shallowest file still present under `dir`, breadth-first — the best
+/// available pointer at what blocked a delete. Breadth-first because the
+/// remaining entry closest to the root is the most useful thing to name.
+fn first_remaining_entry(dir: &Path) -> Option<PathBuf> {
+    let mut queue = vec![dir.to_path_buf()];
+    let mut subdirs = Vec::new();
+    while let Some(d) = queue.pop() {
+        let Ok(entries) = fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            match e.metadata() {
+                Ok(md) if md.is_dir() => subdirs.push(e.path()),
+                Ok(_) => return Some(e.path()),
+                Err(_) => return Some(e.path()),
+            }
+        }
+        if queue.is_empty() {
+            queue.append(&mut subdirs);
+        }
+    }
+    None
+}
+
+/// Manifests still present under `<store>/snapshots`. Counted on the failure
+/// path so the report can say how many survived instead of asserting loss it
+/// has not checked.
+fn count_snapshots(store_dir: &Path) -> usize {
+    match fs::read_dir(store_dir.join("snapshots")) {
+        Ok(it) => it
+            .flatten()
+            .filter(|e| manifest_id_from_path(&e.path()).is_some())
+            .count(),
+        Err(_) => 0,
+    }
+}
+
+/// What happened to one store in a reclaim pass. `Refused` and `DeleteFailed`
+/// are separate because only the latter can have destroyed anything: a refusal
+/// is decided before `remove_dir_all` is called.
+#[derive(Debug)]
+enum RemoveOutcome {
+    Removed,
+    /// The origin reappeared before the delete; the store was left alone.
+    Revived,
+    /// A precondition failed. Nothing was touched.
+    Refused(String),
+    /// `remove_dir_all` ran and returned an error.
+    DeleteFailed(String),
+}
+
+/// Delete one store directory. Every precondition is enforced here rather than
+/// at the call site so no caller can opt out.
+///
+/// Invariant: a store directory is removed only when it is a real directory
+/// named by a 16-hex store id under `<base>/reflogless`, owned by the current
+/// user, and its recorded origin repo is *confirmed absent* at the moment of
+/// removal.
+///
+/// "Confirmed absent" is the load-bearing word. Every precondition here fails
+/// closed: anything that cannot be established — the origin probe erroring, the
+/// store's metadata being unreadable — refuses the delete rather than proceeding.
+///
+/// Returns `Revived` when the origin reappeared since the scan: a repo can be
+/// restored, re-cloned, or a volume remounted while the pass runs, and the store
+/// is then live again.
+/// `euid` is passed in rather than read here so the ownership refusal is
+/// reachable from a test — the same reason `repo::is_uid_safe` takes both uids
+/// instead of calling `geteuid` itself. Production callers pass
+/// `repo::current_euid()`.
+fn remove_stale_store(base: &Path, store_id: &str, origin: &Path, euid: u32) -> RemoveOutcome {
+    if !is_repo_id_dirname(store_id) {
+        return RemoveOutcome::Refused(format!("refusing to reclaim {store_id}: not a store id"));
+    }
+    // The recorded origin is the sole evidence that this store is dead, and it
+    // arrives from a file on disk. Re-derive the store id from it: a store id is
+    // `sha256(abs repo root)[..8]`, so a faithful origin necessarily hashes back
+    // to the directory holding it. Anything else — a hand-edited file, a write
+    // truncated mid-flight, or a path mangled by `to_string_lossy` on a
+    // non-UTF-8 repo root — is a path this store's repo never had, and a
+    // nonexistent path is exactly what looks like proof of death.
+    let derived = crate::repo::id_for_root(origin);
+    if derived != store_id {
+        return RemoveOutcome::Refused(format!(
+            "refusing to reclaim {store_id}: recorded origin {} hashes to store id \
+             {derived}, so it is not a faithful record of this store's repo",
+            origin.display()
+        ));
+    }
+    match origin.try_exists() {
+        Ok(false) => {}
+        Ok(true) => return RemoveOutcome::Revived,
+        // Same reasoning as `classify_origin`: a probe that errors is not a
+        // repo that is gone. Without this, the re-check is the identical
+        // predicate that classified the store, and so protects against nothing
+        // whose cause persists for the length of the pass.
+        Err(e) => {
+            return RemoveOutcome::Refused(format!(
+                "refusing to reclaim {store_id}: cannot determine whether {} exists: {e}",
+                origin.display()
+            ))
+        }
+    }
+    let dir = base.join("reflogless").join(store_id);
+    let md = match fs::symlink_metadata(&dir) {
+        Ok(md) => md,
+        Err(e) => {
+            return RemoveOutcome::Refused(format!(
+                "refusing to reclaim {store_id}: cannot stat {}: {e}",
+                dir.display()
+            ))
+        }
+    };
+    if md.is_symlink() {
+        return RemoveOutcome::Refused(format!(
+            "refusing to reclaim {store_id}: {} is a symlink, and deleting through it \
+             would remove data outside the store directory",
+            dir.display()
+        ));
+    }
+    if !md.is_dir() {
+        return RemoveOutcome::Refused(format!(
+            "refusing to reclaim {store_id}: {} is not a directory",
+            dir.display()
+        ));
+    }
+    if let Err(e) = assert_dir_owned_by(&dir, &md, euid) {
+        return RemoveOutcome::Refused(format!("refusing to reclaim {store_id}: {e}"));
+    }
+    match fs::remove_dir_all(&dir) {
+        Ok(()) => RemoveOutcome::Removed,
+        // `remove_dir_all` returns a bare error with no path, and the blocker is
+        // usually a nested entry, not the store root — attributing it to the root
+        // sends the user to a directory that is typically fine. Name the entry
+        // that is actually still there.
+        Err(e) => RemoveOutcome::DeleteFailed(match first_remaining_entry(&dir) {
+            Some(blocker) => format!("{e} (still present: {})", blocker.display()),
+            None => e.to_string(),
+        }),
+    }
+}
+
+#[cfg(unix)]
+fn current_euid() -> u32 {
+    crate::repo::current_euid()
+}
+
+/// Windows ownership semantics differ; `Repo::assert_safe_ownership` is likewise
+/// a no-op there.
+#[cfg(not(unix))]
+fn current_euid() -> u32 {
+    0
+}
+
+/// Every other mutating entry point gates on `Repo::assert_safe_ownership`. This
+/// is the one destructive path with no repo to ask, so it checks the store
+/// directory itself.
+#[cfg(unix)]
+fn assert_dir_owned_by(dir: &Path, md: &fs::Metadata, euid: u32) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    crate::repo::is_uid_safe(md.uid(), euid, dir)
+}
+
+#[cfg(not(unix))]
+fn assert_dir_owned_by(_dir: &Path, _md: &fs::Metadata, _euid: u32) -> Result<()> {
+    Ok(())
 }
 
 pub fn base_data_dir() -> Result<PathBuf> {
@@ -1122,6 +1644,17 @@ mod tests {
         }
     }
 
+    /// `seed_store` with the store id **derived from the origin**, as production
+    /// guarantees: a store's directory name is `sha256(abs repo root)[..8]` of the
+    /// very path its `repo_origin.txt` records. Any fixture that exercises the
+    /// delete path must satisfy that, because `remove_stale_store` now re-derives
+    /// the id and refuses a mismatch. Returns the derived id.
+    fn seed_store_for(base: &Path, origin: &Path, manifest_ids: &[&str]) -> String {
+        let id = crate::repo::id_for_root(origin);
+        seed_store(base, &id, Some(origin), manifest_ids, false);
+        id
+    }
+
     #[test]
     fn list_all_stores_returns_multiple_active_stores() {
         let td = TempDir::new().unwrap();
@@ -1206,6 +1739,14 @@ mod tests {
         seed_store(td.path(), "1111111111111111", None, &[], false);
         seed_store(td.path(), "2222222222222222", Some(&stale_path), &[], false);
         seed_store(td.path(), "3333333333333333", Some(&active), &[], false);
+        // A relative origin classifies Unknown, so rank 2 gets a fixture too.
+        seed_store(
+            td.path(),
+            "4444444444444444",
+            Some(Path::new("rel/repo")),
+            &[],
+            false,
+        );
         let stores = list_all_stores(td.path()).unwrap();
         let states: Vec<&str> = stores
             .iter()
@@ -1213,9 +1754,759 @@ mod tests {
                 StoreOriginState::Active(_) => "active",
                 StoreOriginState::Stale(_) => "stale",
                 StoreOriginState::Legacy => "legacy",
+                StoreOriginState::Unknown { .. } => "unknown",
             })
             .collect();
-        assert_eq!(states, vec!["active", "stale", "legacy"]);
+        assert_eq!(states, vec!["active", "stale", "unknown", "legacy"]);
+    }
+
+    /// The core #78 invariant: a store whose origin repo is gone gets reclaimed,
+    /// and neither an active store nor a legacy one is touched. Legacy is the
+    /// dangerous case — absence of `repo_origin.txt` tracks install age, not
+    /// deadness, so stores in daily use look identical to dead ones.
+    #[test]
+    fn reclaim_removes_stale_stores_and_never_active_or_legacy() {
+        let td = TempDir::new().unwrap();
+        let live = td.path().join("live-repo");
+        fs::create_dir_all(&live).unwrap();
+        let dead = td.path().join("deleted-repo");
+        let active_id = seed_store_for(td.path(), &live, &["a"]);
+        let stale_id = seed_store_for(td.path(), &dead, &["b"]);
+        seed_store(td.path(), "3333333333333333", None, &["c"], false);
+
+        let report = reclaim_stale_stores(td.path(), true).unwrap();
+        assert!(!report.dry_run);
+        assert_eq!(report.removed, vec![stale_id.clone()]);
+        assert!(
+            report.failures.is_empty(),
+            "unexpected failures: {report:?}"
+        );
+        assert!(report.revived.is_empty());
+
+        let root = td.path().join("reflogless");
+        assert!(root.join(&active_id).exists(), "active was removed");
+        assert!(!root.join(&stale_id).exists(), "stale survived");
+        assert!(root.join("3333333333333333").exists(), "legacy was removed");
+    }
+
+    #[test]
+    fn reclaim_dry_run_reports_candidates_without_deleting() {
+        let td = TempDir::new().unwrap();
+        let dead = td.path().join("deleted-repo");
+        seed_store(
+            td.path(),
+            "4444444444444444",
+            Some(&dead),
+            &["a", "b"],
+            false,
+        );
+
+        let report = reclaim_stale_stores(td.path(), false).unwrap();
+        assert!(report.dry_run);
+        assert_eq!(report.candidates.len(), 1);
+        assert_eq!(report.candidates[0].store_id, "4444444444444444");
+        assert_eq!(report.candidates[0].origin, dead);
+        assert_eq!(report.candidates[0].snapshot_count, 2);
+        assert!(
+            report.candidates[0].bytes.unwrap_or(0) > 0,
+            "size not measured"
+        );
+        assert!(!report.candidates[0].snapshots_unreadable);
+        assert!(report.removed.is_empty());
+        assert_eq!(report.bytes_freed, 0);
+        assert!(
+            td.path()
+                .join("reflogless")
+                .join("4444444444444444")
+                .exists(),
+            "dry run deleted the store"
+        );
+    }
+
+    /// TOCTOU: the origin repo can come back between the scan and the delete
+    /// (restored from backup, re-cloned, volume remounted). The re-check lives
+    /// inside `remove_stale_store`, so this is what keeps a revived repo's
+    /// snapshots from being destroyed by a pass that started moments earlier.
+    #[test]
+    fn reclaim_skips_a_store_whose_origin_reappeared_before_the_delete() {
+        let td = TempDir::new().unwrap();
+        let revived = td.path().join("came-back");
+        let id = seed_store_for(td.path(), &revived, &["a"]);
+        // Scan-time state is Stale; recreate the repo before the delete runs.
+        let scanned = list_all_stores(td.path()).unwrap();
+        assert!(matches!(scanned[0].state, StoreOriginState::Stale(_)));
+        fs::create_dir_all(&revived).unwrap();
+
+        assert!(
+            matches!(
+                remove_stale_store(td.path(), &id, &revived, current_euid()),
+                RemoveOutcome::Revived
+            ),
+            "removed a store whose repo had come back"
+        );
+        assert!(td.path().join("reflogless").join(&id).exists());
+    }
+
+    #[test]
+    fn reclaim_refuses_a_store_id_that_is_not_a_store_id() {
+        let td = TempDir::new().unwrap();
+        let gone = td.path().join("nope");
+        // Traversal shape: hex-only/len-16 is the guard that makes joining the
+        // name onto the store root safe.
+        match remove_stale_store(td.path(), "../../../etc", &gone, current_euid()) {
+            RemoveOutcome::Refused(msg) => assert!(msg.contains("not a store id"), "{msg}"),
+            other => panic!("expected a refusal, got {}", outcome_name(&other)),
+        }
+    }
+
+    fn outcome_name(o: &RemoveOutcome) -> &'static str {
+        match o {
+            RemoveOutcome::Removed => "Removed",
+            RemoveOutcome::Revived => "Revived",
+            RemoveOutcome::Refused(_) => "Refused",
+            RemoveOutcome::DeleteFailed(_) => "DeleteFailed",
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_refuses_to_delete_through_a_symlinked_store_dir() {
+        let td = TempDir::new().unwrap();
+        let outside = td.path().join("someone-elses-data");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("precious.txt"), b"keep me").unwrap();
+        let root = td.path().join("reflogless");
+        fs::create_dir_all(&root).unwrap();
+        let gone = td.path().join("deleted-repo");
+        let id = crate::repo::id_for_root(&gone);
+        std::os::unix::fs::symlink(&outside, root.join(&id)).unwrap();
+
+        match remove_stale_store(td.path(), &id, &gone, current_euid()) {
+            // The diagnosis must name the symlink. Falling through to the generic
+            // "not a directory" refusal would also be safe but would point the
+            // user at the wrong problem.
+            RemoveOutcome::Refused(msg) => assert!(
+                msg.contains("symlink"),
+                "refusal does not identify the symlink: {msg}"
+            ),
+            other => panic!("expected a refusal, got {}", outcome_name(&other)),
+        }
+        assert!(
+            outside.join("precious.txt").exists(),
+            "deleted data outside the store directory"
+        );
+    }
+
+    /// One unremovable store must not abort the pass — the rest still get
+    /// reclaimed, and the failure is reported rather than swallowed.
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_reports_a_failure_without_abandoning_the_remaining_stores() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        let root = td.path().join("reflogless");
+        let gone_a = td.path().join("dead-a");
+        let gone_b = td.path().join("dead-b");
+        let blocked_id = seed_store_for(td.path(), &gone_a, &["a"]);
+        let ok_id = seed_store_for(td.path(), &gone_b, &["b"]);
+        // Read+execute but not write, at *every* level: each directory is still
+        // traversable (so the store scans normally) but nothing inside it can be
+        // unlinked, so `remove_dir_all` fails having removed nothing. Locking
+        // only the store root is not enough — the walk would descend into a
+        // writable `snapshots/` and empty it first, which is the partial case
+        // covered by `reclaim_reports_a_partly_deleted_store_as_partly_deleted`.
+        let blocked = root.join(&blocked_id);
+        fs::set_permissions(blocked.join("snapshots"), fs::Permissions::from_mode(0o500)).unwrap();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let report = reclaim_stale_stores(td.path(), true).unwrap();
+
+        // Restore before any assertion can unwind, or TempDir cleanup fails.
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(blocked.join("snapshots"), fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(report.failures.len(), 1, "failure not reported: {report:?}");
+        assert_eq!(report.failures[0].store_id, blocked_id);
+        assert_eq!(
+            report.failures[0].kind,
+            ReclaimFailureKind::Intact,
+            "nothing was deleted, so this must not claim damage: {report:?}"
+        );
+        assert_eq!(
+            report.removed,
+            vec![ok_id],
+            "one failure abandoned the remaining stores"
+        );
+    }
+
+    /// The blocker this PR shipped with: `Path::exists()` returns `false` for
+    /// *any* metadata error, so a fully intact repo behind an unreadable parent
+    /// directory — an unmounted volume, an offline share, a `chmod` on a parent —
+    /// classified as dead and had its snapshots deleted, reporting success.
+    ///
+    /// The repo here is entirely present. Only its parent is unreadable.
+    #[cfg(unix)]
+    #[test]
+    fn a_live_repo_behind_an_unreadable_parent_is_never_reclaimed() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        let vault = td.path().join("vault");
+        let live = vault.join("live-repo");
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join("f.txt"), b"precious").unwrap();
+        seed_store(td.path(), "9999999999999999", Some(&live), &["a"], false);
+
+        // Traversal denied on the parent: the repo exists, but no process can
+        // confirm it. `exists()` says false; `try_exists()` says "cannot tell".
+        fs::set_permissions(&vault, fs::Permissions::from_mode(0o000)).unwrap();
+        let scanned = list_all_stores(td.path()).unwrap();
+        let report = reclaim_stale_stores(td.path(), true).unwrap();
+        fs::set_permissions(&vault, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(
+            matches!(scanned[0].state, StoreOriginState::Unknown { .. }),
+            "an unreadable parent was read as proof the repo is gone: {:?}",
+            scanned[0].state
+        );
+        assert!(
+            report.candidates.is_empty() && report.removed.is_empty(),
+            "deleted a live repo's snapshots because its parent was unreadable: {report:?}"
+        );
+        assert_eq!(
+            report.skipped_unknown.len(),
+            1,
+            "skipped the store without saying so: {report:?}"
+        );
+        assert!(
+            live.join("f.txt").exists(),
+            "the repo was there the whole time"
+        );
+        assert!(td
+            .path()
+            .join("reflogless")
+            .join("9999999999999999")
+            .join("snapshots")
+            .exists());
+    }
+
+    /// The pre-delete re-check must fail closed for the same reason: if it uses
+    /// the same predicate that classified the store, it protects only against
+    /// causes that vanish mid-pass, which is the rarest case and not the one that
+    /// loses data.
+    #[cfg(unix)]
+    #[test]
+    fn the_pre_delete_recheck_refuses_when_the_origin_cannot_be_probed() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        let vault = td.path().join("vault");
+        let live = vault.join("live-repo");
+        fs::create_dir_all(&live).unwrap();
+        let id = seed_store_for(td.path(), &live, &["a"]);
+
+        fs::set_permissions(&vault, fs::Permissions::from_mode(0o000)).unwrap();
+        let outcome = remove_stale_store(td.path(), &id, &live, current_euid());
+        fs::set_permissions(&vault, fs::Permissions::from_mode(0o700)).unwrap();
+
+        match outcome {
+            RemoveOutcome::Refused(msg) => assert!(
+                msg.contains("cannot determine whether"),
+                "wrong refusal: {msg}"
+            ),
+            other => panic!(
+                "deleted or accepted a store whose origin could not be probed: {}",
+                outcome_name(&other)
+            ),
+        }
+        assert!(td
+            .path()
+            .join("reflogless")
+            .join(&id)
+            .join("snapshots")
+            .exists());
+    }
+
+    /// Every other mutating entry point gates on `Repo::assert_safe_ownership`.
+    /// This is the only destructive path with no repo to ask, so it must gate on
+    /// the store directory itself — a store under someone else's uid is not ours
+    /// to delete, however dead its origin looks.
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_refuses_a_store_directory_owned_by_another_user() {
+        let td = TempDir::new().unwrap();
+        let gone = td.path().join("dead-repo");
+        let id = seed_store_for(td.path(), &gone, &["a"]);
+
+        // The fixture is ours; the *check* is what's under test, so pass a uid
+        // that is not the owner rather than chowning (which needs root).
+        let not_us = 0xdead_beef;
+        match remove_stale_store(td.path(), &id, &gone, not_us) {
+            RemoveOutcome::Refused(msg) => {
+                assert!(msg.contains("owned by uid"), "wrong refusal: {msg}")
+            }
+            other => panic!("deleted another user's store: {}", outcome_name(&other)),
+        }
+        assert!(td
+            .path()
+            .join("reflogless")
+            .join(&id)
+            .join("snapshots")
+            .exists());
+    }
+
+    /// `remove_dir_all` can unlink part of a store and then fail. That must be
+    /// reported as damage — the original defect called it a no-op ("could not
+    /// reclaim", zero bytes), i.e. "fix the cause and retry" when snapshots were
+    /// already gone.
+    ///
+    /// An unwritable `objects/<shard>/` is the production shape: `write_blob`
+    /// creates exactly that nesting, and the walk unlinks what it can reach
+    /// before hitting the entry it cannot.
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_reports_a_partly_deleted_store_as_damaged_with_a_counted_remainder() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        let gone = td.path().join("dead-repo");
+        let id = seed_store_for(td.path(), &gone, &["a", "b"]);
+        let dir = td.path().join("reflogless").join(&id);
+        let shard = dir.join("objects").join("ab");
+        fs::create_dir_all(&shard).unwrap();
+        fs::write(shard.join("blob"), vec![0u8; 4096]).unwrap();
+        fs::set_permissions(&shard, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let report = reclaim_stale_stores(td.path(), true).unwrap();
+        fs::set_permissions(&shard, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(
+            report.removed.is_empty(),
+            "claimed a successful delete: {report:?}"
+        );
+        assert_eq!(report.failures.len(), 1, "{report:?}");
+        assert_eq!(report.failures[0].store_id, id);
+        match report.failures[0].kind {
+            ReclaimFailureKind::PartlyDeleted {
+                bytes_removed,
+                snapshots_left,
+            } => {
+                assert!(bytes_removed > 0, "damage reported as zero bytes");
+                // How many manifests survive is readdir-order dependent, because
+                // `remove_dir_all` bails on its first error: reach `snapshots/`
+                // before the locked shard and they are gone, reach the shard first
+                // and all of them remain. macOS gave 0 here and Linux gave 2, so a
+                // hard-coded expectation pins the platform, not the product.
+                //
+                // The invariant that holds either way is the one the original
+                // defect broke: the number the report gives a user must match what
+                // they would find if they looked. Counted inline rather than with
+                // `count_snapshots` so this cannot pass by the two agreeing while
+                // both are wrong; that primitive is pinned directly in
+                // `count_snapshots_counts_manifests_on_disk`.
+                let on_disk = fs::read_dir(dir.join("snapshots"))
+                    .map(|rd| {
+                        rd.flatten()
+                            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                            .count()
+                    })
+                    .unwrap_or(0);
+                assert_eq!(
+                    snapshots_left, on_disk,
+                    "reported remainder disagrees with the filesystem"
+                );
+                assert_eq!(report.bytes_destroyed, bytes_removed);
+            }
+            ref other => panic!("a partly-deleted store was not reported as damaged: {other:?}"),
+        }
+        assert_eq!(
+            report.bytes_freed, 0,
+            "damage counted as successfully freed space: {report:?}"
+        );
+    }
+
+    /// `count_snapshots` is what stops the damage report inventing a remainder,
+    /// so it has to actually read the directory. A non-zero count is the case the
+    /// partial-delete fixture above cannot produce: `remove_dir_all` bails on its
+    /// first error, so whether the manifests survive a partial delete depends on
+    /// readdir order — which is why the count is pinned here instead.
+    #[test]
+    fn count_snapshots_counts_manifests_on_disk() {
+        let td = TempDir::new().unwrap();
+        let dir = td.path().join("store");
+        fs::create_dir_all(dir.join("snapshots")).unwrap();
+        assert_eq!(count_snapshots(&dir), 0);
+        fs::write(dir.join("snapshots").join("a.json"), b"{}").unwrap();
+        fs::write(dir.join("snapshots").join("b.json.age"), b"x").unwrap();
+        // Not a manifest — must not inflate the count a user reads as "recoverable".
+        fs::write(dir.join("snapshots").join("README"), b"x").unwrap();
+        assert_eq!(count_snapshots(&dir), 2);
+    }
+
+    /// The regression the fix for the above introduced: when the same permission
+    /// fault blocks `dir_size` *and* the delete, nothing is removed, but the store
+    /// was reported as "partly deleted, snapshots cannot be restored — remove by
+    /// hand". Following that advice destroys snapshots the tool merely failed to
+    /// read. Unmeasurable is its own answer, not a guess in either direction.
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_reports_an_unmeasurable_failure_as_unverified_not_as_damage() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        let gone = td.path().join("dead-repo");
+        let id = seed_store_for(td.path(), &gone, &["a"]);
+        let dir = td.path().join("reflogless").join(&id);
+        // Write+execute, no read: `dir_size` cannot enumerate it and
+        // `remove_dir_all` cannot either, so nothing is deleted and nothing is
+        // measurable.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).unwrap();
+
+        let report = reclaim_stale_stores(td.path(), true).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(report.failures.len(), 1, "{report:?}");
+        assert_eq!(
+            report.failures[0].kind,
+            ReclaimFailureKind::Unverified,
+            "an unreadable store was reported as damaged: {report:?}"
+        );
+        assert_eq!(
+            report.bytes_destroyed, 0,
+            "claimed bytes were destroyed without being able to measure: {report:?}"
+        );
+        // Nothing was actually touched.
+        assert_eq!(count_snapshots(&dir), 1, "a snapshot was lost");
+    }
+
+    /// A store id is `sha256(abs repo root)[..8]`, so a faithful origin hashes
+    /// back to the directory holding it. One that doesn't — hand-edited, or a
+    /// truncated write — names a path this repo never had, and a nonexistent path
+    /// is exactly what reads as proof of death.
+    ///
+    /// Note what this does *not* cover: a `to_string_lossy` mangling. Both the
+    /// store id and the origin file are derived from the same lossy string, so
+    /// they agree and this gate passes. That route is covered by
+    /// `reclaim_refuses_a_store_whose_recorded_origin_is_a_lossy_transcription`.
+    #[test]
+    fn reclaim_refuses_a_store_whose_origin_does_not_hash_to_its_store_id() {
+        let td = TempDir::new().unwrap();
+        let live = td.path().join("very-much-alive");
+        fs::create_dir_all(&live).unwrap();
+        // A real store for a live repo, but its origin file has been rewritten to
+        // a path that does not exist. Classification says Stale; the store id says
+        // this is not that repo's store.
+        let id = crate::repo::id_for_root(&live);
+        seed_store(
+            td.path(),
+            &id,
+            Some(Path::new("/nonexistent/mangled")),
+            &["a"],
+            false,
+        );
+
+        let report = reclaim_stale_stores(td.path(), true).unwrap();
+
+        assert!(
+            report.removed.is_empty(),
+            "deleted a store on the word of an unverifiable origin file: {report:?}"
+        );
+        assert_eq!(report.failures.len(), 1, "{report:?}");
+        assert_eq!(report.failures[0].kind, ReclaimFailureKind::Intact);
+        assert!(
+            report.failures[0].reason.contains("hashes to store id"),
+            "wrong refusal: {}",
+            report.failures[0].reason
+        );
+        assert!(td
+            .path()
+            .join("reflogless")
+            .join(&id)
+            .join("snapshots")
+            .exists());
+    }
+
+    /// A trailing space is legal in a path on both Linux and macOS, and
+    /// `save_repo_origin` writes the path verbatim. Trimming the read side made
+    /// the two disagree: the recorded origin of a *live* repo read back as a
+    /// different, nonexistent path, so the store classified `Stale` and appeared on
+    /// the dry-run consent screen as reclaimable. Only the store-id gate stopped
+    /// the delete — and that same mismatch meant the store could never be reclaimed
+    /// once the repo really died. Both halves of the feature broke on a space.
+    #[test]
+    fn a_repo_root_with_a_trailing_space_is_active_not_a_candidate() {
+        let td = TempDir::new().unwrap();
+        let live = td.path().join("alive ");
+        fs::create_dir_all(&live).unwrap();
+        let id = seed_store_for(td.path(), &live, &["a"]);
+
+        let report = reclaim_stale_stores(td.path(), true).unwrap();
+
+        assert!(
+            report.candidates.is_empty(),
+            "offered a live repo's store as reclaimable: {report:?}"
+        );
+        assert!(
+            report.failures.is_empty(),
+            "a live repo's store reached the delete path at all: {report:?}"
+        );
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert!(td
+            .path()
+            .join("reflogless")
+            .join(&id)
+            .join("snapshots")
+            .join("a.json")
+            .exists());
+    }
+
+    /// `remove_stale_store` refuses a store path that is not a directory. Today
+    /// `list_all_stores` filters non-directories out before it can be reached, so
+    /// this is unreachable through `reclaim_stale_stores` — which is the point of
+    /// gating inside the destroying function rather than at its caller: the
+    /// precondition holds for a caller that does not filter. Exercised directly,
+    /// because a guard no test can reach is a guard that can be deleted by accident.
+    #[test]
+    fn remove_stale_store_refuses_a_store_path_that_is_not_a_directory() {
+        let td = TempDir::new().unwrap();
+        let gone = td.path().join("dead-repo");
+        // The id must match the origin or the earlier gate refuses first, and the
+        // origin must be genuinely absent or we get `Revived`.
+        let id = crate::repo::id_for_root(&gone);
+        fs::create_dir_all(td.path().join("reflogless")).unwrap();
+        fs::write(td.path().join("reflogless").join(&id), b"not a directory").unwrap();
+
+        match remove_stale_store(td.path(), &id, &gone, current_euid()) {
+            RemoveOutcome::Refused(reason) => assert!(
+                reason.contains("is not a directory"),
+                "refused for the wrong reason: {reason}"
+            ),
+            other => panic!("deleted through a non-directory store path: {other:?}"),
+        }
+        assert!(
+            td.path().join("reflogless").join(&id).exists(),
+            "the path was removed anyway"
+        );
+    }
+
+    /// The route the store-id gate does **not** close, and the reason this feature
+    /// took four rounds to get right.
+    ///
+    /// On Linux a path is bytes, not UTF-8. `Repo::id` hashes
+    /// `root.to_string_lossy()` and `save_repo_origin` writes
+    /// `path.to_string_lossy()` — the *same* mangled string. So for a non-UTF-8
+    /// repo root the recorded origin is `…\u{FFFD}…`, the store directory is named
+    /// `sha256` of that identical string, and re-deriving the id from the record
+    /// agrees. Every guard passes: the path is absolute, `try_exists()` says
+    /// `Ok(false)` because the mangled spelling genuinely does not exist, the
+    /// directory is a real dir we own. A live repo's snapshots get destroyed.
+    ///
+    /// A lossy transcription is not evidence about the filesystem — it is evidence
+    /// that we failed to record the path. Absence of a path we never wrote down
+    /// correctly cannot be confirmation that the repo is gone, so this is
+    /// `Unknown`, never `Stale`.
+    ///
+    /// The fixture is the exact state production produces: `seed_store_for`
+    /// derives the id from the origin, as `Store::for_repo_with_base` does. It
+    /// reproduces on macOS even though APFS rejects non-UTF-8 names, because what
+    /// matters is the *recorded string*, not this host's filesystem — which is why
+    /// the earlier rounds' macOS-only runs never saw it.
+    #[test]
+    fn reclaim_refuses_a_store_whose_recorded_origin_is_a_lossy_transcription() {
+        let td = TempDir::new().unwrap();
+        // What `to_string_lossy()` yields for a repo at b"/data/\xff-repo".
+        let mangled = td.path().join("data").join("\u{FFFD}-repo");
+        let id = seed_store_for(td.path(), &mangled, &["a"]);
+
+        let report = reclaim_stale_stores(td.path(), true).unwrap();
+
+        assert!(
+            report.removed.is_empty(),
+            "destroyed a live repo's snapshots on a mangled origin: {report:?}"
+        );
+        assert!(
+            report.candidates.is_empty(),
+            "offered a store with an untrustworthy origin as reclaimable: {report:?}"
+        );
+        assert_eq!(
+            report.skipped_unknown.len(),
+            1,
+            "a lossy origin was not reported as unresolvable: {report:?}"
+        );
+        assert!(
+            report.skipped_unknown[0].1.contains("lossy"),
+            "the reason does not explain why: {:?}",
+            report.skipped_unknown[0]
+        );
+        assert!(
+            td.path()
+                .join("reflogless")
+                .join(&id)
+                .join("snapshots")
+                .join("a.json")
+                .exists(),
+            "the snapshot is gone"
+        );
+    }
+
+    /// An empty origin file means a truncated write or an interrupted delete — a
+    /// damaged store. Filing it as `Legacy` reports it as a design decision
+    /// ("no recorded origin, kept") and hides it forever.
+    #[test]
+    fn an_empty_origin_file_is_unknown_not_legacy() {
+        let td = TempDir::new().unwrap();
+        seed_store(
+            td.path(),
+            "1234123412341234",
+            Some(Path::new("   \n\t ")),
+            &["a"],
+            false,
+        );
+        let stores = list_all_stores(td.path()).unwrap();
+        assert!(
+            matches!(
+                stores[0].state,
+                StoreOriginState::Unknown { origin: None, .. }
+            ),
+            "wrong state: {:?}",
+            stores[0].state
+        );
+    }
+
+    /// A relative origin resolves against the caller's cwd, and
+    /// `gc --stale-stores` dispatches before repo discovery so its cwd is
+    /// arbitrary — the same store would read Active or Stale depending on where
+    /// the command ran. That is not confirmation of anything.
+    #[test]
+    fn a_relative_origin_is_unknown_and_never_a_candidate() {
+        let td = TempDir::new().unwrap();
+        seed_store(
+            td.path(),
+            "5678567856785678",
+            Some(Path::new("some/relative/repo")),
+            &["a"],
+            false,
+        );
+
+        let stores = list_all_stores(td.path()).unwrap();
+        let report = reclaim_stale_stores(td.path(), true).unwrap();
+
+        assert!(
+            matches!(stores[0].state, StoreOriginState::Unknown { .. }),
+            "a cwd-relative origin was treated as authoritative: {:?}",
+            stores[0].state
+        );
+        assert!(report.candidates.is_empty(), "{report:?}");
+        assert_eq!(report.skipped_unknown.len(), 1);
+    }
+
+    /// A store whose size cannot be measured must not be offered for deletion as
+    /// `0 bytes`. This is the consent screen for an irreversible delete, and the
+    /// 1.9 GB orphan that motivated #78 is exactly the case that matters.
+    #[cfg(unix)]
+    #[test]
+    fn an_unmeasurable_candidate_reports_no_size_rather_than_zero() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        let gone = td.path().join("dead-repo");
+        seed_store(td.path(), "cafecafecafecafe", Some(&gone), &["a"], false);
+        let snaps = td
+            .path()
+            .join("reflogless")
+            .join("cafecafecafecafe")
+            .join("snapshots");
+        fs::set_permissions(&snaps, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let report = reclaim_stale_stores(td.path(), false).unwrap();
+        fs::set_permissions(&snaps, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(report.candidates.len(), 1);
+        assert!(
+            report.candidates[0].bytes.is_none(),
+            "an unreadable store reported a concrete size: {report:?}"
+        );
+        assert!(
+            report.candidates[0].snapshots_unreadable,
+            "snapshot count is a floor here and must say so: {report:?}"
+        );
+    }
+
+    /// An unreadable `repo_origin.txt` is not an absent one. Reading it as
+    /// `Legacy` would be safe today but silently wrong, and the distinction is
+    /// what keeps `store_usage` honest about which stores it cannot classify.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_origin_file_is_unknown_not_legacy() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        let gone = td.path().join("dead-repo");
+        seed_store(td.path(), "d00dd00dd00dd00d", Some(&gone), &["a"], false);
+        let origin_file = td
+            .path()
+            .join("reflogless")
+            .join("d00dd00dd00dd00d")
+            .join(REPO_ORIGIN_FILENAME);
+        fs::set_permissions(&origin_file, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let stores = list_all_stores(td.path()).unwrap();
+        let usage = store_usage(td.path()).unwrap();
+        fs::set_permissions(&origin_file, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(
+            matches!(
+                stores[0].state,
+                StoreOriginState::Unknown { origin: None, .. }
+            ),
+            "wrong state: {:?}",
+            stores[0].state
+        );
+        assert_eq!(usage.unknown_count, 1);
+        assert_eq!(usage.legacy_count, 0, "counted as legacy");
+        assert!(usage.unknown_bytes > 0);
+    }
+
+    #[test]
+    fn store_usage_separates_total_stale_and_legacy_bytes() {
+        let td = TempDir::new().unwrap();
+        let live = td.path().join("live-repo");
+        fs::create_dir_all(&live).unwrap();
+        let dead = td.path().join("dead-repo");
+        seed_store(td.path(), "aaaaaaaaaaaaaaa1", Some(&live), &["a"], false);
+        seed_store(td.path(), "aaaaaaaaaaaaaaa2", Some(&dead), &["b"], false);
+        seed_store(td.path(), "aaaaaaaaaaaaaaa3", None, &["c"], false);
+
+        let u = store_usage(td.path()).unwrap();
+        assert_eq!(u.store_count, 3);
+        assert_eq!(u.stale_count, 1);
+        assert_eq!(u.legacy_count, 1);
+        assert!(u.unreadable.is_empty());
+        assert!(u.stale_bytes > 0 && u.legacy_bytes > 0);
+        // Totals include active stores, so the total must exceed either class.
+        assert!(u.total_bytes > u.stale_bytes + u.legacy_bytes);
+    }
+
+    #[test]
+    fn store_usage_is_empty_when_no_stores_exist() {
+        let td = TempDir::new().unwrap();
+        assert_eq!(store_usage(td.path()).unwrap(), StoreUsage::default());
+    }
+
+    /// A store containing a symlink to a big tree elsewhere must not report that
+    /// tree's bytes as its own — the figure is presented to the user as
+    /// reclaimable space.
+    #[cfg(unix)]
+    #[test]
+    fn dir_size_does_not_follow_symlinks_out_of_the_tree() {
+        let td = TempDir::new().unwrap();
+        let outside = td.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("big"), vec![0u8; 4096]).unwrap();
+        let inside = td.path().join("inside");
+        fs::create_dir_all(&inside).unwrap();
+        fs::write(inside.join("small"), b"xy").unwrap();
+        std::os::unix::fs::symlink(&outside, inside.join("link")).unwrap();
+
+        let n = dir_size(&inside).unwrap();
+        assert!(
+            n < 4096,
+            "counted the symlink target's bytes ({n}) as store bytes"
+        );
     }
 
     #[test]

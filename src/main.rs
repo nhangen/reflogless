@@ -12,8 +12,8 @@ use reflogless::repo::Repo;
 use reflogless::shim;
 use reflogless::snapshot::{restore, snap_with_config, SnapshotResult};
 use reflogless::store::{
-    base_data_dir, list_all_stores, CryptoCtx, Store, StoreOriginState, DEFAULT_MAX_AGE_DAYS,
-    DEFAULT_MAX_STORE_BYTES,
+    base_data_dir, list_all_stores, reclaim_stale_stores, CryptoCtx, ReclaimFailureKind,
+    ReclaimReport, Store, StoreOriginState, DEFAULT_MAX_AGE_DAYS, DEFAULT_MAX_STORE_BYTES,
 };
 
 #[derive(Parser)]
@@ -105,12 +105,23 @@ enum Cmd {
     },
     /// Diff a snapshot file vs the current working tree.
     Diff { id: String, path: Option<PathBuf> },
-    /// Run LRU + age eviction.
+    /// Run LRU + age eviction on this repo's store, or with --stale-stores
+    /// reclaim whole stores whose repo has been deleted.
     Gc {
         #[arg(long, default_value_t = DEFAULT_MAX_AGE_DAYS)]
         max_age_days: i64,
         #[arg(long, default_value_t = DEFAULT_MAX_STORE_BYTES)]
         max_bytes: u64,
+        /// Reclaim entire stores whose recorded origin repo no longer exists.
+        /// Operates across every store under the data dir, not just this repo,
+        /// so it runs from anywhere. Reports only unless --yes is also given.
+        /// Never touches a store that has no recorded origin: that file's
+        /// absence tracks install age, not deadness.
+        #[arg(long, conflicts_with_all = ["max_age_days", "max_bytes"])]
+        stale_stores: bool,
+        /// Confirms the deletion. Without it --stale-stores is a dry run.
+        #[arg(long, requires = "stale_stores")]
+        yes: bool,
     },
     /// Install reflogless hooks into the current repo and provision an
     /// encryption identity (keychain by default; pass --insecure-file-key
@@ -190,6 +201,19 @@ fn run() -> reflogless::Result<()> {
         return run_list_all();
     }
 
+    // Same for `gc --stale-stores`: the stores it reclaims belong to repos that
+    // no longer exist, so requiring the caller to stand inside a repo would be
+    // arbitrary — and a `Store` cannot be constructed for a repo that is gone,
+    // which is exactly why this can't be a `Store` method (#78).
+    if let Cmd::Gc {
+        stale_stores: true,
+        yes,
+        ..
+    } = cli.cmd
+    {
+        return run_reclaim_stale_stores(yes);
+    }
+
     let cwd = std::env::current_dir().map_err(|e| reflogless::Error::io(".", e))?;
     let repo = Repo::discover(&cwd)?;
     repo.assert_safe_ownership()?;
@@ -243,6 +267,7 @@ fn run() -> reflogless::Result<()> {
         Cmd::Gc {
             max_age_days,
             max_bytes,
+            ..
         } => {
             let report = store.gc(max_age_days, max_bytes)?;
             println!(
@@ -827,6 +852,13 @@ fn run_list_all() -> reflogless::Result<()> {
             StoreOriginState::Active(p) => ("active", p.display().to_string()),
             StoreOriginState::Stale(p) => ("stale", p.display().to_string()),
             StoreOriginState::Legacy => ("legacy", s.store_id.clone()),
+            StoreOriginState::Unknown { origin, reason } => (
+                "unknown",
+                match origin {
+                    Some(p) => format!("{} ({reason})", p.display()),
+                    None => format!("{} ({reason})", s.store_id),
+                },
+            ),
         };
         if s.snapshots_unreadable {
             println!("{}  {}  snapshots unreadable", origin_label, state_label,);
@@ -841,6 +873,180 @@ fn run_list_all() -> reflogless::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `gc --stale-stores`. Dry run unless `apply`. Prints every candidate so the
+/// user sees what a subsequent `--yes` would destroy, since a reclaimed store's
+/// snapshots are unrecoverable.
+fn run_reclaim_stale_stores(apply: bool) -> reflogless::Result<()> {
+    let base = base_data_dir()?;
+    let report = reclaim_stale_stores(&base, apply)?;
+    let rendered = render_reclaim(&report, &base.join("reflogless"));
+    print!("{}", rendered.out);
+    eprint!("{}", rendered.err);
+    match rendered.failure {
+        Some(msg) => Err(reflogless::Error::ReclaimIncomplete(msg)),
+        None => Ok(()),
+    }
+}
+
+/// What `gc --stale-stores` prints, as data.
+///
+/// Pure so it can be asserted on directly. Every line here is either a consent
+/// screen for an irreversible delete or a statement about whether the user still
+/// has their snapshots, and none of it was testable while it lived inside
+/// `println!` calls. Mirrors `doctor::Report::render`.
+struct RenderedReclaim {
+    out: String,
+    err: String,
+    /// `Some` when the pass did not fully succeed, carrying the error text. The
+    /// exit code is the entire contract for anyone scripting `--yes`.
+    failure: Option<String>,
+}
+
+fn render_reclaim(report: &ReclaimReport, root: &std::path::Path) -> RenderedReclaim {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let mut err = String::new();
+
+    // Emitted before the early return: a store nobody can classify is invisible
+    // otherwise, and a bare "no orphaned stores" would be a false all-clear.
+    for (id, reason) in &report.skipped_unknown {
+        let _ = writeln!(err, "reflogless: keeping {id}: {reason}");
+    }
+
+    if report.candidates.is_empty() {
+        // The count goes on stdout too. A consumer that discards stderr must not
+        // be told "nothing to do" when a store was skipped.
+        let kept = match report.skipped_unknown.len() {
+            0 => String::new(),
+            n => format!(" ({n} store(s) kept: origin could not be checked)"),
+        };
+        let _ = writeln!(out, "no orphaned stores under {}{kept}", root.display());
+        return RenderedReclaim {
+            out,
+            err,
+            failure: None,
+        };
+    }
+
+    // An unmeasurable store contributes nothing to the total and says so on its
+    // own line, so the total is a floor, never a claim.
+    let measured: u64 = report.candidates.iter().filter_map(|c| c.bytes).sum();
+    let any_unmeasured = report.candidates.iter().any(|c| c.bytes.is_none());
+    for c in &report.candidates {
+        let size = match c.bytes {
+            Some(b) => format!("{b} bytes"),
+            None => "size unreadable".to_string(),
+        };
+        let snaps = if c.snapshots_unreadable {
+            "snapshots unreadable".to_string()
+        } else {
+            format!("{} snapshots", c.snapshot_count)
+        };
+        let _ = writeln!(
+            out,
+            "{}  {}  {}  origin gone: {}",
+            c.store_id,
+            size,
+            snaps,
+            c.origin.display()
+        );
+    }
+
+    let qualifier = if any_unmeasured { " (at least)" } else { "" };
+
+    if report.dry_run {
+        let _ = writeln!(
+            out,
+            "would reclaim {} store(s), {measured} bytes{qualifier} — re-run with --yes to delete",
+            report.candidates.len(),
+        );
+        return RenderedReclaim {
+            out,
+            err,
+            failure: None,
+        };
+    }
+
+    // Pairs only with stores removed in full. Bytes taken off stores whose delete
+    // then failed are not a success figure and get their own line below.
+    let _ = writeln!(
+        out,
+        "reclaimed {} store(s), {} bytes",
+        report.removed.len(),
+        report.bytes_freed
+    );
+    for id in &report.revived {
+        let _ = writeln!(out, "  kept {id}: origin repo reappeared before the delete");
+    }
+
+    let mut damaged = 0usize;
+    for f in &report.failures {
+        match &f.kind {
+            ReclaimFailureKind::Intact => {
+                let _ = writeln!(
+                    err,
+                    "reflogless: could not reclaim {} (nothing was deleted, safe to \
+                     retry once fixed): {}",
+                    f.store_id, f.reason
+                );
+            }
+            ReclaimFailureKind::PartlyDeleted {
+                bytes_removed,
+                snapshots_left,
+            } => {
+                damaged += 1;
+                // Says what was counted, not what was assumed. `snapshots_left`
+                // is read off disk, so "0 remain" is a fact and "3 remain" stops
+                // the user deleting three recoverable snapshots.
+                let remainder = match snapshots_left {
+                    0 => "no snapshots remain".to_string(),
+                    n => format!(
+                        "{n} snapshot(s) remain and may still be restorable, so \
+                         inspect it before removing it"
+                    ),
+                };
+                let _ = writeln!(
+                    err,
+                    "reflogless: PARTLY DELETED {}: {} — {bytes_removed} bytes were \
+                     removed before it failed; {remainder}",
+                    f.store_id, f.reason
+                );
+            }
+            ReclaimFailureKind::Unverified => {
+                damaged += 1;
+                let _ = writeln!(
+                    err,
+                    "reflogless: could not reclaim {} and could not verify its \
+                     contents, so whether anything was deleted is unknown — inspect \
+                     it before removing it: {}",
+                    f.store_id, f.reason
+                );
+            }
+        }
+    }
+    if report.bytes_destroyed > 0 {
+        let _ = writeln!(
+            out,
+            "partly deleted {damaged} store(s), {} bytes removed from stores that were \
+             not reclaimed",
+            report.bytes_destroyed
+        );
+    }
+
+    let failure = (!report.failures.is_empty()).then(|| {
+        format!(
+            "{} store(s) could not be reclaimed{}",
+            report.failures.len(),
+            if damaged == 0 {
+                ""
+            } else {
+                ", and at least one may have been left incomplete"
+            }
+        )
+    });
+    RenderedReclaim { out, err, failure }
 }
 
 fn run_shim(shim_dir: PathBuf, args: Vec<String>) -> reflogless::Result<()> {
@@ -941,6 +1147,7 @@ fn shim_fallback_log_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reflogless::store::{ReclaimCandidate, ReclaimFailure};
     use std::process::Command;
     use std::sync::Mutex;
     use tempfile::TempDir;
@@ -1010,6 +1217,337 @@ mod tests {
                 .any(|e| e.path == std::path::Path::new("untracked.txt")),
             "baseline must include untracked file"
         );
+    }
+
+    /// Seed `<data>/reflogless/<id>/` with a manifest and an origin pointer, the
+    /// shape `list_all_stores` classifies on.
+    /// The store id is **derived from the origin**, as production guarantees:
+    /// `remove_stale_store` re-derives it and refuses a mismatch, so a fixture
+    /// with a hand-picked id is not a store the tool could have written. Creates
+    /// `objects/` too, so the real nesting (`objects/<shard>/`) is reachable.
+    /// Returns the derived id.
+    fn seed_store(data: &std::path::Path, origin: &std::path::Path) -> String {
+        let id = reflogless::repo::id_for_root(origin);
+        let dir = data.join("reflogless").join(&id);
+        std::fs::create_dir_all(dir.join("snapshots")).unwrap();
+        std::fs::create_dir_all(dir.join("objects")).unwrap();
+        std::fs::write(dir.join("snapshots").join("2026-01-01-000000.json"), b"{}").unwrap();
+        std::fs::write(
+            dir.join("repo_origin.txt"),
+            origin.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        id
+    }
+
+    /// Run `run_reclaim_stale_stores` against an isolated data dir. Never let this
+    /// touch the real one — it deletes stores.
+    ///
+    /// The restore runs from a `Drop` impl so a panic inside `f` cannot leave
+    /// `REFLOGLESS_DATA_DIR` (process-global) pointing at a dropped `TempDir` for
+    /// every later test in this binary.
+    fn with_data_dir<T>(data: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("REFLOGLESS_DATA_DIR", v),
+                    None => std::env::remove_var("REFLOGLESS_DATA_DIR"),
+                }
+            }
+        }
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = Restore(std::env::var_os("REFLOGLESS_DATA_DIR"));
+        std::env::set_var("REFLOGLESS_DATA_DIR", data);
+        f()
+    }
+
+    /// The dry run is the default because a reclaimed store is unrecoverable.
+    /// Nothing may be deleted without `--yes`.
+    #[test]
+    fn reclaim_dry_run_deletes_nothing_and_exits_zero() {
+        let data = TempDir::new().unwrap();
+        let gone = data.path().join("deleted-repo");
+        let id = seed_store(data.path(), &gone);
+
+        let result = with_data_dir(data.path(), || run_reclaim_stale_stores(false));
+
+        result.unwrap();
+        assert!(
+            data.path().join("reflogless").join(&id).exists(),
+            "dry run deleted a store"
+        );
+    }
+
+    #[test]
+    fn reclaim_apply_removes_the_orphan_and_exits_zero() {
+        let data = TempDir::new().unwrap();
+        let live = data.path().join("live-repo");
+        std::fs::create_dir_all(&live).unwrap();
+        let gone = data.path().join("deleted-repo");
+        let orphan = seed_store(data.path(), &gone);
+        let kept = seed_store(data.path(), &live);
+
+        let result = with_data_dir(data.path(), || run_reclaim_stale_stores(true));
+
+        result.unwrap();
+        let root = data.path().join("reflogless");
+        assert!(!root.join(&orphan).exists(), "orphan survived");
+        assert!(root.join(&kept).exists(), "live store removed");
+    }
+
+    /// The exit code is the whole contract for anyone scripting `--yes`: silence
+    /// plus exit 0 reads as "everything was reclaimed". A store left behind must
+    /// make the command fail.
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_exits_non_zero_when_a_store_could_not_be_reclaimed() {
+        use std::os::unix::fs::PermissionsExt;
+        let data = TempDir::new().unwrap();
+        let gone = data.path().join("deleted-repo");
+        let id = seed_store(data.path(), &gone);
+        let dir = data.path().join("reflogless").join(&id);
+        std::fs::set_permissions(
+            dir.join("snapshots"),
+            std::fs::Permissions::from_mode(0o500),
+        )
+        .unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let result = with_data_dir(data.path(), || run_reclaim_stale_stores(true));
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            dir.join("snapshots"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+
+        match result {
+            Err(reflogless::Error::ReclaimIncomplete(msg)) => {
+                assert!(msg.contains("could not be reclaimed"), "{msg}")
+            }
+            other => panic!("expected a non-zero exit, got {other:?}"),
+        }
+    }
+
+    /// A store partly destroyed by a failed delete must also fail the command.
+    /// This is the case the `Intact` fixture above cannot reach, and it is the
+    /// worse one: exiting 0 after damaging a store tells a script the pass
+    /// succeeded. An unwritable `objects/<shard>/` is the production shape.
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_exits_non_zero_when_a_store_was_left_incomplete() {
+        use std::os::unix::fs::PermissionsExt;
+        let data = TempDir::new().unwrap();
+        let gone = data.path().join("deleted-repo");
+        let id = seed_store(data.path(), &gone);
+        let shard = data
+            .path()
+            .join("reflogless")
+            .join(&id)
+            .join("objects")
+            .join("ab");
+        std::fs::create_dir_all(&shard).unwrap();
+        std::fs::write(shard.join("blob"), vec![0u8; 4096]).unwrap();
+        std::fs::set_permissions(&shard, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let result = with_data_dir(data.path(), || run_reclaim_stale_stores(true));
+
+        std::fs::set_permissions(&shard, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        match result {
+            Err(reflogless::Error::ReclaimIncomplete(msg)) => assert!(
+                msg.contains("left incomplete"),
+                "the exit message does not distinguish damage from a clean refusal: {msg}"
+            ),
+            other => panic!("damaged a store and exited zero: {other:?}"),
+        }
+    }
+
+    /// An empty data dir must not look like a failure.
+    #[test]
+    fn reclaim_reports_nothing_to_do_and_exits_zero() {
+        let data = TempDir::new().unwrap();
+        with_data_dir(data.path(), || run_reclaim_stale_stores(true)).unwrap();
+    }
+
+    fn candidate(id: &str, bytes: Option<u64>, snapshots_unreadable: bool) -> ReclaimCandidate {
+        ReclaimCandidate {
+            store_id: id.to_string(),
+            origin: PathBuf::from("/gone/repo"),
+            bytes,
+            snapshot_count: 3,
+            snapshots_unreadable,
+        }
+    }
+
+    fn root() -> PathBuf {
+        PathBuf::from("/data/reflogless")
+    }
+
+    /// `bytes` became `Option` precisely so an unmeasurable store is not offered
+    /// for deletion as `0 bytes`. The store layer pins the field; this pins the
+    /// consent screen the user actually reads.
+    #[test]
+    fn render_never_shows_an_unmeasurable_store_as_zero_bytes() {
+        let report = ReclaimReport {
+            candidates: vec![candidate("aaaaaaaaaaaaaaaa", None, false)],
+            dry_run: true,
+            ..Default::default()
+        };
+        let r = render_reclaim(&report, &root());
+        let candidate_line = r
+            .out
+            .lines()
+            .find(|l| l.starts_with("aaaaaaaaaaaaaaaa"))
+            .expect("no candidate line");
+        assert!(
+            candidate_line.contains("size unreadable"),
+            "{candidate_line}"
+        );
+        assert!(
+            !candidate_line.contains("0 bytes"),
+            "an unmeasurable store was offered as 0 bytes: {candidate_line}"
+        );
+        // The summary total is legitimately 0 here — nothing was measurable — but
+        // it must not present that as the exact figure.
+        assert!(
+            r.out.contains("0 bytes (at least)"),
+            "an unmeasurable total presented as exact: {}",
+            r.out
+        );
+    }
+
+    /// The totals are a floor whenever any store could not be measured, and must
+    /// say so — otherwise a partial sum reads as the whole truth.
+    #[test]
+    fn render_marks_totals_as_a_floor_only_when_something_was_unmeasurable() {
+        let exact = ReclaimReport {
+            candidates: vec![candidate("aaaaaaaaaaaaaaaa", Some(10), false)],
+            dry_run: true,
+            ..Default::default()
+        };
+        assert!(!render_reclaim(&exact, &root()).out.contains("at least"));
+
+        let floor = ReclaimReport {
+            candidates: vec![
+                candidate("aaaaaaaaaaaaaaaa", Some(10), false),
+                candidate("bbbbbbbbbbbbbbbb", None, false),
+            ],
+            dry_run: true,
+            ..Default::default()
+        };
+        let out = render_reclaim(&floor, &root()).out;
+        assert!(
+            out.contains("10 bytes (at least)"),
+            "totals presented as exact while a store was unmeasurable: {out}"
+        );
+    }
+
+    /// An unreadable `snapshots/` makes the count a floor. Saying "3 snapshots"
+    /// when the real number is unknown understates what a `--yes` would destroy.
+    #[test]
+    fn render_says_snapshots_are_unreadable_rather_than_guessing_a_count() {
+        let report = ReclaimReport {
+            candidates: vec![candidate("aaaaaaaaaaaaaaaa", Some(10), true)],
+            dry_run: true,
+            ..Default::default()
+        };
+        let out = render_reclaim(&report, &root()).out;
+        assert!(out.contains("snapshots unreadable"), "{out}");
+        assert!(!out.contains("3 snapshots"), "{out}");
+    }
+
+    /// A skipped store must reach the user even when stderr is discarded and even
+    /// when there is nothing else to report — that invisibility is the leak #78
+    /// exists to end.
+    #[test]
+    fn render_surfaces_skipped_stores_on_both_streams() {
+        let report = ReclaimReport {
+            skipped_unknown: vec![("aaaaaaaaaaaaaaaa".into(), "volume not mounted".into())],
+            dry_run: false,
+            ..Default::default()
+        };
+        let r = render_reclaim(&report, &root());
+        assert!(r.err.contains("keeping aaaaaaaaaaaaaaaa"), "{}", r.err);
+        assert!(r.err.contains("volume not mounted"), "{}", r.err);
+        assert!(
+            r.out.contains("1 store(s) kept"),
+            "a stdout-only consumer was told nothing to do: {}",
+            r.out
+        );
+    }
+
+    /// The three failure kinds need three different pieces of advice, and the
+    /// damaging error is telling a user their snapshots are gone when they are
+    /// not — they act on that by deleting the store.
+    #[test]
+    fn render_gives_each_failure_kind_advice_that_matches_what_is_known() {
+        let report = ReclaimReport {
+            candidates: vec![candidate("aaaaaaaaaaaaaaaa", Some(1), false)],
+            dry_run: false,
+            bytes_destroyed: 4096,
+            failures: vec![
+                ReclaimFailure {
+                    store_id: "1111111111111111".into(),
+                    reason: "denied".into(),
+                    kind: ReclaimFailureKind::Intact,
+                },
+                ReclaimFailure {
+                    store_id: "2222222222222222".into(),
+                    reason: "denied".into(),
+                    kind: ReclaimFailureKind::PartlyDeleted {
+                        bytes_removed: 4096,
+                        snapshots_left: 2,
+                    },
+                },
+                ReclaimFailure {
+                    store_id: "3333333333333333".into(),
+                    reason: "denied".into(),
+                    kind: ReclaimFailureKind::Unverified,
+                },
+            ],
+            ..Default::default()
+        };
+        let r = render_reclaim(&report, &root());
+
+        assert!(
+            r.err
+                .contains("1111111111111111 (nothing was deleted, safe to retry"),
+            "an untouched store was not described as untouched: {}",
+            r.err
+        );
+        // The counted remainder is the point: it stops the user deleting two
+        // snapshots they could still restore.
+        assert!(
+            r.err.contains("2 snapshot(s) remain") && r.err.contains("inspect it before removing"),
+            "damage report does not say what survived: {}",
+            r.err
+        );
+        assert!(
+            r.err.contains("whether anything was deleted is unknown"),
+            "an unverifiable store was described as known: {}",
+            r.err
+        );
+        // Never on any failure line: an unqualified instruction to delete.
+        assert!(
+            !r.err.contains("cannot be restored"),
+            "asserted unrecoverable loss: {}",
+            r.err
+        );
+        // Damage is not success. The reclaimed line pairs only with full removals.
+        assert!(
+            r.out.contains("reclaimed 0 store(s), 0 bytes"),
+            "damaged bytes counted as freed: {}",
+            r.out
+        );
+        assert!(
+            r.out.contains("partly deleted 2 store(s), 4096 bytes"),
+            "damage not reported on its own line: {}",
+            r.out
+        );
+        assert!(r.failure.is_some(), "an incomplete pass exited zero");
     }
 
     #[test]

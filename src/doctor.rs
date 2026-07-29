@@ -5,7 +5,7 @@ use crate::hooks::{
     Entry, HooksTarget, HOOKS, INVOKE_PROBE, MARKER,
 };
 use crate::repo::Repo;
-use crate::store::Store;
+use crate::store::{base_data_dir, dir_size, store_usage, Store, StoreUsage};
 use std::fmt::Write as _;
 use std::fs;
 
@@ -31,6 +31,11 @@ pub struct DoctorReport {
     /// directory has no entry to forward from. A failure, not a note — the same
     /// call reflogless makes for a shadowed shim.
     pub shadowed_hooks: Vec<String>,
+    /// Machine-wide store accounting, not scoped to this repo. `snap` never
+    /// prunes, so this is the only place total growth and reclaimable orphans
+    /// become visible (#78). Informational: another repo's dead store is not a
+    /// failure of this repo's protection, so it stays out of `first_failure`.
+    pub all_stores: Result<StoreUsage>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -312,6 +317,7 @@ pub fn run(repo: &Repo, store: &Store) -> Result<DoctorReport> {
             .map(crate::hooks::shadowed_hooks)
             .unwrap_or_default(),
         declined_hooks_path: declined,
+        all_stores: base_data_dir().and_then(|b| store_usage(&b)),
     })
 }
 
@@ -585,6 +591,52 @@ impl DoctorReport {
                 let _ = writeln!(s, "  store size          : UNREADABLE ({e})");
             }
         }
+        match &self.all_stores {
+            Ok(u) => {
+                let _ = writeln!(
+                    s,
+                    "  all stores          : {} bytes across {} store(s)",
+                    u.total_bytes, u.store_count
+                );
+                if u.stale_count > 0 {
+                    let _ = writeln!(
+                        s,
+                        "  orphaned stores     : {} ({} bytes reclaimable) — \
+                         `reflogless gc --stale-stores` to review",
+                        u.stale_count, u.stale_bytes
+                    );
+                }
+                // Counted as part of the total above, and never reclaimable, so
+                // without their own line they read as unexplained bulk.
+                if u.legacy_count > 0 {
+                    let _ = writeln!(
+                        s,
+                        "  pre-origin stores   : {} ({} bytes) — no recorded origin, kept",
+                        u.legacy_count, u.legacy_bytes
+                    );
+                }
+                if u.unknown_count > 0 {
+                    let _ = writeln!(
+                        s,
+                        "  unresolved origins  : {} ({} bytes) — origin could not be \
+                         checked (unmounted volume or permissions), kept",
+                        u.unknown_count, u.unknown_bytes
+                    );
+                }
+                if !u.unreadable.is_empty() {
+                    let _ = writeln!(
+                        s,
+                        "  store size unknown  : {} store(s) unreadable, totals are a \
+                         lower bound: {}",
+                        u.unreadable.len(),
+                        u.unreadable.join(", ")
+                    );
+                }
+            }
+            Err(e) => {
+                let _ = writeln!(s, "  all stores          : UNREADABLE ({e})");
+            }
+        }
         match &self.snapshots {
             Ok(n) => {
                 let _ = writeln!(s, "  snapshots           : {n}");
@@ -728,30 +780,6 @@ fn render_shim(s: &ShimStatus) -> String {
             )
         }
     }
-}
-
-fn dir_size(p: &std::path::Path) -> Result<u64> {
-    use crate::error::Error;
-    if !p.exists() {
-        return Err(Error::io(
-            p,
-            std::io::Error::from(std::io::ErrorKind::NotFound),
-        ));
-    }
-    let mut total = 0;
-    let mut stack = vec![p.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir).map_err(|e| Error::io(&dir, e))? {
-            let entry = entry.map_err(|e| Error::io(&dir, e))?;
-            let md = entry.metadata().map_err(|e| Error::io(entry.path(), e))?;
-            if md.is_dir() {
-                stack.push(entry.path());
-            } else {
-                total += md.len();
-            }
-        }
-    }
-    Ok(total)
 }
 
 #[cfg(test)]
@@ -1526,10 +1554,160 @@ mod tests {
             remote: RemoteStatus::Disabled,
             declined_hooks_path: None,
             shadowed_hooks: vec![],
+            all_stores: Ok(StoreUsage::default()),
         };
         assert_eq!(
             isolated.first_failure(),
             Some("watcher stale (pid reused after reboot)")
+        );
+    }
+
+    /// A report with nothing wrong, for exercising one field at a time.
+    fn healthy_report() -> DoctorReport {
+        DoctorReport {
+            hooks: HOOKS
+                .iter()
+                .map(|h| HookStatus {
+                    name: (*h).into(),
+                    state: HookState::Managed { chained: false },
+                })
+                .collect(),
+            store_size_bytes: Ok(0),
+            snapshots: Ok(0),
+            corrupt_snapshots: 0,
+            shim_status: ShimStatus::Off,
+            canary_roundtrip: true,
+            recent_hook_errors: vec![],
+            recent_shim_errors: vec![],
+            recent_gate_skips: vec![],
+            watcher: crate::watch::WatcherLiveness::NeverInstalled,
+            crypto_status: CryptoStatus::Healthy {
+                insecure_file_key: false,
+            },
+            remote: RemoteStatus::Disabled,
+            declined_hooks_path: None,
+            shadowed_hooks: vec![],
+            all_stores: Ok(StoreUsage::default()),
+        }
+    }
+
+    #[test]
+    fn doctor_renders_total_store_bytes_and_count() {
+        let mut r = healthy_report();
+        r.all_stores = Ok(StoreUsage {
+            store_count: 7,
+            total_bytes: 4096,
+            ..Default::default()
+        });
+        let out = r.render();
+        assert!(
+            out.contains("all stores          : 4096 bytes across 7 store(s)"),
+            "missing machine-wide total: {out}"
+        );
+    }
+
+    /// #78's visibility half: an orphaned store is only actionable if the user is
+    /// told it exists and how much it costs.
+    #[test]
+    fn doctor_renders_orphaned_store_count_and_reclaimable_bytes() {
+        let mut r = healthy_report();
+        r.all_stores = Ok(StoreUsage {
+            store_count: 3,
+            total_bytes: 9000,
+            stale_count: 2,
+            stale_bytes: 8000,
+            ..Default::default()
+        });
+        let out = r.render();
+        assert!(
+            out.contains("orphaned stores     : 2 (8000 bytes reclaimable)"),
+            "orphan line missing: {out}"
+        );
+        assert!(out.contains("gc --stale-stores"), "no remedy named: {out}");
+    }
+
+    #[test]
+    fn doctor_omits_the_orphan_line_when_there_are_none() {
+        let out = healthy_report().render();
+        assert!(
+            !out.contains("orphaned stores"),
+            "reported orphans that don't exist: {out}"
+        );
+    }
+
+    /// An orphaned store belongs to a repo that is gone. It costs disk, but it is
+    /// not a failure of *this* repo's protection, and making doctor exit non-zero
+    /// for it would train users to ignore a red doctor.
+    #[test]
+    fn orphaned_stores_do_not_make_doctor_unhealthy() {
+        let mut r = healthy_report();
+        assert!(r.is_healthy(), "fixture is not healthy: {:?}", r.render());
+        r.all_stores = Ok(StoreUsage {
+            store_count: 9,
+            total_bytes: 1 << 30,
+            stale_count: 4,
+            stale_bytes: 1 << 29,
+            legacy_count: 2,
+            legacy_bytes: 1024,
+            ..Default::default()
+        });
+        assert_eq!(r.first_failure(), None);
+        assert!(r.is_healthy());
+    }
+
+    /// These counts contribute to the reported total but are never reclaimable, so
+    /// without their own lines they read as unexplained bulk — which is the
+    /// invisible growth #78 exists to end. They were computed and silently dropped
+    /// before.
+    #[test]
+    fn doctor_accounts_for_the_stores_it_will_never_reclaim() {
+        let mut r = healthy_report();
+        r.all_stores = Ok(StoreUsage {
+            store_count: 4,
+            total_bytes: 9000,
+            legacy_count: 2,
+            legacy_bytes: 4000,
+            unknown_count: 1,
+            unknown_bytes: 3000,
+            ..Default::default()
+        });
+        let out = r.render();
+        assert!(
+            out.contains("pre-origin stores   : 2 (4000 bytes)"),
+            "stores with no recorded origin are counted in the total but unexplained: {out}"
+        );
+        assert!(
+            out.contains("unresolved origins  : 1 (3000 bytes)"),
+            "stores whose origin could not be checked are invisible: {out}"
+        );
+    }
+
+    /// Totals computed with some stores unreadable are a lower bound. Presenting
+    /// them as exact would understate real usage with no hint that it happened.
+    #[test]
+    fn doctor_flags_unreadable_stores_so_totals_are_not_read_as_exact() {
+        let mut r = healthy_report();
+        r.all_stores = Ok(StoreUsage {
+            store_count: 2,
+            total_bytes: 10,
+            unreadable: vec!["dddddddddddddddd".into()],
+            ..Default::default()
+        });
+        let out = r.render();
+        assert!(
+            out.contains("lower bound") && out.contains("dddddddddddddddd"),
+            "unreadable stores not surfaced: {out}"
+        );
+    }
+
+    #[test]
+    fn doctor_renders_unreadable_when_store_accounting_fails() {
+        let mut r = healthy_report();
+        r.all_stores = Err(crate::error::Error::Config("no data dir".into()));
+        let out = r.render();
+        assert!(
+            out.contains("all stores          : UNREADABLE"),
+            "error not surfaced: {out}"
         );
     }
 

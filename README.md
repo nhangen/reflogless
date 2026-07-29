@@ -141,7 +141,8 @@ reflogless restore ID                restore (refuses overwrite without --force)
 reflogless restore latest            restore most recent
 reflogless restore ID PATH ...       restore specific paths only
 reflogless diff ID [PATH]            unified diff snap vs work
-reflogless gc                        LRU + age eviction
+reflogless gc                        LRU + age eviction for this repo's store
+reflogless gc --stale-stores         report stores whose repo is gone (add --yes to delete)
 reflogless uninstall                 remove hooks; restore prior chained hooks
 reflogless uninstall --purge --yes   also delete the store (--yes required)
 ```
@@ -578,6 +579,62 @@ different binary than you asked for.
 ### Recovering from a corrupted store
 
 `reflogless gc` evicts corrupt snapshots automatically (`snapshots_corrupt_evicted` count in the gc summary). If `reflogless list` is producing UNREADABLE warnings, run `reflogless gc` and they'll drop. If the store itself is unreadable (permissions, disk corruption), the nuclear option is `reflogless uninstall --purge --yes` followed by `reflogless init` — you'll lose snapshot history but the install will be clean.
+
+### Disk usage grows and nothing prunes it
+
+`snap` never runs a GC pass. Doing that from a git hook would mean deleting
+snapshots on the hot path of a git command, so eviction is always something you
+run deliberately:
+
+- `reflogless gc` — age + size eviction inside the current repo's store.
+- `reflogless doctor` — reports `all stores` (machine-wide bytes and count), so
+  growth is at least visible without hunting through the data directory.
+
+### Reclaiming stores for repos you deleted
+
+A store is addressed by a hash of its repo's absolute path. Delete or move the
+repo and its store is orphaned: still on disk, no longer reachable by anything
+scoped to a repo. `reflogless doctor` counts these as `orphaned stores` with the
+bytes they hold.
+
+```
+reflogless gc --stale-stores          # report only: size, snapshot count, dead origin
+reflogless gc --stale-stores --yes    # delete them
+```
+
+Runs from anywhere — it operates on the data directory, not the current repo.
+Reclaimed snapshots are gone for good, which is why the default is a dry run.
+
+A store is only ever deleted on **positive confirmation that its origin repo is
+gone** — a check that came back "not found", never one that merely failed. So
+three kinds of store are deliberately kept:
+
+- **No recorded origin** (`repo_origin.txt` absent). That file's absence means
+  the store predates the feature, not that the repo is dead, and stores in daily
+  use look identical. Reported by `doctor` as `pre-origin stores`.
+- **Origin that can't be checked** — an unmounted external drive, an offline
+  network share, a permissions change on a parent directory, a path over the OS
+  length limit. Each of those makes the repo *look* missing while it is entirely
+  intact, so they are reported (`unresolved origins`) and never reclaimed.
+- **Origin that came back** between the scan and the delete — restored from
+  backup, re-cloned, a volume remounted. Rechecked immediately before removal.
+
+- **An origin that doesn't check out.** A store's directory name is a hash of
+  its repo's path, so a faithful `repo_origin.txt` hashes back to the directory
+  holding it. One that doesn't — hand-edited, truncated mid-write — names a path
+  this repo never had, and a nonexistent path is exactly what reads as proof of
+  death. Also covers an empty file and a relative path (which would otherwise
+  resolve against wherever you happened to run the command from).
+
+It also refuses to delete a store directory that is a symlink rather than a real
+directory, or, on Unix, one owned by another user.
+
+If a delete fails, what the report says depends on what it can establish. A store
+it never touched is described as safe to retry. One that measurably shrank is
+reported as partly deleted, **with the number of snapshots still present** so you
+don't delete recoverable ones. One whose contents couldn't be read on either side
+of the failure is reported as exactly that — unknown, not guessed. Any of the
+three exits non-zero.
 
 ### WSL / Headless Linux / CI / Docker
 

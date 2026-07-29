@@ -23,10 +23,7 @@ impl Repo {
     }
 
     pub fn id(&self) -> String {
-        let mut h = Sha256::new();
-        h.update(self.root.to_string_lossy().as_bytes());
-        let digest = h.finalize();
-        hex::encode_short(&digest[..8])
+        id_for_root(&self.root)
     }
 
     /// Refuse to operate on a repo owned by another user.
@@ -209,13 +206,33 @@ unsafe fn libc_geteuid() -> u32 {
     geteuid()
 }
 
-/// Pure helper extracted from `assert_safe_ownership` so the safety invariant
-/// is exercised without needing a real chown'd fixture in tests.
+/// The store-id derivation, as a free function over a path.
+///
+/// Exposed separately from `Repo::id` so `store::remove_stale_store` can check a
+/// recorded origin *against* the store id it is about to delete. That makes
+/// `repo_origin.txt` self-verifying rather than merely trusted: a path that does
+/// not hash to this store's id is not this store's repo, whatever it says.
+pub fn id_for_root(root: &Path) -> String {
+    let mut h = Sha256::new();
+    h.update(root.to_string_lossy().as_bytes());
+    let digest = h.finalize();
+    hex::encode_short(&digest[..8])
+}
+
 #[cfg(unix)]
-fn is_uid_safe(owner: u32, me: u32, root: &Path) -> Result<()> {
+pub(crate) fn current_euid() -> u32 {
+    unsafe { libc_geteuid() }
+}
+
+/// Pure helper extracted from `assert_safe_ownership` so the safety invariant
+/// is exercised without needing a real chown'd fixture in tests. Shared with
+/// `store::remove_stale_store`, which has no `Repo` to ask and so gates on the
+/// store directory's own owner.
+#[cfg(unix)]
+pub(crate) fn is_uid_safe(owner: u32, me: u32, root: &Path) -> Result<()> {
     if owner != me {
         return Err(Error::UnsafeOwnership(format!(
-            "repo {} is owned by uid {owner}, but current uid is {me}",
+            "{} is owned by uid {owner}, but current uid is {me}",
             root.display()
         )));
     }
