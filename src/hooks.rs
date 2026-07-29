@@ -491,11 +491,24 @@ fn build_hook_body(
     // record of it. `mkdir` is external too and can still fail that way, but its
     // failure is already handled, and step 2 now works with no PATH at all, so
     // an already-existing log directory keeps logging.
+    //
+    // `%/*` is not `dirname`, though, and the two shapes where they differ both
+    // matter: a value with no slash at all leaves itself unchanged (so
+    // `mkdir -p hook-errors.log` would create a *directory* of that name in git's
+    // cwd and then fail to write to it), and a root-level path yields the empty
+    // string. Normalize both, still without an external command.
+    s.push_str("__REFLOGLESS_LOG_DIR=\"${REFLOGLESS_HOOK_LOG%/*}\"\n");
     s.push_str(
-        "mkdir -p \"${REFLOGLESS_HOOK_LOG%/*}\" 2>/dev/null \
-         || REFLOGLESS_HOOK_LOG=\"$__REFLOGLESS_FALLBACK_LOG\"\n",
+        "case \"$REFLOGLESS_HOOK_LOG\" in */*) ;; *) __REFLOGLESS_LOG_DIR=. ;; esac\n\
+         [ -n \"$__REFLOGLESS_LOG_DIR\" ] || __REFLOGLESS_LOG_DIR=/\n",
     );
-    s.push_str("[ -d \"${REFLOGLESS_HOOK_LOG%/*}\" ] || REFLOGLESS_HOOK_LOG=/dev/null\n");
+    s.push_str(
+        "mkdir -p \"$__REFLOGLESS_LOG_DIR\" 2>/dev/null \
+         || { REFLOGLESS_HOOK_LOG=\"$__REFLOGLESS_FALLBACK_LOG\"\n  \
+         __REFLOGLESS_LOG_DIR=\"${REFLOGLESS_HOOK_LOG%/*}\"\n\
+         }\n",
+    );
+    s.push_str("[ -d \"$__REFLOGLESS_LOG_DIR\" ] || REFLOGLESS_HOOK_LOG=/dev/null\n");
     // Address the binary by absolute path. A bare `reflogless` resolves against
     // whatever PATH the git caller happens to have, and a GUI editor, launchd
     // job, or sandboxed runner typically lacks ~/.cargo/bin or
@@ -538,11 +551,21 @@ fn build_hook_body(
             s.push_str(bare_fallback);
         }
         None => {
-            // No baked path to protect, so an unusable override is left in place
-            // deliberately: `sh` then names the real path in the log, which is
-            // more informative than a silent substitution.
+            // There is no baked path to protect here, but the invariant above
+            // still holds: an unusable override is left in place so `sh` names
+            // the real path, *and* a line says the override was the reason. The
+            // earlier version emitted no line, so a user whose `REFLOGLESS_BIN`
+            // was wrong saw only a bare `Permission denied` and had to guess —
+            // the attribution problem this whole chain exists to fix.
             s.push_str("__REFLOGLESS_BIN=reflogless\n");
-            s.push_str("[ -n \"${REFLOGLESS_BIN:-}\" ] && __REFLOGLESS_BIN=\"$REFLOGLESS_BIN\"\n");
+            s.push_str(
+                "if [ -n \"${REFLOGLESS_BIN:-}\" ]; then\n  \
+                   __REFLOGLESS_BIN=\"$REFLOGLESS_BIN\"\n  \
+                   [ -x \"$__REFLOGLESS_BIN\" ] || echo \"reflogless: \
+                   REFLOGLESS_BIN=$REFLOGLESS_BIN is not executable, and no binary path \
+                   was baked at install time\" >>\"$REFLOGLESS_HOOK_LOG\"\n\
+                 fi\n",
+            );
         }
     }
     s.push_str(&format!(
@@ -1052,6 +1075,32 @@ mod tests {
         );
     }
 
+    /// The same signal, on the branch with no baked path (`current_exe()` failed
+    /// at install). The override is still honored — there is nothing better to
+    /// fall back to — but a line has to name it as the cause, or the user sees
+    /// only `sh`'s bare `Permission denied` and has to guess that their own
+    /// `REFLOGLESS_BIN` was responsible. That guessing is the attribution problem
+    /// this resolution chain exists to remove, and the sibling branch above
+    /// already gets it right.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_executable_override_with_no_baked_binary_still_says_why() {
+        let td = TempDir::new().unwrap();
+        let not_exec = td.path().join("not-executable");
+        fs::write(&not_exec, b"i am not a program").unwrap();
+
+        let (_who, log) = run_body_with(
+            &td,
+            None,
+            &[("REFLOGLESS_BIN", not_exec.to_str().unwrap())],
+            "/nonexistent-bin",
+        );
+        assert!(
+            log.contains("REFLOGLESS_BIN") && log.contains("not executable"),
+            "the rejected override left no signal naming it: {log:?}"
+        );
+    }
+
     /// `current_exe()` can hand back a path containing `..`, which embeds the
     /// install-time working directory in the hook. Renaming that directory then
     /// kills the baked path while the binary sits untouched.
@@ -1218,6 +1267,85 @@ mod tests {
         assert!(
             !logged.is_empty(),
             "hook failure left no record — the log was discarded, not written"
+        );
+    }
+
+    /// `${VAR%/*}` is not `dirname`, and the difference bites on a log path with
+    /// no slash: `%/*` leaves the value untouched, so `mkdir -p hook-errors.log`
+    /// would create a *directory* of that name in git's working tree, `[ -d ]`
+    /// would then pass, and the redirect would fail with `Is a directory` —
+    /// littering the repo and discarding the log, which is the loss the builtin
+    /// was adopted to prevent.
+    #[cfg(unix)]
+    #[test]
+    fn a_log_path_with_no_directory_component_still_logs_and_creates_no_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        let body = build_hook_body(
+            "post-checkout",
+            &td.path().join("fallback.log"),
+            "0123456789abcdef",
+            None,
+            None,
+        );
+        let script = td.path().join("hook.sh");
+        fs::write(&script, &body).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // `mkdir` is itself external, so PATH must be able to resolve it — with an
+        // empty PATH the `mkdir` fails for an unrelated reason and the log falls
+        // back, which would hide the bug. PATH deliberately cannot resolve
+        // `reflogless`, so the invocation fails and something must be logged.
+        let cwd = td.path().join("worktree");
+        fs::create_dir_all(&cwd).unwrap();
+        let status = Command::new(&script)
+            .current_dir(&cwd)
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.path())
+            .env("REFLOGLESS_HOOK_LOG", "hook-errors.log")
+            .status()
+            .unwrap();
+        assert!(status.success(), "hook must stay best-effort");
+
+        let written = cwd.join("hook-errors.log");
+        assert!(
+            !written.is_dir(),
+            "created a directory in the working tree where the log file should be"
+        );
+        assert!(
+            !fs::read_to_string(&written).unwrap_or_default().is_empty(),
+            "a slash-less log path threw the record away"
+        );
+    }
+
+    /// The other shape where `%/*` and `dirname` disagree: a root-level path
+    /// yields the empty string, so `mkdir -p ""` fails. Benign — the log degrades
+    /// to the fallback rather than being lost — but the hook must still not abort
+    /// git, and `/` is the correct parent.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_level_log_path_does_not_abort_the_hook() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        let fallback = td.path().join("fallback.log");
+        let body = build_hook_body("post-checkout", &fallback, "0123456789abcdef", None, None);
+        let script = td.path().join("hook.sh");
+        fs::write(&script, &body).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let status = Command::new(&script)
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.path())
+            // Real PATH so `mkdir` resolves. The parent must come out as `/`
+            // rather than the empty string; the path itself is not writable by
+            // this user, so the log degrades to the fallback and the hook copes.
+            .env("REFLOGLESS_HOOK_LOG", "/reflogless-hook-errors.log")
+            .status()
+            .unwrap();
+        assert!(status.success(), "hook must stay best-effort");
+        assert!(
+            !std::path::Path::new("/reflogless-hook-errors.log").exists(),
+            "test wrote to the filesystem root"
         );
     }
 

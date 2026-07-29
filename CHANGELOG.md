@@ -60,13 +60,16 @@ follow [SemVer](https://semver.org/).
   and the baked path back out of each managed hook and reports `STALE (...)`,
   naming the dead path, and fails the run with `run reflogless init` as the
   remedy — matching what it already did for a stale PATH shim.
-- A hook run with a minimal `PATH` discarded its own error log. The log's parent
-  directory was derived with `$(dirname ...)`, an external command, so under a
-  PATH without coreutils the substitution returned empty, the directory check
-  failed, and the entire log was redirected to `/dev/null`. The hook then failed
-  *and* destroyed the only record of it, in exactly the environment class where
-  that is most likely. Now uses the `${VAR%/*}` builtin, so an existing log
-  directory keeps logging with no `PATH` at all.
+- A hook run with a minimal `PATH` discarded its own error log (regression from
+  #68). The log's parent directory was derived with `$(dirname ...)`, an external
+  command, so under a PATH without coreutils the substitution returned empty, the
+  directory check failed, and the entire log was redirected to `/dev/null`. The
+  hook then failed *and* destroyed the only record of it, in exactly the
+  environment class where that is most likely. Now uses the `${VAR%/*}` builtin,
+  so an existing log directory keeps logging with no `PATH` at all. `%/*` is not
+  `dirname`, so the two shapes where they disagree are normalized too: a log path
+  with no directory component would otherwise have `mkdir`'d a *directory* of that
+  name into the working tree, and a root-level path yielded an empty parent.
 - Hook installation destroyed a shared `core.hooksPath` directory (#73).
   `core.hooksPath` is frequently set *globally*, naming one directory of
   symlinks that every repo on the machine shares. `install` wrote straight

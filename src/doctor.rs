@@ -98,7 +98,9 @@ pub enum HookStale {
     /// The absolute binary the body bakes in is no longer executable — reinstall
     /// to a new prefix, a moved or upgraded binary. The hook falls back to a PATH
     /// lookup, which is the pre-#74 behavior.
-    Binary(std::path::PathBuf),
+    Binary {
+        script_points_at: std::path::PathBuf,
+    },
 }
 
 #[derive(Debug)]
@@ -157,12 +159,16 @@ impl From<crate::shim::ShimStatus> for ShimStatus {
 
 /// Why a managed hook body won't deliver protection as installed, if it won't.
 ///
-/// Mirrors what `shim.rs` already does for the PATH shim (`ShimStatus::Stale`):
-/// that code bakes a reflogless path into a generated script, then reads it back
-/// and compares against the current binary so a relocated install is reported
+/// Modelled on `shim.rs`'s `ShimStatus::Stale`, which bakes a reflogless path
+/// into a generated script and reads it back so a relocated install is reported
 /// rather than silently degrading. Hooks bake the same kind of path and had none
 /// of that detection, so an install that had stopped protecting the repo still
 /// read as four `OK` lines and `overall: HEALTHY`.
+///
+/// It deliberately stops short of the shim's check: the shim compares its baked
+/// path against the *current* binary, and doing that here would report every
+/// pinned-build and wrapper setup as stale (see the note in the match below).
+/// Do not "align" the two by reintroducing a `current_exe()` comparison.
 ///
 /// Version is checked before the binary: an old body may not bake a path at all,
 /// and "re-run init" is the same remedy either way.
@@ -175,7 +181,9 @@ fn hook_staleness(body: &str) -> Option<HookStale> {
         // `current_exe()`: a hook pointing at a *different but working* reflogless
         // is a supported setup (a pinned build, a wrapper), and `doctor` may be
         // running from a different binary than the hooks were installed with.
-        Some(p) if !is_executable_file(&p) => Some(HookStale::Binary(p)),
+        Some(p) if !is_executable_file(&p) => Some(HookStale::Binary {
+            script_points_at: p,
+        }),
         _ => None,
     }
 }
@@ -433,7 +441,7 @@ impl DoctorReport {
                     ..
                 } => return Some("hooks predate this reflogless version (run `reflogless init`)"),
                 HookState::Managed {
-                    stale: Some(HookStale::Binary(_)),
+                    stale: Some(HookStale::Binary { .. }),
                     ..
                 } => {
                     return Some(
@@ -524,7 +532,10 @@ impl DoctorReport {
                     ..
                 } => "STALE (older hook format — run `reflogless init`)".into(),
                 HookState::Managed {
-                    stale: Some(HookStale::Binary(p)),
+                    stale:
+                        Some(HookStale::Binary {
+                            script_points_at: p,
+                        }),
                     ..
                 } => format!("STALE (baked binary missing: {})", p.display()),
                 HookState::Managed {
@@ -1070,7 +1081,9 @@ mod tests {
             pc.state,
             HookState::Managed {
                 chained: false,
-                stale: Some(HookStale::Binary(dead.clone()))
+                stale: Some(HookStale::Binary {
+                    script_points_at: dead.clone()
+                })
             },
             "dead baked path classified as {:?}",
             pc.state
@@ -1084,6 +1097,62 @@ mod tests {
             report.render().contains("removed-by-an-upgrade"),
             "render does not name the dead path: {}",
             report.render()
+        );
+    }
+
+    /// A baked path that still *exists* but has lost its exec bit is the case the
+    /// sibling test above cannot reach — it points at a path that is simply gone,
+    /// which `fs::metadata` rejects on its own, so the mode-bit half of
+    /// `is_executable_file` was never exercised and deleting it broke no test.
+    ///
+    /// It matters because the generated hook gates on `[ -x ]`: a binary that lost
+    /// its exec bit (a `chmod -x`, a restore that dropped permissions, a copy
+    /// across filesystems) makes the hook fall through to a PATH lookup, which is
+    /// exactly the pre-#74 behavior. Without the mode check `doctor` calls that
+    /// `OK` / `HEALTHY`.
+    #[cfg(unix)]
+    #[test]
+    fn doctor_fails_when_the_baked_binary_is_present_but_not_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        hooks::install(&repo, &store.root.join("hook-errors.log")).unwrap();
+        let p = repo.root.join(".git").join("hooks").join("post-checkout");
+        let body = fs::read_to_string(&p).unwrap();
+        let live = crate::hooks::extract_hook_binary(&body).expect("install bakes a path");
+
+        // A real file at the baked path, present and readable, but not runnable.
+        let unrunnable = td.path().join("reflogless-no-exec-bit");
+        fs::write(&unrunnable, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&unrunnable, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(
+            &p,
+            body.replace(live.to_str().unwrap(), unrunnable.to_str().unwrap()),
+        )
+        .unwrap();
+
+        let report = run(&repo, &store).unwrap();
+        let pc = report
+            .hooks
+            .iter()
+            .find(|h| h.name == "post-checkout")
+            .unwrap();
+        assert_eq!(
+            pc.state,
+            HookState::Managed {
+                chained: false,
+                stale: Some(HookStale::Binary {
+                    script_points_at: unrunnable.clone()
+                })
+            },
+            "a present-but-unrunnable binary classified as {:?}",
+            pc.state
+        );
+        assert!(
+            !report.is_healthy(),
+            "doctor reported healthy for a hook that cannot run its binary"
         );
     }
 
