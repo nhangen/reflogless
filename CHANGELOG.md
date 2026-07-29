@@ -67,9 +67,13 @@ follow [SemVer](https://semver.org/).
   hook then failed *and* destroyed the only record of it, in exactly the
   environment class where that is most likely. Now uses the `${VAR%/*}` builtin,
   so an existing log directory keeps logging with no `PATH` at all. `%/*` is not
-  `dirname`, so the two shapes where they disagree are normalized too: a log path
-  with no directory component would otherwise have `mkdir`'d a *directory* of that
-  name into the working tree, and a root-level path yielded an empty parent.
+  `dirname`: a log path with no directory component would otherwise have `mkdir`'d
+  a *directory* of that name into the working tree, so that shape is normalized to
+  `.`, and a root-level path yields an empty parent, so `mkdir` is skipped rather
+  than run on `""`. The log is then tested for *appendability* rather than its
+  directory for existence — a directory can exist and still not accept the append,
+  and a failed redirect means `sh` never runs the snapshot at all, so probing the
+  wrong thing silently skipped the very snapshot the hook exists to take.
 - Hook installation destroyed a shared `core.hooksPath` directory (#73).
   `core.hooksPath` is frequently set *globally*, naming one directory of
   symlinks that every repo on the machine shares. `install` wrote straight

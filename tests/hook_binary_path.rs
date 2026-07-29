@@ -149,12 +149,16 @@ fn an_installed_hook_snapshots_with_reflogless_absent_from_path() {
 
     // The hook ran the binary if and only if a snapshot manifest appeared beyond
     // the baseline `init` took.
-    let store = fs::read_dir(data.join("reflogless"))
-        .expect("no store dir — the hook never reached the binary")
-        .next()
-        .expect("no store")
-        .unwrap()
-        .path();
+    // Address the store by the repo's own id rather than taking whichever entry
+    // `read_dir` yields first — otherwise the day this fixture grows a second
+    // repo, the failure reads as "no snapshots dir" and names the wrong store.
+    let id = reflogless::repo::Repo::discover(&repo).expect("repo").id();
+    let store = data.join("reflogless").join(&id);
+    assert!(
+        store.is_dir(),
+        "no store at {} — the hook never reached the binary",
+        store.display()
+    );
     let snaps: Vec<_> = fs::read_dir(store.join("snapshots"))
         .expect("no snapshots dir")
         .flatten()

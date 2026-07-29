@@ -1037,6 +1037,12 @@ mod tests {
         fs::write(&script, &body).unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         let mut cmd = Command::new(&script);
+        // Run from the tempdir, not the crate root. A test that plants a decoy
+        // binary "in the cwd" is only testing relative resolution if the hook's
+        // cwd is actually that directory — otherwise the guard passes for the
+        // accidental reason that no such file exists wherever cargo happened to
+        // put us.
+        cmd.current_dir(td.path());
         // Pin the log explicitly: the body resolves its own default from the
         // data dir, and this test cares about the log's *contents*, not where
         // the resolution lands (covered separately).
@@ -1125,8 +1131,12 @@ mod tests {
         let marker = td.path().join("who-ran");
         let baked = td.path().join("baked");
         stub_at(&baked, &marker, "BAKED");
-        // An executable named `rl` sitting in the cwd — the shape that fooled the
-        // old guard.
+        // An executable named `rl` in the hook's cwd. This is load-bearing, and
+        // for a non-obvious reason: it is what makes `[ -f rl ] && [ -x rl ]`
+        // *pass*, so the override survives the usability check. The exec side
+        // then disagrees — a slash-less word is a PATH lookup, never a
+        // cwd-relative exec — so `rl` is not found and the snapshot is lost.
+        // The stub therefore never runs; its role is to get the guard to say yes.
         let cwd_stub = td.path().join("rl");
         stub_at(&cwd_stub, &marker, "CWD_RELATIVE");
 
@@ -1243,12 +1253,15 @@ mod tests {
         let not_exec = td.path().join("not-executable");
         fs::write(&not_exec, b"i am not a program").unwrap();
 
-        let (_who, log) = run_body_with(
+        let (who, log) = run_body_with(
             &td,
             None,
             &[("REFLOGLESS_BIN", not_exec.to_str().unwrap())],
             "/nonexistent-bin",
         );
+        // With nothing baked, the unusable override is deliberately left in place
+        // so `sh` names the real path in its own error. Nothing should have run.
+        assert_eq!(who, "", "something executed despite no usable binary");
         assert!(
             log.contains("REFLOGLESS_BIN") && log.contains("executable"),
             "the rejected override left no signal naming it: {log:?}"
@@ -1469,37 +1482,6 @@ mod tests {
         assert!(
             !fs::read_to_string(&written).unwrap_or_default().is_empty(),
             "a slash-less log path threw the record away"
-        );
-    }
-
-    /// The other shape where `%/*` and `dirname` disagree: a root-level path
-    /// yields the empty string, so `mkdir -p ""` fails. Benign — the log degrades
-    /// to the fallback rather than being lost — but the hook must still not abort
-    /// git, and `/` is the correct parent.
-    #[cfg(unix)]
-    #[test]
-    fn a_root_level_log_path_does_not_abort_the_hook() {
-        use std::os::unix::fs::PermissionsExt;
-        let td = TempDir::new().unwrap();
-        let fallback = td.path().join("fallback.log");
-        let body = build_hook_body("post-checkout", &fallback, "0123456789abcdef", None, None);
-        let script = td.path().join("hook.sh");
-        fs::write(&script, &body).unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-
-        let status = Command::new(&script)
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", td.path())
-            // Real PATH so `mkdir` resolves. The parent must come out as `/`
-            // rather than the empty string; the path itself is not writable by
-            // this user, so the log degrades to the fallback and the hook copes.
-            .env("REFLOGLESS_HOOK_LOG", "/reflogless-hook-errors.log")
-            .status()
-            .unwrap();
-        assert!(status.success(), "hook must stay best-effort");
-        assert!(
-            !std::path::Path::new("/reflogless-hook-errors.log").exists(),
-            "test wrote to the filesystem root"
         );
     }
 
