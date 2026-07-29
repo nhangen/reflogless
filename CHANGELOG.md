@@ -6,6 +6,8 @@ follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-07-29
+
 ### Added
 - An opt-in Windows Authenticode signing path (#32) — **not yet configured, so
   Windows binaries in this release remain unsigned.** Once the Azure secrets and
@@ -239,7 +241,8 @@ follow [SemVer](https://semver.org/).
 - Tag-driven multi-OS release via cargo-dist: macOS arm64 + x86,
   Linux x86, Windows x86 prebuilt binaries.
 
-[Unreleased]: https://github.com/nhangen/reflogless/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/nhangen/reflogless/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/nhangen/reflogless/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/nhangen/reflogless/compare/v0.1.2...v1.0.0
 [0.1.2]: https://github.com/nhangen/reflogless/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/nhangen/reflogless/compare/v0.1.0...v0.1.1

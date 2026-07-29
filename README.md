@@ -85,7 +85,7 @@ Or download a per-platform archive from the [releases page](https://github.com/n
 
 ARM64 Linux covers Graviton, Raspberry Pi, and Ampere hosts.
 
-> **Windows users:** v1.0 binaries are unsigned. SmartScreen will warn on first run ("Windows protected your PC") — choose *More info* → *Run anyway*. On enterprise machines with Smart App Control or AppLocker in enforcement mode the binary may be blocked silently with no warning dialog — use `cargo install` from source or wait for signed builds. Authenticode signing is deferred to launch readiness; managed signing providers are typically low hundreds of dollars per year, while traditional certificate + HSM paths can cost more.
+> **Windows users:** release binaries are currently unsigned. SmartScreen will warn on first run ("Windows protected your PC") — choose *More info* → *Run anyway*. On enterprise machines with Smart App Control or AppLocker in enforcement mode the binary may be blocked silently with no warning dialog — use `cargo install` from source or wait for signed builds. Authenticode signing is deferred to launch readiness; managed signing providers are typically low hundreds of dollars per year, while traditional certificate + HSM paths can cost more.
 
 ### From source
 
