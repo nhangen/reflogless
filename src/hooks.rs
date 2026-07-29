@@ -29,6 +29,19 @@ const BIN_ASSIGN: &str = "__REFLOGLESS_BIN=";
 /// independent of how the binary is addressed. `doctor` keys off this to tell a
 /// marker-stripped reflogless hook (tampered) from a genuine third-party hook,
 /// so it must not embed the binary name.
+///
+/// It also must stay broad enough to match a **v2** body, which spells the
+/// invocation `reflogless snap --event <hook>`. Narrowing this to something more
+/// specific — the `$__REFLOGLESS_BIN` assignment, say — would silently stop
+/// classifying marker-stripped legacy hooks as tampered, and they are the ones
+/// most likely to have been hand-edited. `body_invokes_snap_on_both_formats`
+/// pins that.
+///
+/// The cost of the looseness is a third-party hook that happens to contain this
+/// substring reading as `Tampered`. That direction is the cheap one: it produces
+/// a confusing message, while `install` still independently keys on `MARKER` and
+/// so preserves and chains the hook rather than clobbering it. A missed tamper
+/// would instead hide a hook that has stopped snapshotting.
 pub const INVOKE_PROBE: &str = "snap --event";
 
 #[derive(Debug)]
@@ -1133,6 +1146,27 @@ mod tests {
         assert_eq!(extract_hook_binary(&body), None);
         assert_eq!(extract_hook_binary("#!/bin/sh\necho hi\n"), None);
         assert_eq!(extract_hook_binary(""), None);
+    }
+
+    /// `INVOKE_PROBE` has to match the current body *and* a v2 body, or
+    /// marker-stripped legacy hooks quietly stop classifying as tampered. See the
+    /// constant's docs for why the resulting looseness is the cheaper direction.
+    #[test]
+    fn body_invokes_snap_on_both_formats() {
+        let current = build_hook_body(
+            "post-checkout",
+            Path::new("/tmp/log"),
+            "0123456789abcdef",
+            None,
+            Some(Path::new("/opt/reflogless")),
+        );
+        assert!(current.contains(INVOKE_PROBE), "current body: {current}");
+        // How v2 spelled it, before the binary was addressed by path.
+        let v2 = "#!/bin/sh\nreflogless snap --event post-checkout || true\n";
+        assert!(v2.contains(INVOKE_PROBE), "v2 body must still match");
+        // An ordinary third-party hook must not.
+        let third_party = "#!/bin/sh\nnpx lint-staged\nexit 0\n";
+        assert!(!third_party.contains(INVOKE_PROBE));
     }
 
     #[test]

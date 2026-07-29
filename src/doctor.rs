@@ -810,14 +810,23 @@ mod tests {
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
 
         let hook = repo.root.join(".git").join("hooks").join("post-checkout");
+        // A *different* stub on PATH, one that would fail this test's assertions
+        // if it ran. Since #74 the hook addresses an absolute binary, so PATH must
+        // never be consulted; pointing PATH at the same stub as `REFLOGLESS_BIN`
+        // would make the test pass either way and assert nothing about precedence.
+        let poisoned = TempDir::new().unwrap();
+        let decoy = poisoned.path().join("reflogless");
+        fs::write(
+            &decoy,
+            "#!/bin/sh\necho 'PATH STUB RAN — binary resolution ignored the override' >&2\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&decoy, fs::Permissions::from_mode(0o755)).unwrap();
         let path = format!(
             "{}:{}",
-            bin.path().display(),
+            poisoned.path().display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        // `REFLOGLESS_BIN` rather than PATH: since #74 the hook addresses an
-        // absolute baked-in binary, so a PATH-injected stub is (correctly) not
-        // consulted.
         let status = Command::new(&hook)
             .env("PATH", path)
             .env("REFLOGLESS_BIN", &fake)
@@ -834,6 +843,13 @@ mod tests {
         assert!(
             !install_only.path().join("install-time.log").exists(),
             "hook must NOT write to install-time path when REFLOGLESS_DATA_DIR is set"
+        );
+        // Precedence, now actually asserted: the override ran and the PATH decoy
+        // did not.
+        let logged = fs::read_to_string(&runtime_log).unwrap_or_default();
+        assert!(
+            !logged.contains("PATH STUB RAN"),
+            "binary was resolved off PATH instead of the explicit override: {logged}"
         );
 
         let report = run(&repo, &store).unwrap();
