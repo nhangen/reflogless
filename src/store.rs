@@ -2056,14 +2056,28 @@ mod tests {
                 snapshots_left,
             } => {
                 assert!(bytes_removed > 0, "damage reported as zero bytes");
-                // Hand-computed, not derived from `count_snapshots` — building
-                // `expected` from the primitive under test can only prove the two
-                // agree. `snapshots/` is writable here, so the walk empties it
-                // before failing on the locked shard: zero manifests survive.
-                assert_eq!(snapshots_left, 0);
-                assert!(
-                    !dir.join("snapshots").join("a.json").exists(),
-                    "fixture no longer deletes the manifests, so 0 is the wrong expectation"
+                // How many manifests survive is readdir-order dependent, because
+                // `remove_dir_all` bails on its first error: reach `snapshots/`
+                // before the locked shard and they are gone, reach the shard first
+                // and all of them remain. macOS gave 0 here and Linux gave 2, so a
+                // hard-coded expectation pins the platform, not the product.
+                //
+                // The invariant that holds either way is the one the original
+                // defect broke: the number the report gives a user must match what
+                // they would find if they looked. Counted inline rather than with
+                // `count_snapshots` so this cannot pass by the two agreeing while
+                // both are wrong; that primitive is pinned directly in
+                // `count_snapshots_counts_manifests_on_disk`.
+                let on_disk = fs::read_dir(dir.join("snapshots"))
+                    .map(|rd| {
+                        rd.flatten()
+                            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                            .count()
+                    })
+                    .unwrap_or(0);
+                assert_eq!(
+                    snapshots_left, on_disk,
+                    "reported remainder disagrees with the filesystem"
                 );
                 assert_eq!(report.bytes_destroyed, bytes_removed);
             }
