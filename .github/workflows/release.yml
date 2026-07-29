@@ -156,7 +156,22 @@ jobs:
           # Actually do builds and make zips and whatnot
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
-      - name: Verify Windows Authenticode signing configuration
+      # Resolve whether Authenticode signing is configured, and emit `enabled` for
+      # the steps below. Three outcomes, deliberately:
+      #
+      #   all six set  -> enabled=true, sign and hard-fail on any signing error
+      #   none set     -> enabled=false, skip signing, release proceeds unsigned
+      #   some set     -> fail the job
+      #
+      # The partial case is the one that must not be tolerated. It means someone
+      # intended signing and got it wrong, and the failure mode of guessing is
+      # shipping an unsigned binary from a release the maintainer believes is
+      # signed. Absent config is a different situation: signing has not been set up
+      # yet, which is a known state documented in the README, not an error — and
+      # making it fatal meant this branch could not be merged without breaking every
+      # release until an Azure account existed.
+      - name: Resolve Windows Authenticode signing configuration
+        id: signing-config
         if: ${{ needs.plan.outputs.publishing == 'true' && contains(join(matrix.targets, ','), 'x86_64-pc-windows-msvc') }}
         shell: bash
         env:
@@ -168,38 +183,53 @@ jobs:
           AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
         run: |
           set -euo pipefail
-          missing=0
-          for name in \
-            AZURE_CLIENT_ID \
-            AZURE_TENANT_ID \
-            AZURE_SUBSCRIPTION_ID \
-            AZURE_ARTIFACT_SIGNING_ENDPOINT \
-            AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME \
-            AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME
-          do
-            if [ -z "${!name:-}" ]; then
-              echo "::error::$name is required for Windows Authenticode release signing."
-              missing=1
+          required="AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID \
+            AZURE_ARTIFACT_SIGNING_ENDPOINT AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME \
+            AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME"
+          set_count=0
+          total=0
+          missing=""
+          for name in $required; do
+            total=$((total + 1))
+            if [ -n "${!name:-}" ]; then
+              set_count=$((set_count + 1))
+            else
+              missing="$missing $name"
             fi
           done
-          if [ "$missing" -ne 0 ]; then
+
+          if [ "$set_count" -eq 0 ]; then
+            echo "::warning::Windows Authenticode signing is not configured; \
+          publishing the Windows archive unsigned. See README.md for the required \
+          secrets and variables."
+            echo "enabled=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$set_count" -ne "$total" ]; then
+            echo "::error::Windows Authenticode signing is partially configured \
+          ($set_count of $total set). Missing:$missing. Set all of them or none — \
+          a partial configuration would publish an unsigned binary from a release \
+          that looks signed."
             exit 1
           fi
+
+          echo "enabled=true" >>"$GITHUB_OUTPUT"
       - name: Prepare Windows Authenticode signing
         id: windows-signing
-        if: ${{ needs.plan.outputs.publishing == 'true' && contains(join(matrix.targets, ','), 'x86_64-pc-windows-msvc') }}
+        if: ${{ steps.signing-config.outputs.enabled == 'true' }}
         shell: pwsh
         run: |
           ./scripts/prepare-windows-signing.ps1 -DistribDir target/distrib
       - name: Azure login for Windows Authenticode signing
-        if: ${{ needs.plan.outputs.publishing == 'true' && contains(join(matrix.targets, ','), 'x86_64-pc-windows-msvc') }}
+        if: ${{ steps.signing-config.outputs.enabled == 'true' }}
         uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       - name: Sign Windows binaries with Azure Artifact Signing
-        if: ${{ needs.plan.outputs.publishing == 'true' && contains(join(matrix.targets, ','), 'x86_64-pc-windows-msvc') }}
+        if: ${{ steps.signing-config.outputs.enabled == 'true' }}
         uses: azure/artifact-signing-action@v2
         with:
           endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
@@ -212,7 +242,7 @@ jobs:
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
       - name: Verify and repack signed Windows archive
-        if: ${{ needs.plan.outputs.publishing == 'true' && contains(join(matrix.targets, ','), 'x86_64-pc-windows-msvc') }}
+        if: ${{ steps.signing-config.outputs.enabled == 'true' }}
         shell: pwsh
         run: |
           ./scripts/verify-repack-windows-signing.ps1 `

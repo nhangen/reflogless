@@ -713,7 +713,15 @@ Conventions:
 
 Issue [#32](https://github.com/nhangen/reflogless/issues/32) tracks launch-readiness Authenticode signing. Until that work is actually configured and verified on a prerelease, keep the Windows install warning above explicit that release binaries are unsigned.
 
-The current draft release-signing path uses Azure Artifact Signing in `.github/workflows/release.yml` before cargo-dist uploads artifacts to the GitHub Release. Tag releases fail before publishing if signing configuration is missing, signing fails, Authenticode verification fails, or the signed archive checksum cannot be regenerated.
+The release-signing path uses Azure Artifact Signing in `.github/workflows/release.yml` before cargo-dist uploads artifacts to the GitHub Release. It is **opt-in by configuration** — the workflow resolves what is set and takes one of three paths:
+
+| Configuration | Behavior |
+| --- | --- |
+| All six secrets/variables set | Signs, verifies each file with `Get-AuthenticodeSignature`, repacks the ZIP, regenerates the `.sha256`. A failure at any step fails the release before publishing. |
+| None set | Skips signing with a workflow warning and publishes the Windows archive **unsigned**. |
+| Some set | Fails the release. |
+
+The partial case is deliberately fatal. It means signing was intended and misconfigured, and the failure mode of guessing is publishing an unsigned binary from a release the maintainer believes is signed. A blank value counts as unset. Signing turns itself on with no workflow change the moment all six are present.
 
 Required GitHub Actions secrets:
 
