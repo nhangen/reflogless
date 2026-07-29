@@ -1317,6 +1317,33 @@ mod tests {
         assert!(r.is_healthy());
     }
 
+    /// These counts contribute to the reported total but are never reclaimable, so
+    /// without their own lines they read as unexplained bulk — which is the
+    /// invisible growth #78 exists to end. They were computed and silently dropped
+    /// before.
+    #[test]
+    fn doctor_accounts_for_the_stores_it_will_never_reclaim() {
+        let mut r = healthy_report();
+        r.all_stores = Ok(StoreUsage {
+            store_count: 4,
+            total_bytes: 9000,
+            legacy_count: 2,
+            legacy_bytes: 4000,
+            unknown_count: 1,
+            unknown_bytes: 3000,
+            ..Default::default()
+        });
+        let out = r.render();
+        assert!(
+            out.contains("pre-origin stores   : 2 (4000 bytes)"),
+            "stores with no recorded origin are counted in the total but unexplained: {out}"
+        );
+        assert!(
+            out.contains("unresolved origins  : 1 (3000 bytes)"),
+            "stores whose origin could not be checked are invisible: {out}"
+        );
+    }
+
     /// Totals computed with some stores unreadable are a lower bound. Presenting
     /// them as exact would understate real usage with no hint that it happened.
     #[test]

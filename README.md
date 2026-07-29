@@ -583,12 +583,22 @@ three kinds of store are deliberately kept:
 - **Origin that came back** between the scan and the delete — restored from
   backup, re-cloned, a volume remounted. Rechecked immediately before removal.
 
-It also refuses to delete a store directory owned by another user, or one that
-is a symlink rather than a real directory.
+- **An origin that doesn't check out.** A store's directory name is a hash of
+  its repo's path, so a faithful `repo_origin.txt` hashes back to the directory
+  holding it. One that doesn't — hand-edited, truncated mid-write — names a path
+  this repo never had, and a nonexistent path is exactly what reads as proof of
+  death. Also covers an empty file and a relative path (which would otherwise
+  resolve against wherever you happened to run the command from).
 
-If a delete fails partway — leaving some snapshots already unlinked — that is
-reported as `PARTIALLY DELETED`, distinctly from a store it could not touch at
-all, because only one of those two is safe to retry. Either case exits non-zero.
+It also refuses to delete a store directory that is a symlink rather than a real
+directory, or, on Unix, one owned by another user.
+
+If a delete fails, what the report says depends on what it can establish. A store
+it never touched is described as safe to retry. One that measurably shrank is
+reported as partly deleted, **with the number of snapshots still present** so you
+don't delete recoverable ones. One whose contents couldn't be read on either side
+of the failure is reported as exactly that — unknown, not guessed. Any of the
+three exits non-zero.
 
 ### WSL / Headless Linux / CI / Docker
 
