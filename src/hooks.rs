@@ -211,9 +211,15 @@ pub fn install(repo: &Repo, hook_log_path: &Path) -> Result<InstallReport> {
             // rewrote the wrapper without its `exec`, so a second `install`
             // silently stopped running a third-party hook it had preserved.
             Entry::Body(body) if body.contains(MARKER) => {
-                let prior = fs::symlink_metadata(&backup)
-                    .is_ok()
-                    .then_some(backup.as_path());
+                // A regular file, resolved through links — not merely "something
+                // exists here". `fs::copy` on the preserve path always produces a
+                // regular file, but this branch reads a backup that may predate us
+                // or have been replaced by hand, and a directory here becomes
+                // `exec <dir>` in the generated hook.
+                let prior = fs::metadata(&backup)
+                    .ok()
+                    .filter(|m| m.is_file())
+                    .map(|_| backup.as_path());
                 write_hook(&path, hook, hook_log_path, &repo_id, prior, bin.as_deref())?;
                 if prior.is_some() {
                     chained.push((*hook).to_string());
@@ -551,7 +557,14 @@ fn build_hook_body(
     //     baked path.
     //
     // `[ -f ] && [ -x ]` on an absolute path is the test that matches the exec.
-    let usable = |var: &str| format!("[ -f \"${var}\" ] && [ -x \"${var}\" ]");
+    //
+    // Every "can this word actually be exec'd?" test in this body goes through
+    // `usable_word`. Keeping two hand-written guard expressions is how this defect
+    // kept recurring: the chain-to-prior-hook line below had its own `[ -x ]`-only
+    // test, which is true for a directory, so `exec <dir>` aborted the user's git
+    // — the same POSIX fact being fixed here, one branch away from the fix.
+    let usable_word = |w: &str| format!("[ -f {w} ] && [ -x {w} ]");
+    let usable = |var: &str| usable_word(&format!("\"${var}\""));
     let absolute_or_reject = "case \"$REFLOGLESS_BIN\" in\n  \
            /*) ;;\n  \
            *) echo \"reflogless: REFLOGLESS_BIN must be an absolute path \
@@ -617,7 +630,17 @@ fn build_hook_body(
     ));
     if let Some(p) = prior {
         let q = sh_squote(p);
-        s.push_str(&format!("if [ -x {q} ]; then\n  exec {q} \"$@\"\nfi\n"));
+        // Not `[ -x ]` alone, and not silent on the failing branch: dropping a
+        // third-party hook the user asked us to preserve is exactly the kind of
+        // invisible degradation the rest of this body logs.
+        s.push_str(&format!(
+            "if {}; then\n  \
+               exec {q} \"$@\"\n\
+             fi\n\
+             echo \"reflogless: preserved hook at {q} is not an executable file; \
+             not chaining to it\" >>\"$REFLOGLESS_HOOK_LOG\"\n",
+            usable_word(&q)
+        ));
     }
     s.push_str("exit 0\n");
     s
@@ -742,6 +765,130 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&sentinel).unwrap(),
             format!("{MARKER}\n")
+        );
+    }
+
+    /// `[ -x dir ]` is true, and `exec <dir>` makes the shell exit 126 — so a
+    /// directory sitting at the backup path aborted the user's git operation
+    /// outright (`fatal: ref updates aborted by hook`, `git commit` rc=128). This
+    /// is the same POSIX fact the `REFLOGLESS_BIN` guard above was hardened for,
+    /// recurring one branch away from that fix because the chain line carried its
+    /// own hand-written `[ -x ]` test. Blast radius is larger than the bug it
+    /// mirrors: a skipped snapshot is bad, a git command that refuses to run is
+    /// worse.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_at_the_backup_path_does_not_abort_the_hook() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        let marker = td.path().join("who-ran");
+        let baked = td.path().join("baked");
+        stub_at(&baked, &marker, "BAKED");
+        let backup = td.path().join("post-checkout.reflogless-orig");
+        fs::create_dir_all(&backup).unwrap();
+
+        let log = td.path().join("hook-errors.log");
+        let body = build_hook_body(
+            "post-checkout",
+            &log,
+            "0123456789abcdef",
+            Some(&backup),
+            Some(&baked),
+        );
+        let script = td.path().join("hook.sh");
+        fs::write(&script, &body).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let status = Command::new(&script)
+            .current_dir(td.path())
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.path())
+            .env("REFLOGLESS_HOOK_LOG", &log)
+            .status()
+            .unwrap();
+
+        assert!(
+            status.success(),
+            "a directory at the backup path aborted the hook: {status:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&marker).unwrap_or_default().trim(),
+            "BAKED",
+            "the snapshot was skipped"
+        );
+        let text = fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            text.contains("not chaining"),
+            "dropped a preserved hook with no explanation: {text:?}"
+        );
+    }
+
+    /// Same guard, the shape that silently dropped a hook the user asked us to
+    /// preserve: a regular file that is not executable. Chaining is impossible, so
+    /// skipping is right — doing it without a word in the log is not.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_executable_backup_is_skipped_but_says_so() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        let marker = td.path().join("who-ran");
+        let baked = td.path().join("baked");
+        stub_at(&baked, &marker, "BAKED");
+        let backup = td.path().join("post-checkout.reflogless-orig");
+        fs::write(&backup, "#!/bin/sh\necho nope\n").unwrap();
+        fs::set_permissions(&backup, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let log = td.path().join("hook-errors.log");
+        let body = build_hook_body(
+            "post-checkout",
+            &log,
+            "0123456789abcdef",
+            Some(&backup),
+            Some(&baked),
+        );
+        let script = td.path().join("hook.sh");
+        fs::write(&script, &body).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let status = Command::new(&script)
+            .current_dir(td.path())
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.path())
+            .env("REFLOGLESS_HOOK_LOG", &log)
+            .status()
+            .unwrap();
+
+        assert!(status.success(), "hook must stay best-effort: {status:?}");
+        let text = fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            text.contains("not chaining"),
+            "a preserved hook was dropped silently: {text:?}"
+        );
+    }
+
+    /// The install-time half: a directory at the backup path must not become a
+    /// `prior` at all, so the generated body has no chain line to guard.
+    #[test]
+    fn a_directory_backup_is_not_treated_as_a_preserved_hook() {
+        let td = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        let hooks = repo.git_common_dir().join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let entry = hooks.join("post-checkout");
+        let log = repo.root.join("hook-errors.log");
+        install(&repo, &log).unwrap();
+
+        // Replace the backup path with a directory, then re-install: this takes the
+        // already-managed branch, which used bare existence to decide `prior`.
+        let backup = entry.with_extension("reflogless-orig");
+        let _ = fs::remove_file(&backup);
+        fs::create_dir_all(&backup).unwrap();
+        install(&repo, &log).unwrap();
+
+        let body = fs::read_to_string(&entry).unwrap();
+        assert!(
+            !body_chains_to(&body, &backup),
+            "a directory was wired in as a preserved hook: {body}"
         );
     }
 
