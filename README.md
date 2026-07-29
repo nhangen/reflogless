@@ -539,6 +539,42 @@ Enterprise Windows policies such as Smart App Control or AppLocker may block uns
 
 `reflogless` writes hook errors to `<store>/hook-errors.log`. The doctor surfaces recent entries. Common cause: encryption canary failed mid-hook (see above). Hook errors never block the underlying git op — the work continues, the snapshot just didn't land.
 
+### `doctor` says a hook is STALE
+
+Hooks bake in the absolute path of the reflogless binary that installed them, and
+they carry a format version. `doctor` reports `STALE` when either has gone out of
+date:
+
+- **`STALE (older hook format)`** — the hooks predate your current reflogless.
+  Older hooks called the binary by bare name, which only works when `PATH`
+  happens to include the install directory, so they silently skip snapshots when
+  git is driven by a GUI editor, a launchd/cron job, or a sandboxed runner.
+- **`STALE (baked binary missing: ...)`** — the binary moved. Reinstalling to a
+  different prefix, or a package manager replacing a versioned path, leaves the
+  hook pointing at something that no longer exists.
+
+Both are fixed the same way, and nothing does it for you:
+
+```
+reflogless init
+```
+
+### Pointing hooks at a different binary (`REFLOGLESS_BIN`)
+
+Set `REFLOGLESS_BIN` to an **absolute path** to an executable file, and installed
+hooks will use it instead of the path they baked in. This redirects a relocated
+install without reinstalling every hook, and lets you run hooks against a dev
+build.
+
+Absolute is required, not a style preference: a value with no slash in it is a
+`PATH` lookup when the hook execs it, not a path relative to your shell's
+directory — so `REFLOGLESS_BIN=./target/debug/reflogless` works and
+`REFLOGLESS_BIN=reflogless` is the very thing hooks avoid doing. A relative
+value, a directory, or a non-executable file is rejected: the hook keeps its
+baked path and writes a line to `<store>/hook-errors.log` naming the reason. It
+will not silently fall back to a PATH lookup, since that would swap in a
+different binary than you asked for.
+
 ### Recovering from a corrupted store
 
 `reflogless gc` evicts corrupt snapshots automatically (`snapshots_corrupt_evicted` count in the gc summary). If `reflogless list` is producing UNREADABLE warnings, run `reflogless gc` and they'll drop. If the store itself is unreadable (permissions, disk corruption), the nuclear option is `reflogless uninstall --purge --yes` followed by `reflogless init` — you'll lose snapshot history but the install will be clean.

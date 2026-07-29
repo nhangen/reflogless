@@ -1,7 +1,8 @@
 use crate::crypto;
 use crate::error::Result;
 use crate::hooks::{
-    body_chains_to, read_entry, resolve_hooks_target, Entry, HooksTarget, HOOKS, MARKER,
+    body_chains_to, body_is_current_version, extract_hook_binary, read_entry, resolve_hooks_target,
+    Entry, HooksTarget, HOOKS, INVOKE_PROBE, MARKER,
 };
 use crate::repo::Repo;
 use crate::store::Store;
@@ -77,9 +78,29 @@ pub struct HookStatus {
 pub enum HookState {
     Missing,
     Unreadable(String),
-    Managed { chained: bool },
+    Managed {
+        chained: bool,
+        /// Set when the hook is ours but will not deliver protection as installed.
+        /// Not cosmetic — see `HookStale`.
+        stale: Option<HookStale>,
+    },
     Tampered,
     Foreign,
+}
+
+/// Why a managed hook won't do its job until `reflogless init` is re-run.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HookStale {
+    /// Body predates the current `build_hook_body` format. A v2 body invokes bare
+    /// `reflogless`, so it silently skips the snapshot under a PATH that lacks the
+    /// install dir (#74).
+    Version,
+    /// The absolute binary the body bakes in is no longer executable — reinstall
+    /// to a new prefix, a moved or upgraded binary. The hook falls back to a PATH
+    /// lookup, which is the pre-#74 behavior.
+    Binary {
+        script_points_at: std::path::PathBuf,
+    },
 }
 
 #[derive(Debug)]
@@ -136,6 +157,50 @@ impl From<crate::shim::ShimStatus> for ShimStatus {
     }
 }
 
+/// Why a managed hook body won't deliver protection as installed, if it won't.
+///
+/// Modelled on `shim.rs`'s `ShimStatus::Stale`, which bakes a reflogless path
+/// into a generated script and reads it back so a relocated install is reported
+/// rather than silently degrading. Hooks bake the same kind of path and had none
+/// of that detection, so an install that had stopped protecting the repo still
+/// read as four `OK` lines and `overall: HEALTHY`.
+///
+/// It deliberately stops short of the shim's check: the shim compares its baked
+/// path against the *current* binary, and doing that here would report every
+/// pinned-build and wrapper setup as stale (see the note in the match below).
+/// Do not "align" the two by reintroducing a `current_exe()` comparison.
+///
+/// Version is checked before the binary: an old body may not bake a path at all,
+/// and "re-run init" is the same remedy either way.
+fn hook_staleness(body: &str) -> Option<HookStale> {
+    if !body_is_current_version(body) {
+        return Some(HookStale::Version);
+    }
+    match extract_hook_binary(body) {
+        // Deliberately an executability test rather than a comparison against
+        // `current_exe()`: a hook pointing at a *different but working* reflogless
+        // is a supported setup (a pinned build, a wrapper), and `doctor` may be
+        // running from a different binary than the hooks were installed with.
+        Some(p) if !is_executable_file(&p) => Some(HookStale::Binary {
+            script_points_at: p,
+        }),
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
+fn is_executable_file(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(p)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(p: &std::path::Path) -> bool {
+    p.is_file()
+}
+
 pub fn run(repo: &Repo, store: &Store) -> Result<DoctorReport> {
     // Inspect the directory `install` writes to, not whatever `core.hooksPath`
     // names — with a global `core.hooksPath` those differ, and reading the shared
@@ -160,8 +225,9 @@ pub fn run(repo: &Repo, store: &Store) -> Result<DoctorReport> {
                         // From the body, not `backup.exists()` — see
                         // `hooks::body_chains_to`.
                         chained: body_chains_to(&body, &backup),
+                        stale: hook_staleness(&body),
                     }
-                } else if body.contains("reflogless snap --event") {
+                } else if body.contains(INVOKE_PROBE) {
                     // A user hand-edited the reflogless wrapper and stripped
                     // the marker, but the reflogless call is still present —
                     // distinct from a legitimate third-party hook.
@@ -365,7 +431,24 @@ impl DoctorReport {
                 HookState::Unreadable(_) => return Some("hook unreadable"),
                 HookState::Tampered => return Some("hook tampered"),
                 HookState::Foreign => return Some("hook foreign (not managed)"),
-                HookState::Managed { .. } => {}
+                // A stale hook is installed but not protecting: a pre-#74 body
+                // resolves the binary off PATH, and a dead baked path falls back
+                // to that same PATH lookup. Nothing rewrites hooks on its own, so
+                // reporting this as a note would leave the user holding an
+                // unprotected repo and a green doctor.
+                HookState::Managed {
+                    stale: Some(HookStale::Version),
+                    ..
+                } => return Some("hooks predate this reflogless version (run `reflogless init`)"),
+                HookState::Managed {
+                    stale: Some(HookStale::Binary { .. }),
+                    ..
+                } => {
+                    return Some(
+                        "hook points at a reflogless binary that is gone (run `reflogless init`)",
+                    )
+                }
+                HookState::Managed { stale: None, .. } => {}
             }
         }
         // A hook git will never call is as broken as a shadowed shim, which this
@@ -444,8 +527,25 @@ impl DoctorReport {
             let state = match &h.state {
                 HookState::Missing => "MISSING".into(),
                 HookState::Unreadable(e) => format!("UNREADABLE: {e}"),
-                HookState::Managed { chained: true } => "OK (chained)".into(),
-                HookState::Managed { chained: false } => "OK".into(),
+                HookState::Managed {
+                    stale: Some(HookStale::Version),
+                    ..
+                } => "STALE (older hook format — run `reflogless init`)".into(),
+                HookState::Managed {
+                    stale:
+                        Some(HookStale::Binary {
+                            script_points_at: p,
+                        }),
+                    ..
+                } => format!("STALE (baked binary missing: {})", p.display()),
+                HookState::Managed {
+                    chained: true,
+                    stale: None,
+                } => "OK (chained)".into(),
+                HookState::Managed {
+                    chained: false,
+                    stale: None,
+                } => "OK".into(),
                 HookState::Tampered => "TAMPERED (manually edited)".into(),
                 HookState::Foreign => "FOREIGN (not reflogless-managed)".into(),
             };
@@ -721,13 +821,26 @@ mod tests {
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
 
         let hook = repo.root.join(".git").join("hooks").join("post-checkout");
+        // A *different* stub on PATH, one that would fail this test's assertions
+        // if it ran. Since #74 the hook addresses an absolute binary, so PATH must
+        // never be consulted; pointing PATH at the same stub as `REFLOGLESS_BIN`
+        // would make the test pass either way and assert nothing about precedence.
+        let poisoned = TempDir::new().unwrap();
+        let decoy = poisoned.path().join("reflogless");
+        fs::write(
+            &decoy,
+            "#!/bin/sh\necho 'PATH STUB RAN — binary resolution ignored the override' >&2\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&decoy, fs::Permissions::from_mode(0o755)).unwrap();
         let path = format!(
             "{}:{}",
-            bin.path().display(),
+            poisoned.path().display(),
             std::env::var("PATH").unwrap_or_default()
         );
         let status = Command::new(&hook)
             .env("PATH", path)
+            .env("REFLOGLESS_BIN", &fake)
             .env("REFLOGLESS_DATA_DIR", data.path())
             .status()
             .unwrap();
@@ -741,6 +854,13 @@ mod tests {
         assert!(
             !install_only.path().join("install-time.log").exists(),
             "hook must NOT write to install-time path when REFLOGLESS_DATA_DIR is set"
+        );
+        // Precedence, now actually asserted: the override ran and the PATH decoy
+        // did not.
+        let logged = fs::read_to_string(&runtime_log).unwrap_or_default();
+        assert!(
+            !logged.contains("PATH STUB RAN"),
+            "binary was resolved off PATH instead of the explicit override: {logged}"
         );
 
         let report = run(&repo, &store).unwrap();
@@ -884,6 +1004,224 @@ mod tests {
             Some("remote backlog past unhealthy threshold")
         );
         assert!(report.render().contains("WARN"));
+    }
+
+    /// A v2 hook resolves the binary off PATH, so it silently skips the snapshot
+    /// from a GUI editor or launchd — the #74 bug. Nothing rewrites hooks on its
+    /// own, so `doctor` failing is the only way the user learns to run `init`.
+    /// Before this, a v2 body reported four `OK` lines and `overall: HEALTHY`.
+    #[test]
+    fn doctor_fails_on_a_hook_body_from_an_older_reflogless() {
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        hooks::install(&repo, &store.root.join("hook-errors.log")).unwrap();
+        let p = repo.root.join(".git").join("hooks").join("post-checkout");
+        let body = fs::read_to_string(&p).unwrap();
+        // Roll the version line back one, leaving the marker intact — exactly what
+        // an install predating this release looks like.
+        fs::write(
+            &p,
+            body.replace(crate::hooks::MARKER_VERSION, "# reflogless-hook-version: 2"),
+        )
+        .unwrap();
+
+        let report = run(&repo, &store).unwrap();
+        let pc = report
+            .hooks
+            .iter()
+            .find(|h| h.name == "post-checkout")
+            .unwrap();
+        assert_eq!(
+            pc.state,
+            HookState::Managed {
+                chained: false,
+                stale: Some(HookStale::Version)
+            },
+            "stale body classified as {:?}",
+            pc.state
+        );
+        assert!(!report.is_healthy(), "stale hooks reported healthy");
+        assert_eq!(
+            report.first_failure(),
+            Some("hooks predate this reflogless version (run `reflogless init`)")
+        );
+        assert!(report.render().contains("STALE"), "{}", report.render());
+    }
+
+    /// Upgrade to a new prefix, move the binary, or let a package manager delete
+    /// a versioned path, and the baked path dies. The hook then falls back to a
+    /// PATH lookup — the pre-#74 behavior — and used to report `OK`.
+    #[cfg(unix)]
+    #[test]
+    fn doctor_fails_when_the_baked_binary_is_gone() {
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        hooks::install(&repo, &store.root.join("hook-errors.log")).unwrap();
+        let p = repo.root.join(".git").join("hooks").join("post-checkout");
+        let body = fs::read_to_string(&p).unwrap();
+        let live = crate::hooks::extract_hook_binary(&body).expect("install bakes a path");
+        let dead = td.path().join("removed-by-an-upgrade");
+        fs::write(
+            &p,
+            body.replace(live.to_str().unwrap(), dead.to_str().unwrap()),
+        )
+        .unwrap();
+
+        let report = run(&repo, &store).unwrap();
+        let pc = report
+            .hooks
+            .iter()
+            .find(|h| h.name == "post-checkout")
+            .unwrap();
+        assert_eq!(
+            pc.state,
+            HookState::Managed {
+                chained: false,
+                stale: Some(HookStale::Binary {
+                    script_points_at: dead.clone()
+                })
+            },
+            "dead baked path classified as {:?}",
+            pc.state
+        );
+        assert!(!report.is_healthy());
+        assert_eq!(
+            report.first_failure(),
+            Some("hook points at a reflogless binary that is gone (run `reflogless init`)")
+        );
+        assert!(
+            report.render().contains("removed-by-an-upgrade"),
+            "render does not name the dead path: {}",
+            report.render()
+        );
+    }
+
+    /// A baked path that still *exists* but has lost its exec bit is the case the
+    /// sibling test above cannot reach — it points at a path that is simply gone,
+    /// which `fs::metadata` rejects on its own, so the mode-bit half of
+    /// `is_executable_file` was never exercised and deleting it broke no test.
+    ///
+    /// It matters because the generated hook gates on `[ -x ]`: a binary that lost
+    /// its exec bit (a `chmod -x`, a restore that dropped permissions, a copy
+    /// across filesystems) makes the hook fall through to a PATH lookup, which is
+    /// exactly the pre-#74 behavior. Without the mode check `doctor` calls that
+    /// `OK` / `HEALTHY`.
+    #[cfg(unix)]
+    #[test]
+    fn doctor_fails_when_the_baked_binary_is_present_but_not_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        hooks::install(&repo, &store.root.join("hook-errors.log")).unwrap();
+        let p = repo.root.join(".git").join("hooks").join("post-checkout");
+        let body = fs::read_to_string(&p).unwrap();
+        let live = crate::hooks::extract_hook_binary(&body).expect("install bakes a path");
+
+        // A real file at the baked path, present and readable, but not runnable.
+        let unrunnable = td.path().join("reflogless-no-exec-bit");
+        fs::write(&unrunnable, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&unrunnable, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(
+            &p,
+            body.replace(live.to_str().unwrap(), unrunnable.to_str().unwrap()),
+        )
+        .unwrap();
+
+        let report = run(&repo, &store).unwrap();
+        let pc = report
+            .hooks
+            .iter()
+            .find(|h| h.name == "post-checkout")
+            .unwrap();
+        assert_eq!(
+            pc.state,
+            HookState::Managed {
+                chained: false,
+                stale: Some(HookStale::Binary {
+                    script_points_at: unrunnable.clone()
+                })
+            },
+            "a present-but-unrunnable binary classified as {:?}",
+            pc.state
+        );
+        assert!(
+            !report.is_healthy(),
+            "doctor reported healthy for a hook that cannot run its binary"
+        );
+    }
+
+    /// The other half of `is_executable_file`. A *directory* carries the execute
+    /// bit (it means searchable), so the mode check alone accepts one — and the
+    /// hook's `[ -x ]` accepted one too until it gained a matching `[ -f ]`. Both
+    /// sides now agree that only a regular file is a binary.
+    #[cfg(unix)]
+    #[test]
+    fn doctor_fails_when_the_baked_binary_is_a_directory() {
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        hooks::install(&repo, &store.root.join("hook-errors.log")).unwrap();
+        let p = repo.root.join(".git").join("hooks").join("post-checkout");
+        let body = fs::read_to_string(&p).unwrap();
+        let live = crate::hooks::extract_hook_binary(&body).expect("install bakes a path");
+
+        let dir = td.path().join("a-directory");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &p,
+            body.replace(live.to_str().unwrap(), dir.to_str().unwrap()),
+        )
+        .unwrap();
+
+        let report = run(&repo, &store).unwrap();
+        let pc = report
+            .hooks
+            .iter()
+            .find(|h| h.name == "post-checkout")
+            .unwrap();
+        assert_eq!(
+            pc.state,
+            HookState::Managed {
+                chained: false,
+                stale: Some(HookStale::Binary {
+                    script_points_at: dir.clone()
+                })
+            },
+            "a directory baked as the binary classified as {:?}",
+            pc.state
+        );
+        assert!(!report.is_healthy());
+    }
+
+    /// The complement: a freshly installed hook points at a live binary and must
+    /// not be called stale, or the new failure fires on every healthy repo.
+    #[test]
+    fn doctor_does_not_call_a_fresh_install_stale() {
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        hooks::install(&repo, &store.root.join("hook-errors.log")).unwrap();
+
+        let report = run(&repo, &store).unwrap();
+        for h in &report.hooks {
+            assert_eq!(
+                h.state,
+                HookState::Managed {
+                    chained: false,
+                    stale: None
+                },
+                "{} reported stale right after install",
+                h.name
+            );
+        }
     }
 
     #[test]
@@ -1235,7 +1573,10 @@ mod tests {
         for h in &report.hooks {
             assert_eq!(
                 h.state,
-                HookState::Managed { chained: false },
+                HookState::Managed {
+                    chained: false,
+                    stale: None,
+                },
                 "{} should be Managed, not {:?}",
                 h.name,
                 h.state
@@ -1337,7 +1678,10 @@ mod tests {
 
         assert_eq!(
             pc.state,
-            HookState::Managed { chained: false },
+            HookState::Managed {
+                chained: false,
+                stale: None,
+            },
             "a backup that nothing execs is not a chain"
         );
         assert!(report.render().contains("post-checkout: OK\n"));
