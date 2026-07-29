@@ -509,7 +509,15 @@ fn build_hook_body(
     // The snapshot was skipped and the redirect error went to git's stderr, which
     // is the pair of outcomes this block exists to prevent. One builtin covers
     // unwritable, read-only-fs, is-a-directory, and a missing parent at once.
-    s.push_str("{ : >>\"$REFLOGLESS_HOOK_LOG\"; } 2>/dev/null || REFLOGLESS_HOOK_LOG=/dev/null\n");
+    //
+    // The subshell is load-bearing, and `{ ...; }` is wrong here. POSIX says a
+    // redirection error on a *special* builtin — `:` is one — shall make a
+    // non-interactive shell exit. dash obeys that; bash does not. So under
+    // `/bin/sh` on Debian/Ubuntu the failed probe killed the hook outright
+    // (exit 2) before the `||` could run, turning a skipped snapshot into an
+    // aborted git command. Running it in a subshell confines the exit, so the
+    // parent just sees a non-zero status and takes the fallback.
+    s.push_str("( : >>\"$REFLOGLESS_HOOK_LOG\" ) 2>/dev/null || REFLOGLESS_HOOK_LOG=/dev/null\n");
     // Address the binary by absolute path. A bare `reflogless` resolves against
     // whatever PATH the git caller happens to have, and a GUI editor, launchd
     // job, or sandboxed runner typically lacks ~/.cargo/bin or
@@ -1236,6 +1244,66 @@ mod tests {
             fs::read_to_string(&marker).unwrap_or_default().trim(),
             "BAKED",
             "an unwritable log path skipped the snapshot entirely"
+        );
+    }
+
+    /// The same unwritable-log case, run explicitly under `dash`.
+    ///
+    /// macOS `/bin/sh` is bash, which is lenient about a failed redirection on a
+    /// special builtin. Debian and Ubuntu `/bin/sh` is dash, which follows POSIX:
+    /// the shell *exits*. So the probe above, written as `{ : >>LOG; }`, passed
+    /// every macOS run and killed the hook with exit 2 on the platform most users
+    /// are on — an aborted git command, the one outcome worse than a missed
+    /// snapshot. The sibling test only caught it because CI runs Linux; on a
+    /// developer machine the bug was invisible. This pins it wherever dash exists.
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_log_path_does_not_abort_the_hook_under_dash() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(dash) = ["/bin/dash", "/usr/bin/dash"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+        else {
+            // No dash here. CI's Linux runner executes this shape through
+            // /bin/sh, so the coverage is not lost — only this shortcut is.
+            return;
+        };
+
+        let td = TempDir::new().unwrap();
+        let marker = td.path().join("who-ran");
+        let baked = td.path().join("baked");
+        stub_at(&baked, &marker, "BAKED");
+        let locked = td.path().join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let body = build_hook_body(
+            "post-checkout",
+            &td.path().join("fallback.log"),
+            "0123456789abcdef",
+            None,
+            Some(&baked),
+        );
+        let script = td.path().join("hook.sh");
+        fs::write(&script, &body).unwrap();
+
+        let status = Command::new(dash)
+            .arg(&script)
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.path())
+            .env("REFLOGLESS_HOOK_LOG", locked.join("hook-errors.log"))
+            .status()
+            .unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(
+            status.success(),
+            "dash aborted the hook on an unwritable log: {status:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&marker).unwrap_or_default().trim(),
+            "BAKED",
+            "an unwritable log path skipped the snapshot entirely under dash"
         );
     }
 

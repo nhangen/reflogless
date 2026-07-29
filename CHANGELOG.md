@@ -73,7 +73,11 @@ follow [SemVer](https://semver.org/).
   than run on `""`. The log is then tested for *appendability* rather than its
   directory for existence — a directory can exist and still not accept the append,
   and a failed redirect means `sh` never runs the snapshot at all, so probing the
-  wrong thing silently skipped the very snapshot the hook exists to take.
+  wrong thing silently skipped the very snapshot the hook exists to take. That
+  probe runs in a subshell: POSIX makes a redirection error on a special builtin
+  exit a non-interactive shell, which dash obeys and bash does not, so on Debian
+  and Ubuntu (`/bin/sh` is dash) a brace-grouped probe aborted the hook with
+  exit 2 instead of falling back — trading a missed snapshot for a broken `git`.
 - Hook installation destroyed a shared `core.hooksPath` directory (#73).
   `core.hooksPath` is frequently set *globally*, naming one directory of
   symlinks that every repo on the machine shares. `install` wrote straight
