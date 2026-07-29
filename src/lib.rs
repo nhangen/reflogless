@@ -18,3 +18,6 @@ pub mod watch;
 pub mod watch_install;
 
 pub use error::{Error, Result};
+
+#[cfg(test)]
+pub(crate) mod testutil;

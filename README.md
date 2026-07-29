@@ -141,7 +141,8 @@ reflogless restore ID                restore (refuses overwrite without --force)
 reflogless restore latest            restore most recent
 reflogless restore ID PATH ...       restore specific paths only
 reflogless diff ID [PATH]            unified diff snap vs work
-reflogless gc                        LRU + age eviction
+reflogless gc                        LRU + age eviction for this repo's store
+reflogless gc --stale-stores         report stores whose repo is gone (add --yes to delete)
 reflogless uninstall                 remove hooks; restore prior chained hooks
 reflogless uninstall --purge --yes   also delete the store (--yes required)
 ```
@@ -539,9 +540,101 @@ Enterprise Windows policies such as Smart App Control or AppLocker may block uns
 
 `reflogless` writes hook errors to `<store>/hook-errors.log`. The doctor surfaces recent entries. Common cause: encryption canary failed mid-hook (see above). Hook errors never block the underlying git op — the work continues, the snapshot just didn't land.
 
+### `doctor` says a hook is STALE
+
+Hooks bake in the absolute path of the reflogless binary that installed them, and
+they carry a format version. `doctor` reports `STALE` when either has gone out of
+date:
+
+- **`STALE (older hook format)`** — the hooks predate your current reflogless.
+  Older hooks called the binary by bare name, which only works when `PATH`
+  happens to include the install directory, so they silently skip snapshots when
+  git is driven by a GUI editor, a launchd/cron job, or a sandboxed runner.
+- **`STALE (baked binary missing: ...)`** — the binary moved. Reinstalling to a
+  different prefix, or a package manager replacing a versioned path, leaves the
+  hook pointing at something that no longer exists.
+
+Both are fixed the same way, and nothing does it for you:
+
+```
+reflogless init
+```
+
+### Pointing hooks at a different binary (`REFLOGLESS_BIN`)
+
+Set `REFLOGLESS_BIN` to an **absolute path** to an executable file, and installed
+hooks will use it instead of the path they baked in. This redirects a relocated
+install without reinstalling every hook, and lets you run hooks against a dev
+build.
+
+Absolute is required, not a style preference: a value with no slash in it is a
+`PATH` lookup when the hook execs it, not a path relative to your shell's
+directory — so `REFLOGLESS_BIN=./target/debug/reflogless` works and
+`REFLOGLESS_BIN=reflogless` is the very thing hooks avoid doing. A relative
+value, a directory, or a non-executable file is rejected: the hook keeps its
+baked path and writes a line to `<store>/hook-errors.log` naming the reason. It
+will not silently fall back to a PATH lookup, since that would swap in a
+different binary than you asked for.
+
 ### Recovering from a corrupted store
 
 `reflogless gc` evicts corrupt snapshots automatically (`snapshots_corrupt_evicted` count in the gc summary). If `reflogless list` is producing UNREADABLE warnings, run `reflogless gc` and they'll drop. If the store itself is unreadable (permissions, disk corruption), the nuclear option is `reflogless uninstall --purge --yes` followed by `reflogless init` — you'll lose snapshot history but the install will be clean.
+
+### Disk usage grows and nothing prunes it
+
+`snap` never runs a GC pass. Doing that from a git hook would mean deleting
+snapshots on the hot path of a git command, so eviction is always something you
+run deliberately:
+
+- `reflogless gc` — age + size eviction inside the current repo's store.
+- `reflogless doctor` — reports `all stores` (machine-wide bytes and count), so
+  growth is at least visible without hunting through the data directory.
+
+### Reclaiming stores for repos you deleted
+
+A store is addressed by a hash of its repo's absolute path. Delete or move the
+repo and its store is orphaned: still on disk, no longer reachable by anything
+scoped to a repo. `reflogless doctor` counts these as `orphaned stores` with the
+bytes they hold.
+
+```
+reflogless gc --stale-stores          # report only: size, snapshot count, dead origin
+reflogless gc --stale-stores --yes    # delete them
+```
+
+Runs from anywhere — it operates on the data directory, not the current repo.
+Reclaimed snapshots are gone for good, which is why the default is a dry run.
+
+A store is only ever deleted on **positive confirmation that its origin repo is
+gone** — a check that came back "not found", never one that merely failed. So
+three kinds of store are deliberately kept:
+
+- **No recorded origin** (`repo_origin.txt` absent). That file's absence means
+  the store predates the feature, not that the repo is dead, and stores in daily
+  use look identical. Reported by `doctor` as `pre-origin stores`.
+- **Origin that can't be checked** — an unmounted external drive, an offline
+  network share, a permissions change on a parent directory, a path over the OS
+  length limit. Each of those makes the repo *look* missing while it is entirely
+  intact, so they are reported (`unresolved origins`) and never reclaimed.
+- **Origin that came back** between the scan and the delete — restored from
+  backup, re-cloned, a volume remounted. Rechecked immediately before removal.
+
+- **An origin that doesn't check out.** A store's directory name is a hash of
+  its repo's path, so a faithful `repo_origin.txt` hashes back to the directory
+  holding it. One that doesn't — hand-edited, truncated mid-write — names a path
+  this repo never had, and a nonexistent path is exactly what reads as proof of
+  death. Also covers an empty file and a relative path (which would otherwise
+  resolve against wherever you happened to run the command from).
+
+It also refuses to delete a store directory that is a symlink rather than a real
+directory, or, on Unix, one owned by another user.
+
+If a delete fails, what the report says depends on what it can establish. A store
+it never touched is described as safe to retry. One that measurably shrank is
+reported as partly deleted, **with the number of snapshots still present** so you
+don't delete recoverable ones. One whose contents couldn't be read on either side
+of the failure is reported as exactly that — unknown, not guessed. Any of the
+three exits non-zero.
 
 ### WSL / Headless Linux / CI / Docker
 
@@ -580,7 +673,22 @@ Not in v0.1.0. The encryption key is bound to the machine's keychain. v2 may add
 Snapshots stay on the old machine. New machine starts fresh. The encryption key doesn't roam.
 
 **Q: Does it work with worktrees?**
-Yes — each worktree is treated as its own repo (different `<repo-hash>`). Snapshots from worktree A can't be restored into worktree B even if they share the same `.git`.
+Yes. Each worktree gets its own store (different `<repo-hash>`), so snapshots from
+worktree A can't be restored into worktree B even though they share one `.git`. The
+hooks themselves are shared: git reads hooks from the *common* directory, so
+installing from any worktree writes to `<main-clone>/.git/hooks` and covers all of
+them. Each hook still resolves its own store at run time from the worktree git is
+operating in.
+
+**Q: `reflogless init` warned that `core.hooksPath` is outside the repo. What now?**
+You have a machine-wide `core.hooksPath` (husky, lefthook, or a shared dispatcher).
+reflogless won't write there — that directory is shared by every repo, and taking it
+over is how it once clobbered a dispatcher. Hooks go to this repo's own hooks
+directory instead, which git only reaches if your dispatcher forwards to it. Run
+`reflogless doctor`: if it says `SHADOWED`, git has no path to those hooks and the
+repo is **not** protected. Two fixes — point this repo at its own hooks
+(`git -C <repo> config --local core.hooksPath .git/hooks`), or make your dispatcher
+exec `"$(git rev-parse --git-path hooks)/<hook-name>"`.
 
 ## Contributing
 
