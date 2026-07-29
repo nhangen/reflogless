@@ -209,13 +209,20 @@ unsafe fn libc_geteuid() -> u32 {
     geteuid()
 }
 
-/// Pure helper extracted from `assert_safe_ownership` so the safety invariant
-/// is exercised without needing a real chown'd fixture in tests.
 #[cfg(unix)]
-fn is_uid_safe(owner: u32, me: u32, root: &Path) -> Result<()> {
+pub(crate) fn current_euid() -> u32 {
+    unsafe { libc_geteuid() }
+}
+
+/// Pure helper extracted from `assert_safe_ownership` so the safety invariant
+/// is exercised without needing a real chown'd fixture in tests. Shared with
+/// `store::remove_stale_store`, which has no `Repo` to ask and so gates on the
+/// store directory's own owner.
+#[cfg(unix)]
+pub(crate) fn is_uid_safe(owner: u32, me: u32, root: &Path) -> Result<()> {
     if owner != me {
         return Err(Error::UnsafeOwnership(format!(
-            "repo {} is owned by uid {owner}, but current uid is {me}",
+            "{} is owned by uid {owner}, but current uid is {me}",
             root.display()
         )));
     }

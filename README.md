@@ -569,11 +569,26 @@ reflogless gc --stale-stores --yes    # delete them
 Runs from anywhere — it operates on the data directory, not the current repo.
 Reclaimed snapshots are gone for good, which is why the default is a dry run.
 
-Two things it deliberately will not do. It never evicts a store with no
-recorded origin (`repo_origin.txt`): that file's absence means the store
-predates the feature, not that the repo is dead, and stores in daily use look
-identical. And if a repo reappears between the scan and the delete — restored
-from backup, re-cloned, a volume remounted — that store is kept and reported.
+A store is only ever deleted on **positive confirmation that its origin repo is
+gone** — a check that came back "not found", never one that merely failed. So
+three kinds of store are deliberately kept:
+
+- **No recorded origin** (`repo_origin.txt` absent). That file's absence means
+  the store predates the feature, not that the repo is dead, and stores in daily
+  use look identical. Reported by `doctor` as `pre-origin stores`.
+- **Origin that can't be checked** — an unmounted external drive, an offline
+  network share, a permissions change on a parent directory, a path over the OS
+  length limit. Each of those makes the repo *look* missing while it is entirely
+  intact, so they are reported (`unresolved origins`) and never reclaimed.
+- **Origin that came back** between the scan and the delete — restored from
+  backup, re-cloned, a volume remounted. Rechecked immediately before removal.
+
+It also refuses to delete a store directory owned by another user, or one that
+is a symlink rather than a real directory.
+
+If a delete fails partway — leaving some snapshots already unlinked — that is
+reported as `PARTIALLY DELETED`, distinctly from a store it could not touch at
+all, because only one of those two is safe to retry. Either case exits non-zero.
 
 ### WSL / Headless Linux / CI / Docker
 
