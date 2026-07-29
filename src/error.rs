@@ -47,6 +47,12 @@ pub enum Error {
     #[error("refusing to operate: {0}")]
     UnsafeOwnership(String),
 
+    /// A reclaim pass finished with stores it could not remove. Distinct from
+    /// `UnsafeOwnership` because "refusing to operate" claims nothing was
+    /// attempted, which is exactly what a partly-completed delete makes false.
+    #[error("reclaim incomplete: {0}")]
+    ReclaimIncomplete(String),
+
     #[error("io error at {path}: {source}")]
     Io {
         path: PathBuf,

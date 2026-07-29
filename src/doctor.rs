@@ -506,6 +506,23 @@ impl DoctorReport {
                         u.stale_count, u.stale_bytes
                     );
                 }
+                // Counted as part of the total above, and never reclaimable, so
+                // without their own line they read as unexplained bulk.
+                if u.legacy_count > 0 {
+                    let _ = writeln!(
+                        s,
+                        "  pre-origin stores   : {} ({} bytes) — no recorded origin, kept",
+                        u.legacy_count, u.legacy_bytes
+                    );
+                }
+                if u.unknown_count > 0 {
+                    let _ = writeln!(
+                        s,
+                        "  unresolved origins  : {} ({} bytes) — origin could not be \
+                         checked (unmounted volume or permissions), kept",
+                        u.unknown_count, u.unknown_bytes
+                    );
+                }
                 if !u.unreadable.is_empty() {
                     let _ = writeln!(
                         s,
