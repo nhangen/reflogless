@@ -671,7 +671,14 @@ pub struct StoreSummary {
 /// otherwise present a live repo's store as reclaimable garbage.
 fn classify_origin(origin_file: &Path) -> StoreOriginState {
     let recorded = match fs::read_to_string(origin_file) {
-        Ok(s) => s.trim().to_string(),
+        // Strip only the line ending, not general whitespace. `save_repo_origin`
+        // writes the path verbatim, so trimming made a root with a leading or
+        // trailing space (legal on both Linux and macOS) read back as a *different*
+        // path: it classified Stale, appeared on the dry-run consent screen as
+        // reclaimable while the repo was alive, and could never be reclaimed once
+        // it really died, because the trimmed spelling no longer hashed to the
+        // store id.
+        Ok(s) => s.trim_end_matches(['\n', '\r']).to_string(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StoreOriginState::Legacy,
         Err(e) => {
             return StoreOriginState::Unknown {
@@ -684,10 +691,35 @@ fn classify_origin(origin_file: &Path) -> StoreOriginState {
     // file", i.e. install age; an empty file means a truncated write, a full
     // disk, or an interrupted delete — a damaged store, which must not be
     // filed under a design decision and reported as "kept" forever.
-    if recorded.is_empty() {
+    // Blank, not just zero-length: `save_repo_origin` never writes whitespace-only
+    // content, so a file of spaces or tabs is the same damage a zero-length one is.
+    // Only this emptiness check trims — the value carried forward keeps any leading
+    // or trailing space, because that may be part of a real path.
+    if recorded.trim().is_empty() {
         return StoreOriginState::Unknown {
             origin: None,
             reason: format!("{} is empty", origin_file.display()),
+        };
+    }
+    // A path is bytes on Unix, but `Repo::id` and `save_repo_origin` both go
+    // through `to_string_lossy`, so a non-UTF-8 repo root is recorded — and hashed
+    // — as the same U+FFFD-substituted spelling. The store-id gate in
+    // `remove_stale_store` therefore agrees with itself and passes, while the
+    // mangled spelling genuinely does not exist on disk. That combination is
+    // indistinguishable from a dead repo and destroys a live one's snapshots.
+    //
+    // The replacement character means the record is a transcription failure, not an
+    // observation about the filesystem. A path we never wrote down correctly cannot
+    // have its absence confirmed, so this is never `Stale`. A genuine path
+    // containing U+FFFD is caught by the same rule and left unreclaimable; refusing
+    // to delete a store we cannot identify is the correct side to err on.
+    if recorded.contains('\u{FFFD}') {
+        return StoreOriginState::Unknown {
+            reason: format!(
+                "recorded origin {recorded} is a lossy transcription (contains U+FFFD), \
+                 so it cannot identify this store's repo"
+            ),
+            origin: Some(PathBuf::from(recorded)),
         };
     }
     let p = PathBuf::from(recorded);
@@ -1099,6 +1131,7 @@ fn count_snapshots(store_dir: &Path) -> usize {
 /// What happened to one store in a reclaim pass. `Refused` and `DeleteFailed`
 /// are separate because only the latter can have destroyed anything: a refusal
 /// is decided before `remove_dir_all` is called.
+#[derive(Debug)]
 enum RemoveOutcome {
     Removed,
     /// The origin reappeared before the delete; the store was left alone.
@@ -2142,12 +2175,15 @@ mod tests {
         assert_eq!(count_snapshots(&dir), 1, "a snapshot was lost");
     }
 
-    /// The origin file is the sole evidence a store is dead, and it comes off
-    /// disk. A store id is `sha256(abs repo root)[..8]`, so a faithful origin
-    /// hashes back to the directory holding it. One that doesn't — hand-edited, a
-    /// truncated write, or a path mangled by `to_string_lossy` on a non-UTF-8 repo
-    /// root — names a path this repo never had, and a nonexistent path is exactly
-    /// what reads as proof of death.
+    /// A store id is `sha256(abs repo root)[..8]`, so a faithful origin hashes
+    /// back to the directory holding it. One that doesn't — hand-edited, or a
+    /// truncated write — names a path this repo never had, and a nonexistent path
+    /// is exactly what reads as proof of death.
+    ///
+    /// Note what this does *not* cover: a `to_string_lossy` mangling. Both the
+    /// store id and the origin file are derived from the same lossy string, so
+    /// they agree and this gate passes. That route is covered by
+    /// `reclaim_refuses_a_store_whose_recorded_origin_is_a_lossy_transcription`.
     #[test]
     fn reclaim_refuses_a_store_whose_origin_does_not_hash_to_its_store_id() {
         let td = TempDir::new().unwrap();
@@ -2184,6 +2220,129 @@ mod tests {
             .join(&id)
             .join("snapshots")
             .exists());
+    }
+
+    /// A trailing space is legal in a path on both Linux and macOS, and
+    /// `save_repo_origin` writes the path verbatim. Trimming the read side made
+    /// the two disagree: the recorded origin of a *live* repo read back as a
+    /// different, nonexistent path, so the store classified `Stale` and appeared on
+    /// the dry-run consent screen as reclaimable. Only the store-id gate stopped
+    /// the delete — and that same mismatch meant the store could never be reclaimed
+    /// once the repo really died. Both halves of the feature broke on a space.
+    #[test]
+    fn a_repo_root_with_a_trailing_space_is_active_not_a_candidate() {
+        let td = TempDir::new().unwrap();
+        let live = td.path().join("alive ");
+        fs::create_dir_all(&live).unwrap();
+        let id = seed_store_for(td.path(), &live, &["a"]);
+
+        let report = reclaim_stale_stores(td.path(), true).unwrap();
+
+        assert!(
+            report.candidates.is_empty(),
+            "offered a live repo's store as reclaimable: {report:?}"
+        );
+        assert!(
+            report.failures.is_empty(),
+            "a live repo's store reached the delete path at all: {report:?}"
+        );
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert!(td
+            .path()
+            .join("reflogless")
+            .join(&id)
+            .join("snapshots")
+            .join("a.json")
+            .exists());
+    }
+
+    /// `remove_stale_store` refuses a store path that is not a directory. Today
+    /// `list_all_stores` filters non-directories out before it can be reached, so
+    /// this is unreachable through `reclaim_stale_stores` — which is the point of
+    /// gating inside the destroying function rather than at its caller: the
+    /// precondition holds for a caller that does not filter. Exercised directly,
+    /// because a guard no test can reach is a guard that can be deleted by accident.
+    #[test]
+    fn remove_stale_store_refuses_a_store_path_that_is_not_a_directory() {
+        let td = TempDir::new().unwrap();
+        let gone = td.path().join("dead-repo");
+        // The id must match the origin or the earlier gate refuses first, and the
+        // origin must be genuinely absent or we get `Revived`.
+        let id = crate::repo::id_for_root(&gone);
+        fs::create_dir_all(td.path().join("reflogless")).unwrap();
+        fs::write(td.path().join("reflogless").join(&id), b"not a directory").unwrap();
+
+        match remove_stale_store(td.path(), &id, &gone, current_euid()) {
+            RemoveOutcome::Refused(reason) => assert!(
+                reason.contains("is not a directory"),
+                "refused for the wrong reason: {reason}"
+            ),
+            other => panic!("deleted through a non-directory store path: {other:?}"),
+        }
+        assert!(
+            td.path().join("reflogless").join(&id).exists(),
+            "the path was removed anyway"
+        );
+    }
+
+    /// The route the store-id gate does **not** close, and the reason this feature
+    /// took four rounds to get right.
+    ///
+    /// On Linux a path is bytes, not UTF-8. `Repo::id` hashes
+    /// `root.to_string_lossy()` and `save_repo_origin` writes
+    /// `path.to_string_lossy()` — the *same* mangled string. So for a non-UTF-8
+    /// repo root the recorded origin is `…\u{FFFD}…`, the store directory is named
+    /// `sha256` of that identical string, and re-deriving the id from the record
+    /// agrees. Every guard passes: the path is absolute, `try_exists()` says
+    /// `Ok(false)` because the mangled spelling genuinely does not exist, the
+    /// directory is a real dir we own. A live repo's snapshots get destroyed.
+    ///
+    /// A lossy transcription is not evidence about the filesystem — it is evidence
+    /// that we failed to record the path. Absence of a path we never wrote down
+    /// correctly cannot be confirmation that the repo is gone, so this is
+    /// `Unknown`, never `Stale`.
+    ///
+    /// The fixture is the exact state production produces: `seed_store_for`
+    /// derives the id from the origin, as `Store::for_repo_with_base` does. It
+    /// reproduces on macOS even though APFS rejects non-UTF-8 names, because what
+    /// matters is the *recorded string*, not this host's filesystem — which is why
+    /// the earlier rounds' macOS-only runs never saw it.
+    #[test]
+    fn reclaim_refuses_a_store_whose_recorded_origin_is_a_lossy_transcription() {
+        let td = TempDir::new().unwrap();
+        // What `to_string_lossy()` yields for a repo at b"/data/\xff-repo".
+        let mangled = td.path().join("data").join("\u{FFFD}-repo");
+        let id = seed_store_for(td.path(), &mangled, &["a"]);
+
+        let report = reclaim_stale_stores(td.path(), true).unwrap();
+
+        assert!(
+            report.removed.is_empty(),
+            "destroyed a live repo's snapshots on a mangled origin: {report:?}"
+        );
+        assert!(
+            report.candidates.is_empty(),
+            "offered a store with an untrustworthy origin as reclaimable: {report:?}"
+        );
+        assert_eq!(
+            report.skipped_unknown.len(),
+            1,
+            "a lossy origin was not reported as unresolvable: {report:?}"
+        );
+        assert!(
+            report.skipped_unknown[0].1.contains("lossy"),
+            "the reason does not explain why: {:?}",
+            report.skipped_unknown[0]
+        );
+        assert!(
+            td.path()
+                .join("reflogless")
+                .join(&id)
+                .join("snapshots")
+                .join("a.json")
+                .exists(),
+            "the snapshot is gone"
+        );
     }
 
     /// An empty origin file means a truncated write or an interrupted delete — a
