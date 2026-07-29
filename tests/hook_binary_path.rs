@@ -82,7 +82,12 @@ fn a_relative_invocation_does_not_bake_the_install_time_cwd() {
     // out of a sibling directory.
     let status = Command::new("../rl")
         .arg("init")
+        // Headless CI has no Secret Service, so keychain provisioning fails
+        // there. Where the key lives is irrelevant to binary resolution, which
+        // is what these tests are about.
+        .arg("--insecure-file-key")
         .current_dir(&repo)
+        .env("HOME", td.path())
         .env("REFLOGLESS_DATA_DIR", &data)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
@@ -114,7 +119,9 @@ fn an_installed_hook_snapshots_with_reflogless_absent_from_path() {
 
     assert!(Command::new(BIN)
         .arg("init")
+        .arg("--insecure-file-key")
         .current_dir(&repo)
+        .env("HOME", td.path())
         .env("REFLOGLESS_DATA_DIR", &data)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
@@ -131,6 +138,7 @@ fn an_installed_hook_snapshots_with_reflogless_absent_from_path() {
         // directory that could resolve a bare `reflogless`. This is the GUI
         // editor / launchd / sandboxed-runner environment from #74.
         .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.path())
         .env("REFLOGLESS_DATA_DIR", &data)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
