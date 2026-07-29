@@ -7,10 +7,11 @@ follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
-- Windows Authenticode release signing (#32): tag releases now sign the
-  Windows `.exe` inside the cargo-dist ZIP with Azure Artifact Signing,
-  verify the Authenticode signature, rebuild the ZIP, and regenerate its
-  SHA-256 checksum before publication. Opt-in by configuration: with all six
+- An opt-in Windows Authenticode signing path (#32) — **not yet configured, so
+  Windows binaries in this release remain unsigned.** Once the Azure secrets and
+  variables exist, tag releases sign the Windows `.exe` inside the cargo-dist ZIP
+  with Azure Artifact Signing, verify the Authenticode signature, rebuild the ZIP,
+  and regenerate its SHA-256 checksum before publication. With all six
   secrets/variables set the release signs and any failure stops it before
   assets are published; with none set it skips signing and publishes unsigned
   with a workflow warning; with only some set it fails, because a partial
