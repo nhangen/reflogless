@@ -492,23 +492,24 @@ fn build_hook_body(
     // failure is already handled, and step 2 now works with no PATH at all, so
     // an already-existing log directory keeps logging.
     //
-    // `%/*` is not `dirname`, though, and the two shapes where they differ both
-    // matter: a value with no slash at all leaves itself unchanged (so
-    // `mkdir -p hook-errors.log` would create a *directory* of that name in git's
-    // cwd and then fail to write to it), and a root-level path yields the empty
-    // string. Normalize both, still without an external command.
+    // `%/*` is not `dirname`, though: a value with no slash at all leaves itself
+    // unchanged, so `mkdir -p hook-errors.log` would create a *directory* of that
+    // name in git's cwd. Normalize that one shape, still without an external
+    // command.
     s.push_str("__REFLOGLESS_LOG_DIR=\"${REFLOGLESS_HOOK_LOG%/*}\"\n");
+    s.push_str("case \"$REFLOGLESS_HOOK_LOG\" in */*) ;; *) __REFLOGLESS_LOG_DIR=. ;; esac\n");
     s.push_str(
-        "case \"$REFLOGLESS_HOOK_LOG\" in */*) ;; *) __REFLOGLESS_LOG_DIR=. ;; esac\n\
-         [ -n \"$__REFLOGLESS_LOG_DIR\" ] || __REFLOGLESS_LOG_DIR=/\n",
+        "[ -z \"$__REFLOGLESS_LOG_DIR\" ] || mkdir -p \"$__REFLOGLESS_LOG_DIR\" 2>/dev/null \
+         || REFLOGLESS_HOOK_LOG=\"$__REFLOGLESS_FALLBACK_LOG\"\n",
     );
-    s.push_str(
-        "mkdir -p \"$__REFLOGLESS_LOG_DIR\" 2>/dev/null \
-         || { REFLOGLESS_HOOK_LOG=\"$__REFLOGLESS_FALLBACK_LOG\"\n  \
-         __REFLOGLESS_LOG_DIR=\"${REFLOGLESS_HOOK_LOG%/*}\"\n\
-         }\n",
-    );
-    s.push_str("[ -d \"$__REFLOGLESS_LOG_DIR\" ] || REFLOGLESS_HOOK_LOG=/dev/null\n");
+    // Then test the log for *appendability*, not its directory for existence.
+    // `[ -d ]` answered the wrong question: a read-only or unwritable directory
+    // exists, so the guard passed, the `2>>` redirect on the snap line below then
+    // failed — and a failed redirect means sh never executes the command at all.
+    // The snapshot was skipped and the redirect error went to git's stderr, which
+    // is the pair of outcomes this block exists to prevent. One builtin covers
+    // unwritable, read-only-fs, is-a-directory, and a missing parent at once.
+    s.push_str("{ : >>\"$REFLOGLESS_HOOK_LOG\"; } 2>/dev/null || REFLOGLESS_HOOK_LOG=/dev/null\n");
     // Address the binary by absolute path. A bare `reflogless` resolves against
     // whatever PATH the git caller happens to have, and a GUI editor, launchd
     // job, or sandboxed runner typically lacks ~/.cargo/bin or
@@ -527,28 +528,58 @@ fn build_hook_body(
     // perfectly good baked path and left `reflogless: command not found` in the
     // log — the exact signature of #74, produced by the fix for #74, pointing
     // the next reader at PATH instead of at the override.
-    let bare_fallback = "[ -x \"$__REFLOGLESS_BIN\" ] || {\n  \
-         echo \"reflogless: $__REFLOGLESS_BIN is not executable; \
-         falling back to PATH lookup\" >>\"$REFLOGLESS_HOOK_LOG\"\n  \
-         __REFLOGLESS_BIN=reflogless\n\
-         }\n";
+    // The guard and the exec have to agree about what the string means, and two
+    // shapes made them disagree:
+    //
+    //   * A value with no slash. `[ -x rl ]` is a filesystem test against the
+    //     cwd, but `"$__REFLOGLESS_BIN"` with no slash is a **PATH lookup**. So
+    //     `REFLOGLESS_BIN=rl`, run from the directory containing `rl`, passed the
+    //     guard and then failed to exec with `reflogless: command not found` —
+    //     #74's own signature for the third time, from #74's own fix. Only an
+    //     absolute path is meaningful for a hook that runs from arbitrary cwds.
+    //   * A directory. `[ -x dir ]` is true in POSIX sh, because for a directory
+    //     the execute bit means searchable. `doctor` rejects one correctly
+    //     (`is_file() && mode & 0o111`), so the two disagreed about the same
+    //     baked path.
+    //
+    // `[ -f ] && [ -x ]` on an absolute path is the test that matches the exec.
+    let usable = |var: &str| format!("[ -f \"${var}\" ] && [ -x \"${var}\" ]");
+    let absolute_or_reject = "case \"$REFLOGLESS_BIN\" in\n  \
+           /*) ;;\n  \
+           *) echo \"reflogless: REFLOGLESS_BIN must be an absolute path \
+              (got $REFLOGLESS_BIN)\" >>\"$REFLOGLESS_HOOK_LOG\"\n     \
+              REFLOGLESS_BIN= ;;\n\
+         esac\n";
+    let bare_fallback = format!(
+        "{} || {{\n  \
+           echo \"reflogless: $__REFLOGLESS_BIN is not executable; \
+           falling back to PATH lookup\" >>\"$REFLOGLESS_HOOK_LOG\"\n  \
+           __REFLOGLESS_BIN=reflogless\n\
+         }}\n",
+        usable("__REFLOGLESS_BIN")
+    );
     match bin {
         Some(p) => {
             s.push_str(&format!("__REFLOGLESS_BIN={}\n", sh_squote(p)));
             // An override is a user instruction. Honor it when it can be
             // honored, and say so when it can't — never swap in a *different*
             // binary behind the user's back.
-            s.push_str(
-                "if [ -n \"${REFLOGLESS_BIN:-}\" ]; then\n  \
-                   if [ -x \"$REFLOGLESS_BIN\" ]; then\n    \
+            s.push_str(&format!(
+                "if [ -n \"${{REFLOGLESS_BIN:-}}\" ]; then\n{}  \
+                 fi\n\
+                 if [ -n \"${{REFLOGLESS_BIN:-}}\" ]; then\n  \
+                   if {}; then\n    \
                      __REFLOGLESS_BIN=\"$REFLOGLESS_BIN\"\n  \
                    else\n    \
-                     echo \"reflogless: REFLOGLESS_BIN=$REFLOGLESS_BIN is not executable; \
-                     using $__REFLOGLESS_BIN\" >>\"$REFLOGLESS_HOOK_LOG\"\n  \
+                     echo \"reflogless: REFLOGLESS_BIN=$REFLOGLESS_BIN is not an \
+                     executable file; using $__REFLOGLESS_BIN\" \
+                     >>\"$REFLOGLESS_HOOK_LOG\"\n  \
                    fi\n\
                  fi\n",
-            );
-            s.push_str(bare_fallback);
+                absolute_or_reject,
+                usable("REFLOGLESS_BIN")
+            ));
+            s.push_str(&bare_fallback);
         }
         None => {
             // There is no baked path to protect here, but the invariant above
@@ -558,14 +589,19 @@ fn build_hook_body(
             // was wrong saw only a bare `Permission denied` and had to guess —
             // the attribution problem this whole chain exists to fix.
             s.push_str("__REFLOGLESS_BIN=reflogless\n");
-            s.push_str(
-                "if [ -n \"${REFLOGLESS_BIN:-}\" ]; then\n  \
+            s.push_str(&format!(
+                "if [ -n \"${{REFLOGLESS_BIN:-}}\" ]; then\n{}  \
+                 fi\n\
+                 if [ -n \"${{REFLOGLESS_BIN:-}}\" ]; then\n  \
                    __REFLOGLESS_BIN=\"$REFLOGLESS_BIN\"\n  \
-                   [ -x \"$__REFLOGLESS_BIN\" ] || echo \"reflogless: \
-                   REFLOGLESS_BIN=$REFLOGLESS_BIN is not executable, and no binary path \
-                   was baked at install time\" >>\"$REFLOGLESS_HOOK_LOG\"\n\
+                   {} || echo \"reflogless: \
+                   REFLOGLESS_BIN=$REFLOGLESS_BIN is not an executable file, and no \
+                   binary path was baked at install time\" \
+                   >>\"$REFLOGLESS_HOOK_LOG\"\n\
                  fi\n",
-            );
+                absolute_or_reject,
+                usable("__REFLOGLESS_BIN")
+            ));
         }
     }
     s.push_str(&format!(
@@ -1066,12 +1102,130 @@ mod tests {
             "a bad override discarded a working baked binary"
         );
         assert!(
-            log.contains("REFLOGLESS_BIN") && log.contains("not executable"),
+            log.contains("REFLOGLESS_BIN") && log.contains("executable"),
             "the rejected override left no signal naming it: {log:?}"
         );
         assert!(
             !log.contains("command not found"),
             "reproduced #74's own failure signature: {log:?}"
+        );
+    }
+
+    /// A slash-less `REFLOGLESS_BIN` passed `[ -x ]` — a filesystem test against
+    /// the cwd — and then **PATH-resolved** at exec time, because a command word
+    /// with no slash is a PATH lookup. So `REFLOGLESS_BIN=rl`, run from the
+    /// directory holding `rl`, cleared the guard and died with
+    /// `reflogless: command not found`: #74's own signature, from #74's own fix,
+    /// for the third time. The guard and the exec must agree on what the string
+    /// means.
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_override_is_rejected_rather_than_path_resolved() {
+        let td = TempDir::new().unwrap();
+        let marker = td.path().join("who-ran");
+        let baked = td.path().join("baked");
+        stub_at(&baked, &marker, "BAKED");
+        // An executable named `rl` sitting in the cwd — the shape that fooled the
+        // old guard.
+        let cwd_stub = td.path().join("rl");
+        stub_at(&cwd_stub, &marker, "CWD_RELATIVE");
+
+        let (who, log) = run_body_with(
+            &td,
+            Some(&baked),
+            &[("REFLOGLESS_BIN", "rl")],
+            "/usr/bin:/bin",
+        );
+
+        assert_eq!(
+            who, "BAKED",
+            "a relative override displaced a working baked binary"
+        );
+        assert!(
+            !log.contains("command not found"),
+            "reproduced #74's own failure signature: {log:?}"
+        );
+        assert!(
+            log.contains("absolute path"),
+            "the rejected override left no signal explaining why: {log:?}"
+        );
+    }
+
+    /// `[ -x dir ]` is true in POSIX sh — for a directory the execute bit means
+    /// searchable — so a directory override cleared the guard, displaced a working
+    /// baked path, and skipped the snapshot. `doctor` rejects one correctly, so the
+    /// two disagreed about the same path.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_override_is_rejected_rather_than_execed() {
+        let td = TempDir::new().unwrap();
+        let marker = td.path().join("who-ran");
+        let baked = td.path().join("baked");
+        stub_at(&baked, &marker, "BAKED");
+        let dir = td.path().join("a-directory");
+        fs::create_dir_all(&dir).unwrap();
+
+        let (who, log) = run_body_with(
+            &td,
+            Some(&baked),
+            &[("REFLOGLESS_BIN", dir.to_str().unwrap())],
+            "/nonexistent-bin",
+        );
+
+        assert_eq!(
+            who, "BAKED",
+            "a directory override displaced the baked binary"
+        );
+        assert!(
+            log.contains("REFLOGLESS_BIN") && log.contains("executable file"),
+            "the rejected directory left no signal naming it: {log:?}"
+        );
+    }
+
+    /// The log guard tested its *directory* for existence when the requirement is
+    /// that the log itself be *appendable*. An unwritable-but-existing directory
+    /// passed, the `2>>` redirect then failed — and a failed redirect means sh
+    /// never runs the command at all. So the snapshot was silently skipped and the
+    /// redirect error went to git's stderr: both of the things that block exists to
+    /// prevent. Asserting `status.success()` cannot catch this; only asserting the
+    /// binary *ran* can.
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_log_path_still_takes_the_snapshot() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        let marker = td.path().join("who-ran");
+        let baked = td.path().join("baked");
+        stub_at(&baked, &marker, "BAKED");
+        // The directory exists and is readable, but nothing may be created in it.
+        let locked = td.path().join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let body = build_hook_body(
+            "post-checkout",
+            &td.path().join("fallback.log"),
+            "0123456789abcdef",
+            None,
+            Some(&baked),
+        );
+        let script = td.path().join("hook.sh");
+        fs::write(&script, &body).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let status = Command::new(&script)
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.path())
+            .env("REFLOGLESS_HOOK_LOG", locked.join("hook-errors.log"))
+            .status()
+            .unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(status.success(), "hook must stay best-effort");
+        assert_eq!(
+            fs::read_to_string(&marker).unwrap_or_default().trim(),
+            "BAKED",
+            "an unwritable log path skipped the snapshot entirely"
         );
     }
 
@@ -1096,7 +1250,7 @@ mod tests {
             "/nonexistent-bin",
         );
         assert!(
-            log.contains("REFLOGLESS_BIN") && log.contains("not executable"),
+            log.contains("REFLOGLESS_BIN") && log.contains("executable"),
             "the rejected override left no signal naming it: {log:?}"
         );
     }

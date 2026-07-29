@@ -561,14 +561,19 @@ reflogless init
 
 ### Pointing hooks at a different binary (`REFLOGLESS_BIN`)
 
-Set `REFLOGLESS_BIN` to an executable and installed hooks will use it instead of
-the path they baked in. This redirects a relocated install without reinstalling
-every hook, and lets you run hooks against a dev build.
+Set `REFLOGLESS_BIN` to an **absolute path** to an executable file, and installed
+hooks will use it instead of the path they baked in. This redirects a relocated
+install without reinstalling every hook, and lets you run hooks against a dev
+build.
 
-It must name something executable. If it doesn't, the hook keeps using its baked
-path and writes a line to `<store>/hook-errors.log` saying so — it will not
-silently fall back to a PATH lookup, since that would swap in a different binary
-than you asked for.
+Absolute is required, not a style preference: a value with no slash in it is a
+`PATH` lookup when the hook execs it, not a path relative to your shell's
+directory — so `REFLOGLESS_BIN=./target/debug/reflogless` works and
+`REFLOGLESS_BIN=reflogless` is the very thing hooks avoid doing. A relative
+value, a directory, or a non-executable file is rejected: the hook keeps its
+baked path and writes a line to `<store>/hook-errors.log` naming the reason. It
+will not silently fall back to a PATH lookup, since that would swap in a
+different binary than you asked for.
 
 ### Recovering from a corrupted store
 

@@ -1156,6 +1156,50 @@ mod tests {
         );
     }
 
+    /// The other half of `is_executable_file`. A *directory* carries the execute
+    /// bit (it means searchable), so the mode check alone accepts one — and the
+    /// hook's `[ -x ]` accepted one too until it gained a matching `[ -f ]`. Both
+    /// sides now agree that only a regular file is a binary.
+    #[cfg(unix)]
+    #[test]
+    fn doctor_fails_when_the_baked_binary_is_a_directory() {
+        let td = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let repo = init_repo(td.path());
+        let store = Store::for_repo_with_base(&repo, data.path().to_path_buf()).unwrap();
+        hooks::install(&repo, &store.root.join("hook-errors.log")).unwrap();
+        let p = repo.root.join(".git").join("hooks").join("post-checkout");
+        let body = fs::read_to_string(&p).unwrap();
+        let live = crate::hooks::extract_hook_binary(&body).expect("install bakes a path");
+
+        let dir = td.path().join("a-directory");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &p,
+            body.replace(live.to_str().unwrap(), dir.to_str().unwrap()),
+        )
+        .unwrap();
+
+        let report = run(&repo, &store).unwrap();
+        let pc = report
+            .hooks
+            .iter()
+            .find(|h| h.name == "post-checkout")
+            .unwrap();
+        assert_eq!(
+            pc.state,
+            HookState::Managed {
+                chained: false,
+                stale: Some(HookStale::Binary {
+                    script_points_at: dir.clone()
+                })
+            },
+            "a directory baked as the binary classified as {:?}",
+            pc.state
+        );
+        assert!(!report.is_healthy());
+    }
+
     /// The complement: a freshly installed hook points at a live binary and must
     /// not be called stale, or the new failure fires on every healthy repo.
     #[test]
