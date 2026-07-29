@@ -407,28 +407,65 @@ fn build_hook_body(
     // stderr (the WSL-install / Git-for-Windows-run case from #67):
     //   1. mkdir -p the resolved parent; on failure, fall to install-time.
     //   2. If even the install-time parent is absent, redirect to /dev/null.
+    //
+    // The parent is derived with `${VAR%/*}`, a shell builtin, not `$(dirname)`.
+    // `dirname` is an external command, so under a minimal PATH — a GUI editor,
+    // launchd, a sandboxed runner: the very callers #74 is about — the
+    // substitution yielded the empty string, `[ -d "" ]` was false, and the log
+    // was redirected to /dev/null. The hook then failed *and* discarded the only
+    // record of it. `mkdir` is external too and can still fail that way, but its
+    // failure is already handled, and step 2 now works with no PATH at all, so
+    // an already-existing log directory keeps logging.
     s.push_str(
-        "mkdir -p \"$(dirname \"$REFLOGLESS_HOOK_LOG\")\" 2>/dev/null \
+        "mkdir -p \"${REFLOGLESS_HOOK_LOG%/*}\" 2>/dev/null \
          || REFLOGLESS_HOOK_LOG=\"$__REFLOGLESS_FALLBACK_LOG\"\n",
     );
-    s.push_str("[ -d \"$(dirname \"$REFLOGLESS_HOOK_LOG\")\" ] || REFLOGLESS_HOOK_LOG=/dev/null\n");
+    s.push_str("[ -d \"${REFLOGLESS_HOOK_LOG%/*}\" ] || REFLOGLESS_HOOK_LOG=/dev/null\n");
     // Address the binary by absolute path. A bare `reflogless` resolves against
     // whatever PATH the git caller happens to have, and a GUI editor, launchd
     // job, or sandboxed runner typically lacks ~/.cargo/bin or
     // /opt/homebrew/bin — the lookup then fails and `|| true` swallows it, so
-    // the snapshot is silently skipped (#74). Fall back to the bare name if the
-    // baked path later disappears (reinstall to a new prefix, moved binary).
-    // Resolution order: `$REFLOGLESS_BIN` override, then the baked path, then
-    // the bare name. The override exists so a relocated install can be pointed
-    // at the new binary without reinstalling every hook, and so tests can
-    // substitute a stub without depending on PATH.
+    // the snapshot is silently skipped (#74).
+    //
+    // Resolution order: the baked path, overridden by `$REFLOGLESS_BIN` if that
+    // names something executable, and bare `reflogless` only as a last resort.
+    // The override exists so a relocated install can be pointed at the new
+    // binary without reinstalling every hook, and so tests can substitute a stub
+    // without depending on PATH.
+    //
+    // Every step down this chain writes a line naming itself. The earlier
+    // version silently rewrote the resolved value to the bare name whenever it
+    // wasn't executable, which meant a mistyped `$REFLOGLESS_BIN` discarded a
+    // perfectly good baked path and left `reflogless: command not found` in the
+    // log — the exact signature of #74, produced by the fix for #74, pointing
+    // the next reader at PATH instead of at the override.
+    let bare_fallback = "[ -x \"$__REFLOGLESS_BIN\" ] || {\n  \
+         echo \"reflogless: $__REFLOGLESS_BIN is not executable; \
+         falling back to PATH lookup\" >>\"$REFLOGLESS_HOOK_LOG\"\n  \
+         __REFLOGLESS_BIN=reflogless\n\
+         }\n";
     match bin {
         Some(p) => {
             s.push_str(&format!("__REFLOGLESS_BIN={}\n", sh_squote(p)));
-            s.push_str("[ -n \"${REFLOGLESS_BIN:-}\" ] && __REFLOGLESS_BIN=\"$REFLOGLESS_BIN\"\n");
-            s.push_str("[ -x \"$__REFLOGLESS_BIN\" ] || __REFLOGLESS_BIN=reflogless\n");
+            // An override is a user instruction. Honor it when it can be
+            // honored, and say so when it can't — never swap in a *different*
+            // binary behind the user's back.
+            s.push_str(
+                "if [ -n \"${REFLOGLESS_BIN:-}\" ]; then\n  \
+                   if [ -x \"$REFLOGLESS_BIN\" ]; then\n    \
+                     __REFLOGLESS_BIN=\"$REFLOGLESS_BIN\"\n  \
+                   else\n    \
+                     echo \"reflogless: REFLOGLESS_BIN=$REFLOGLESS_BIN is not executable; \
+                     using $__REFLOGLESS_BIN\" >>\"$REFLOGLESS_HOOK_LOG\"\n  \
+                   fi\n\
+                 fi\n",
+            );
+            s.push_str(bare_fallback);
         }
         None => {
+            // No baked path to protect, so an unusable override is left in place
+            // deliberately: `sh` then names the real path in the log, which is
+            // more informative than a silent substitution.
             s.push_str("__REFLOGLESS_BIN=reflogless\n");
             s.push_str("[ -n \"${REFLOGLESS_BIN:-}\" ] && __REFLOGLESS_BIN=\"$REFLOGLESS_BIN\"\n");
         }
@@ -777,7 +814,12 @@ mod tests {
             "absolute path not baked in: {body}"
         );
         // Fallback keeps a moved/removed binary from breaking the hook outright.
-        assert!(body.contains("[ -x \"$__REFLOGLESS_BIN\" ] || __REFLOGLESS_BIN=reflogless"));
+        // Behavior is covered by `a_dead_baked_path_falls_back_to_path_and_says_so`;
+        // this only asserts the fallback exists at all.
+        assert!(
+            body.contains("__REFLOGLESS_BIN=reflogless"),
+            "no bare-name fallback: {body}"
+        );
         assert!(body.contains("\"$__REFLOGLESS_BIN\" snap --event post-checkout"));
         // The bare-name invocation is what #74 fixed; it must not survive.
         assert!(
@@ -828,25 +870,171 @@ mod tests {
         );
     }
 
+    /// Write an executable stub that records the name it was invoked under.
+    #[cfg(unix)]
+    fn stub_at(path: &Path, marker: &Path, label: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(
+            path,
+            format!("#!/bin/sh\necho '{label}' >> {}\n", sh_squote(marker)),
+        )
+        .unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Build a hook body for `bin`, run it with `env` applied, and return
+    /// `(whichever stub ran, hook-errors.log contents)`.
+    ///
+    /// Behavioral rather than string-shape: the emitted resolution chain can be
+    /// rewritten freely as long as the binary that ends up running is the right
+    /// one, which is the property anyone actually depends on.
+    #[cfg(unix)]
+    fn run_body_with(
+        td: &TempDir,
+        bin: Option<&Path>,
+        env: &[(&str, &str)],
+        path_var: &str,
+    ) -> (String, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let marker = td.path().join("who-ran");
+        let log = td.path().join("hook-errors.log");
+        let body = build_hook_body("post-checkout", &log, "0123456789abcdef", None, bin);
+        let script = td.path().join("hook.sh");
+        fs::write(&script, &body).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cmd = Command::new(&script);
+        // Pin the log explicitly: the body resolves its own default from the
+        // data dir, and this test cares about the log's *contents*, not where
+        // the resolution lands (covered separately).
+        cmd.env("PATH", path_var)
+            .env("HOME", td.path())
+            .env("REFLOGLESS_HOOK_LOG", &log);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let status = cmd.status().unwrap();
+        assert!(status.success(), "hook must stay best-effort:\n{body}");
+        (
+            fs::read_to_string(&marker)
+                .unwrap_or_default()
+                .trim()
+                .into(),
+            fs::read_to_string(&log).unwrap_or_default(),
+        )
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn hook_body_honors_reflogless_bin_override() {
-        let body = build_hook_body(
-            "post-checkout",
-            Path::new("/tmp/log"),
-            "0123456789abcdef",
-            None,
-            Some(Path::new("/baked/reflogless")),
+    fn hook_body_honors_an_executable_reflogless_bin_override() {
+        let td = TempDir::new().unwrap();
+        let marker = td.path().join("who-ran");
+        let baked = td.path().join("baked");
+        let over = td.path().join("override");
+        stub_at(&baked, &marker, "BAKED");
+        stub_at(&over, &marker, "OVERRIDE");
+
+        let (who, _) = run_body_with(
+            &td,
+            Some(&baked),
+            &[("REFLOGLESS_BIN", over.to_str().unwrap())],
+            "/nonexistent-bin",
+        );
+        assert_eq!(who, "OVERRIDE", "explicit override was not used");
+    }
+
+    /// The defect this replaced a string-shape test to catch: a mistyped or
+    /// not-yet-chmod'd `$REFLOGLESS_BIN` used to overwrite the baked path and
+    /// then get rewritten to bare `reflogless`, so a working install produced
+    /// `reflogless: command not found` — #74's own signature — and skipped the
+    /// snapshot. The override must never cost the user the baked path.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_executable_override_keeps_the_baked_binary_and_says_so() {
+        let td = TempDir::new().unwrap();
+        let marker = td.path().join("who-ran");
+        let baked = td.path().join("baked");
+        stub_at(&baked, &marker, "BAKED");
+        let not_exec = td.path().join("not-executable");
+        fs::write(&not_exec, b"i am not a program").unwrap();
+
+        let (who, log) = run_body_with(
+            &td,
+            Some(&baked),
+            &[("REFLOGLESS_BIN", not_exec.to_str().unwrap())],
+            "/nonexistent-bin",
+        );
+        assert_eq!(
+            who, "BAKED",
+            "a bad override discarded a working baked binary"
         );
         assert!(
-            body.contains("[ -n \"${REFLOGLESS_BIN:-}\" ] && __REFLOGLESS_BIN=\"$REFLOGLESS_BIN\""),
-            "override not honored: {body}"
+            log.contains("REFLOGLESS_BIN") && log.contains("not executable"),
+            "the rejected override left no signal naming it: {log:?}"
         );
-        // Order matters: override must be applied after the baked default and
-        // before the executability fallback.
-        let baked = body.find("__REFLOGLESS_BIN='/baked/reflogless'").unwrap();
-        let over = body.find("REFLOGLESS_BIN:-").unwrap();
-        let fallback = body.find("|| __REFLOGLESS_BIN=reflogless").unwrap();
-        assert!(baked < over && over < fallback, "wrong order in: {body}");
+        assert!(
+            !log.contains("command not found"),
+            "reproduced #74's own failure signature: {log:?}"
+        );
+    }
+
+    /// The error log must survive the environment the hook is most likely to fail
+    /// in. Deriving the log's parent with `$(dirname …)` meant that under a PATH
+    /// without coreutils the substitution came back empty, `[ -d "" ]` was false,
+    /// and the log went to /dev/null — so a hook running from a GUI editor or
+    /// launchd both failed *and* threw away the only record of it. That is the
+    /// same class of environment #74 is about, and `hook-errors.log` is where
+    /// #74's own evidence came from.
+    #[cfg(unix)]
+    #[test]
+    fn the_error_log_survives_a_hook_run_with_no_usable_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        let log = td.path().join("nested").join("hook-errors.log");
+        fs::create_dir_all(log.parent().unwrap()).unwrap();
+        // No baked binary and an empty PATH: the invocation cannot succeed, which
+        // is exactly when the log has to work.
+        let body = build_hook_body("post-checkout", &log, "0123456789abcdef", None, None);
+        let script = td.path().join("hook.sh");
+        fs::write(&script, &body).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let status = Command::new(&script)
+            .env("PATH", "")
+            .env("HOME", td.path())
+            .env("REFLOGLESS_HOOK_LOG", &log)
+            .status()
+            .unwrap();
+        assert!(status.success(), "hook must stay best-effort");
+        let logged = fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            !logged.is_empty(),
+            "hook failure left no record — the log was discarded, not written"
+        );
+    }
+
+    /// The baked path can die under the install (upgrade to a new prefix, moved
+    /// binary). Falling back to PATH is correct — doing it silently is not,
+    /// because the log is the only place this is ever visible.
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_baked_path_falls_back_to_path_and_says_so() {
+        let td = TempDir::new().unwrap();
+        let marker = td.path().join("who-ran");
+        let bindir = td.path().join("bin");
+        fs::create_dir_all(&bindir).unwrap();
+        stub_at(&bindir.join("reflogless"), &marker, "FROM-PATH");
+
+        let (who, log) = run_body_with(
+            &td,
+            Some(&td.path().join("deleted-by-an-upgrade")),
+            &[],
+            bindir.to_str().unwrap(),
+        );
+        assert_eq!(who, "FROM-PATH", "did not fall back to PATH");
+        assert!(
+            log.contains("not executable") && log.contains("deleted-by-an-upgrade"),
+            "silent fallback — no line names the dead baked path: {log:?}"
+        );
     }
 
     #[test]
