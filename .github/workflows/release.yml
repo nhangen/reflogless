@@ -15,7 +15,8 @@
 
 name: Release
 # Least-privilege: only the `host` and `publish-homebrew-formula` jobs below
-# escalate to contents: write.
+# escalate to contents: write. Windows release signing grants id-token to the
+# build-local-artifacts job so Azure Artifact Signing can authenticate by OIDC.
 permissions:
   contents: read
 
@@ -116,6 +117,9 @@ jobs:
       # - N "local" tasks that build each platform's binaries and platform-specific installers
       matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
     container: ${{ matrix.container && matrix.container.image || null }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -152,6 +156,115 @@ jobs:
           # Actually do builds and make zips and whatnot
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
+      # Resolve whether Authenticode signing is configured, and emit `enabled` for
+      # the steps below. Three outcomes, deliberately:
+      #
+      #   all six set  -> enabled=true, sign and hard-fail on any signing error
+      #   none set     -> enabled=false, skip signing, release proceeds unsigned
+      #   some set     -> fail the job
+      #
+      # The partial case is the one that must not be tolerated. It means someone
+      # intended signing and got it wrong, and the failure mode of guessing is
+      # shipping an unsigned binary from a release the maintainer believes is
+      # signed. Absent config is a different situation: signing has not been set up
+      # yet, which is a known state documented in the README, not an error — and
+      # making it fatal meant this branch could not be merged without breaking every
+      # release until an Azure account existed.
+      #
+      # The target match below is `-pc-windows-`, not the x86_64 triple, so adding
+      # `aarch64-pc-windows-msvc` cannot silently skip signing for it — a narrower
+      # match would skip the resolver entirely on that entry, which means not even
+      # the "not configured" warning would fire. Note that
+      # `prepare-windows-signing.ps1` hardcodes `reflogless-x86_64-pc-windows-msvc.zip`
+      # and throws when it is absent, so with signing enabled a second Windows target
+      # would fail loudly here rather than ship unsigned — the correct direction, but
+      # that script needs updating alongside any new Windows triple.
+      - name: Resolve Windows Authenticode signing configuration
+        id: signing-config
+        if: ${{ needs.plan.outputs.publishing == 'true' && contains(join(matrix.targets, ','), '-pc-windows-') }}
+        shell: bash
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          AZURE_ARTIFACT_SIGNING_ENDPOINT: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
+        run: |
+          set -euo pipefail
+          required="AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID \
+            AZURE_ARTIFACT_SIGNING_ENDPOINT AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME \
+            AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME"
+          set_count=0
+          total=0
+          missing=""
+          for name in $required; do
+            total=$((total + 1))
+            # Strip whitespace before testing. An unset secret renders as the empty
+            # string, but one set to spaces or a stray newline would otherwise count
+            # as configured and be handed to Azure. None of these six values can
+            # legitimately contain whitespace, so this only ever catches a mistake.
+            value="${!name:-}"
+            value="${value//[[:space:]]/}"
+            if [ -n "$value" ]; then
+              set_count=$((set_count + 1))
+            else
+              missing="$missing $name"
+            fi
+          done
+
+          if [ "$set_count" -eq 0 ]; then
+            echo "::warning::Windows Authenticode signing is not configured; \
+          publishing the Windows archive unsigned. See README.md for the required \
+          secrets and variables."
+            echo "enabled=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$set_count" -ne "$total" ]; then
+            echo "::error::Windows Authenticode signing is partially configured \
+          ($set_count of $total set). Missing:$missing. Set all of them or none — \
+          a partial configuration would publish an unsigned binary from a release \
+          that looks signed."
+            exit 1
+          fi
+
+          echo "enabled=true" >>"$GITHUB_OUTPUT"
+      - name: Prepare Windows Authenticode signing
+        id: windows-signing
+        if: ${{ steps.signing-config.outputs.enabled == 'true' }}
+        shell: pwsh
+        run: |
+          ./scripts/prepare-windows-signing.ps1 -DistribDir target/distrib
+      - name: Azure login for Windows Authenticode signing
+        if: ${{ steps.signing-config.outputs.enabled == 'true' }}
+        # SHA-pinned: this job holds `id-token: write`, so a compromised float tag
+        # could mint an Azure-audience OIDC token.
+        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Sign Windows binaries with Azure Artifact Signing
+        if: ${{ steps.signing-config.outputs.enabled == 'true' }}
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          files-folder: ${{ steps.windows-signing.outputs.signing_folder }}
+          files-folder-filter: exe,dll
+          files-folder-recurse: true
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+      - name: Verify and repack signed Windows archive
+        if: ${{ steps.signing-config.outputs.enabled == 'true' }}
+        shell: pwsh
+        run: |
+          ./scripts/verify-repack-windows-signing.ps1 `
+            -SigningFolder "${{ steps.windows-signing.outputs.signing_folder }}" `
+            -ZipPath "${{ steps.windows-signing.outputs.zip_path }}"
       - id: cargo-dist
         name: Post-build
         # We force bash here just because github makes it really hard to get values up

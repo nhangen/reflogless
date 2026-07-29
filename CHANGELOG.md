@@ -7,6 +7,17 @@ follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- An opt-in Windows Authenticode signing path (#32) — **not yet configured, so
+  Windows binaries in this release remain unsigned.** Once the Azure secrets and
+  variables exist, tag releases sign the Windows `.exe` inside the cargo-dist ZIP
+  with Azure Artifact Signing, verify the Authenticode signature, rebuild the ZIP,
+  and regenerate its SHA-256 checksum before publication. With all six
+  secrets/variables set the release signs and any failure stops it before
+  assets are published; with none set it skips signing and publishes unsigned
+  with a workflow warning; with only some set it fails, because a partial
+  configuration means signing was intended and misconfigured, and guessing
+  would publish an unsigned binary from a release that looks signed. Signing
+  activates with no workflow change once all six are present.
 - Optional remote snapshot backend (#31): push the blob and manifest content
   of an encrypted store to S3-compatible object storage so snapshots survive
   laptop loss. Opt-in via `cargo install reflogless --features remote`; the

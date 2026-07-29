@@ -709,6 +709,38 @@ Conventions:
 - PR description includes a Test plan section a reviewer can follow.
 - New CLI subcommands need a corresponding doctor check and a README usage line.
 
+### Windows launch signing plan
+
+Issue [#32](https://github.com/nhangen/reflogless/issues/32) tracks launch-readiness Authenticode signing. Until that work is actually configured and verified on a prerelease, keep the Windows install warning above explicit that release binaries are unsigned.
+
+The release-signing path uses Azure Artifact Signing in `.github/workflows/release.yml` before cargo-dist uploads artifacts to the GitHub Release. It is **opt-in by configuration** — the workflow resolves what is set and takes one of three paths:
+
+| Configuration | Behavior |
+| --- | --- |
+| All six secrets/variables set | Signs, verifies each file with `Get-AuthenticodeSignature`, repacks the ZIP, regenerates the `.sha256`. A failure at any step fails the release before publishing. |
+| None set | Skips signing with a workflow warning and publishes the Windows archive **unsigned**. |
+| Some set | Fails the release. |
+
+The partial case is deliberately fatal. It means signing was intended and misconfigured, and the failure mode of guessing is publishing an unsigned binary from a release the maintainer believes is signed. A blank value counts as unset. Signing turns itself on with no workflow change the moment all six are present.
+
+Required GitHub Actions secrets:
+
+- `AZURE_CLIENT_ID`
+- `AZURE_TENANT_ID`
+- `AZURE_SUBSCRIPTION_ID`
+
+Required GitHub Actions variables:
+
+- `AZURE_ARTIFACT_SIGNING_ENDPOINT` (for example, `https://eus.codesigning.azure.net/`)
+- `AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME`
+- `AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME`
+
+The Azure app registration must use a federated credential for this repository and have the `Artifact Signing Certificate Profile Signer` role on the signing account/profile. No certificate private key or HSM material is stored in this repo, GitHub secrets, or release assets.
+
+Rotation is handled in Azure: create or renew the certificate profile, grant the same signer role to the GitHub Actions identity, update the three repository variables if endpoint/account/profile names change, then run a prerelease tag and confirm the Windows `.exe` inside `reflogless-x86_64-pc-windows-msvc.zip` reports a valid Authenticode signature.
+
+Budget for the signing account/profile plus identity validation. Managed signing providers are typically low hundreds of dollars per year, while traditional certificate + HSM paths can cost more.
+
 ## Roadmap
 
 Phases: Core (`snap` / `restore` / CAS store) → Hooks + `init` + `doctor` → Encryption → Packaging → optional `--shim` (covers `git clean -fdx` / `git reset --hard`) → v1.0 → v2.
