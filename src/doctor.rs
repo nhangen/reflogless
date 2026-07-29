@@ -1569,7 +1569,10 @@ mod tests {
                 .iter()
                 .map(|h| HookStatus {
                     name: (*h).into(),
-                    state: HookState::Managed { chained: false },
+                    state: HookState::Managed {
+                        chained: false,
+                        stale: None,
+                    },
                 })
                 .collect(),
             store_size_bytes: Ok(0),
