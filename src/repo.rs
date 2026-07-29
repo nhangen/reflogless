@@ -23,10 +23,7 @@ impl Repo {
     }
 
     pub fn id(&self) -> String {
-        let mut h = Sha256::new();
-        h.update(self.root.to_string_lossy().as_bytes());
-        let digest = h.finalize();
-        hex::encode_short(&digest[..8])
+        id_for_root(&self.root)
     }
 
     /// Refuse to operate on a repo owned by another user.
@@ -207,6 +204,19 @@ extern "C" {
 #[cfg(unix)]
 unsafe fn libc_geteuid() -> u32 {
     geteuid()
+}
+
+/// The store-id derivation, as a free function over a path.
+///
+/// Exposed separately from `Repo::id` so `store::remove_stale_store` can check a
+/// recorded origin *against* the store id it is about to delete. That makes
+/// `repo_origin.txt` self-verifying rather than merely trusted: a path that does
+/// not hash to this store's id is not this store's repo, whatever it says.
+pub fn id_for_root(root: &Path) -> String {
+    let mut h = Sha256::new();
+    h.update(root.to_string_lossy().as_bytes());
+    let digest = h.finalize();
+    hex::encode_short(&digest[..8])
 }
 
 #[cfg(unix)]
